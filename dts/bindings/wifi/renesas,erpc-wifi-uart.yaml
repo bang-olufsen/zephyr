@@ -1,0 +1,10 @@
+# Copyright (c) 2025 Renesas Electronics Corporation
+# SPDX-License-Identifier: Apache-2.0
+
+description: Renesas WiFi offload driver (eRPC over UART)
+
+compatible: "renesas,erpc-wifi-uart"
+
+include:
+  - "renesas,erpc-wifi.yaml"
+  - "uart-device.yaml"

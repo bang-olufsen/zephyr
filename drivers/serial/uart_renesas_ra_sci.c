@@ -326,12 +326,18 @@ static int uart_ra_sci_fifo_read(const struct device *dev, uint8_t *rx_data, con
 	struct uart_ra_sci_data *data = dev->data;
 	const struct uart_ra_sci_config *cfg = dev->config;
 	int num_rx = 0U;
+	uint16_t frdrhl;
 
 #if CONFIG_UART_RA_SCI_UART_FIFO_ENABLE
 	if (data->sci.fifo_depth != 0) {
 		while ((size - num_rx > 0) && cfg->regs->FDR_b.R > 0) {
 			/* Receive a character (8bit , parity none) */
-			rx_data[num_rx++] = cfg->regs->FRDRL;
+			frdrhl = cfg->regs->FRDRHL;
+
+			/* Discard characters containing framing or parity errors */
+			if ((frdrhl & (R_SCI0_FRDRHL_PER_Msk | R_SCI0_FRDRHL_FER_Msk)) == 0) {
+				rx_data[num_rx++] = (uint8_t)frdrhl;
+			}
 		}
 		cfg->regs->SSR_FIFO &= (uint8_t)~SCI_UART_SSR_FIFO_DR_RDF;
 	} else

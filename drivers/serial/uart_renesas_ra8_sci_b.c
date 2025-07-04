@@ -366,13 +366,19 @@ static int uart_ra_sci_b_fifo_read(const struct device *dev, uint8_t *rx_data, c
 	struct uart_ra_sci_b_data *data = dev->data;
 	const struct uart_ra_sci_b_config *cfg = dev->config;
 	int num_rx = 0U;
+	uint32_t rdr;
 
 	if (IS_ENABLED(CONFIG_UART_RA_SCI_B_UART_FIFO_ENABLE) && data->sci.fifo_depth > 0) {
 		while ((size - num_rx > 0) && cfg->regs->FRSR_b.R > 0U) {
 			/* FRSR.DR flag will be cleared with byte write to RDR register */
 
 			/* Receive a character (8bit , parity none) */
-			rx_data[num_rx++] = cfg->regs->RDR;
+			rdr = cfg->regs->RDR;
+
+			/* Discard characters containing framing or parity errors */
+			if ((rdr & (R_SCI_B0_RDR_FPER_Msk | R_SCI_B0_RDR_FFER_Msk)) == 0) {
+				rx_data[num_rx++] = (uint8_t)rdr;
+			}
 		}
 		if (cfg->regs->FRSR_b.R == 0U) {
 			cfg->regs->CFCLR_b.RDRFC = 1U;
