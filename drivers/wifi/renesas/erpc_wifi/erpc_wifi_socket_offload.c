@@ -53,9 +53,21 @@ LOG_MODULE_REGISTER(erpc_wifi_socket_offload, CONFIG_WIFI_LOG_LEVEL);
 
 #define ERPC_WIFI_MAX_SOCKETS 		4
 
+// Event flags that match what you'll return
+#define SOCKET_EVENT_RX   0x01  // POLLIN - Data available to read
+#define SOCKET_EVENT_TX   0x02  // POLLOUT - Ready to write
+#define SOCKET_EVENT_ERR  0x04  // POLLERR - Error condition
+#define SOCKET_EVENT_CLOSE 0x08 // POLLHUP - Connection closed
+
 struct erpc_wifi_socket {
-	int fd;
-	bool in_use;
+    int fd;          // remote FD
+    int zfd;          // Zephyr FD
+    bool in_use;
+
+    bool waiting;
+    struct k_poll_signal poll_signal;  // Add this
+    short poll_events;                 // Events poll is waiting for
+    short triggered_events;            // Events that occurred
 };
 
 static struct erpc_wifi_socket sockets[ERPC_WIFI_MAX_SOCKETS];
@@ -209,13 +221,14 @@ static int erpc_wifi_socket_addr_to_posix(struct sockaddr *addr,
 	return err;
 }
 
-static struct erpc_wifi_socket *erpc_wifi_socket_allocate(int fd)
+static struct erpc_wifi_socket *erpc_wifi_socket_allocate(int fd, int zfd)
 {
 	struct erpc_wifi_socket *socket = NULL;
 
 	for (int i = 0; i < ERPC_WIFI_MAX_SOCKETS; i++) {
 		if (sockets[i].in_use == false) {
 			sockets[i].fd = fd;
+			sockets[i].zfd = zfd;
 			sockets[i].in_use = true;
 			socket = &sockets[i];
 			break;
@@ -333,7 +346,7 @@ static int erpc_wifi_socket_accept(void *obj, struct sockaddr *addr, socklen_t *
 	}
 
     /* Keep track of the new fd returned by accept */
-	socket = erpc_wifi_socket_allocate(conn_fd);
+	socket = erpc_wifi_socket_allocate(conn_fd, fd);
 
     if (socket == NULL){
 		zvfs_free_fd(fd);
@@ -512,13 +525,176 @@ static int erpc_wifi_socket_close(void *obj)
 	return ret;
 }
 
+static struct erpc_wifi_socket *find_socket_by_fd(int zfd)
+{
+    for (int i = 0; i < ERPC_WIFI_MAX_SOCKETS; i++) {
+        if (sockets[i].in_use && sockets[i].zfd == zfd) {
+            return &sockets[i];
+        }
+    }
+
+	return NULL;
+}
+
+static int erpc_wifi_socket_poll_offload(struct zvfs_pollfd *fds, int nfds, int timeout)
+{
+    int ret = 0;
+    int64_t start_time = k_uptime_get();
+    bool forever = (timeout == SYS_FOREVER_MS);
+	uint32_t events = 0;
+
+    LOG_DBG("Poll offload: %d fds, timeout: %d ms", nfds, timeout);
+
+    // First, check current state of all sockets
+    for (int i = 0; i < nfds; i++) {
+        struct erpc_wifi_socket *sock = find_socket_by_fd(fds[i].fd);
+        if (!sock) {
+            fds[i].revents = ZVFS_POLLNVAL;
+            ret++;
+            continue;
+        }
+
+        // Check socket events via eRPC
+        uint32_t events = get_socket_events(sock->fd);
+        fds[i].revents = 0;
+
+        if ((events & SOCKET_EVENT_RX) && (fds[i].events & ZVFS_POLLIN)) {
+            fds[i].revents |= ZVFS_POLLIN;
+        }
+        if ((events & SOCKET_EVENT_TX) && (fds[i].events & ZVFS_POLLOUT)) {
+            fds[i].revents |= ZVFS_POLLOUT;
+        }
+        if ((events & SOCKET_EVENT_ERR) && (fds[i].events & ZVFS_POLLERR)) {
+            fds[i].revents |= ZVFS_POLLERR;
+        }
+        if ((events & SOCKET_EVENT_CLOSE) && (fds[i].events & ZVFS_POLLHUP)) {
+            fds[i].revents |= ZVFS_POLLHUP;
+        }
+
+        if (fds[i].revents != 0) {
+            ret++;
+        }
+    }
+
+    // If we found ready sockets, return immediately
+    if (ret > 0) {
+        return ret;
+    }
+
+    // No sockets ready yet, wait with periodic checks
+    while (true) {
+        // Check if timeout expired (unless forever)
+        if (!forever) {
+            int64_t elapsed = k_uptime_get() - start_time;
+            if (elapsed >= timeout) {
+                break; // Timeout
+            }
+        }
+
+        // Wait a short time before checking again
+        k_msleep(10);
+
+        // Check all sockets again
+        for (int i = 0; i < nfds; i++) {
+            if (fds[i].revents != 0) continue; // Already ready
+
+            struct erpc_wifi_socket *sock = find_socket_by_fd(fds[i].fd);
+            if (!sock) continue;
+
+            events = get_socket_events(sock->fd);
+
+            if ((events & SOCKET_EVENT_RX) && (fds[i].events & ZVFS_POLLIN)) {
+                fds[i].revents |= ZVFS_POLLIN;
+            }
+            if ((events & SOCKET_EVENT_TX) && (fds[i].events & ZVFS_POLLOUT)) {
+                fds[i].revents |= ZVFS_POLLOUT;
+            }
+            if ((events & SOCKET_EVENT_ERR) && (fds[i].events & ZVFS_POLLERR)) {
+                fds[i].revents |= ZVFS_POLLERR;
+            }
+            if ((events & SOCKET_EVENT_CLOSE) && (fds[i].events & ZVFS_POLLHUP)) {
+                fds[i].revents |= ZVFS_POLLHUP;
+            }
+
+            if (fds[i].revents != 0) {
+                ret++;
+            }
+        }
+
+        if (ret > 0) {
+            break;
+        }
+    }
+
+    return ret;
+}
+
+static int erpc_wifi_socket_poll_update(struct zvfs_pollfd *pfd, struct k_poll_event **pev)
+{
+    // For mixed polling - if you have both offloaded and regular sockets
+    // This is called after k_poll() returns to update the revents
+
+    struct erpc_wifi_socket *sock = find_socket_by_fd(pfd->fd);
+    if (!sock) {
+        pfd->revents = ZVFS_POLLNVAL;
+        return 0;
+    }
+
+    // Check if our socket was signaled
+    if (*pev != NULL && (*pev)->state == K_POLL_STATE_SIGNALED) {
+        struct k_poll_signal *signal = (*pev)->signal;
+
+        pfd->revents = signal->result & pfd->events;
+        if (pfd->revents != 0) {
+            k_poll_signal_reset(signal);
+        }
+
+        (*pev)++; // Move to next poll event
+    } else {
+        pfd->revents = 0;
+    }
+
+    return 0;
+}
+
 static int erpc_wifi_socket_ioctl(void *obj, unsigned int request, va_list args)
 {
-	LOG_DBG("request: %d", request);
+    struct erpc_wifi_socket *sock = obj;
+    int ret;
 
-	/* Place holder for future functionality - return error to indicate not supported at present */
+	printk("erpc_wifi_socket_ioctl: request=%u\n", request);
 
-	return -EOPNOTSUPP;
+    switch (request) {
+    case ZFD_IOCTL_POLL_PREPARE: {
+        struct zvfs_pollfd *pfd = va_arg(args, struct zvfs_pollfd *);
+        struct k_poll_event **pev = va_arg(args, struct k_poll_event **);
+        struct k_poll_event *pev_end = va_arg(args, struct k_poll_event *);
+
+        // Tell Zephyr this is an offloaded socket
+        return -EXDEV;
+    }
+
+    case ZFD_IOCTL_POLL_OFFLOAD: {
+        struct zvfs_pollfd *fds = va_arg(args, struct zvfs_pollfd *);
+        int nfds = va_arg(args, int);
+        int timeout = va_arg(args, int);
+
+        return erpc_wifi_socket_poll_offload(fds, nfds, timeout);
+    }
+
+    case ZFD_IOCTL_POLL_UPDATE: {
+        struct zvfs_pollfd *pfd = va_arg(args, struct zvfs_pollfd *);
+        struct k_poll_event **pev = va_arg(args, struct k_poll_event **);
+
+        // For mixed polling (optional)
+        return erpc_wifi_socket_poll_update(pfd, pev);
+    }
+
+    // Other ioctl cases...
+    default:
+        errno = EINVAL;
+        return -1;
+    }
 }
 
 static const struct socket_op_vtable erpc_wifi_socket_fd_op_vtable = {
@@ -568,7 +744,7 @@ static int erpc_wifi_socket_create(int family, int type, int proto)
 		return -1;
 	}
 
-	socket = erpc_wifi_socket_allocate(sock);
+	socket = erpc_wifi_socket_allocate(sock, fd);
 
 	if (socket == NULL){
 		zvfs_free_fd(fd);
