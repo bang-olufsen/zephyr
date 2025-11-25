@@ -642,11 +642,11 @@ static int erpc_wifi_socket_poll_update(struct zvfs_pollfd *pfd, struct k_poll_e
 
     // Check if our socket was signaled
     if (*pev != NULL && (*pev)->state == K_POLL_STATE_SIGNALED) {
-        struct k_poll_signal *signal = (*pev)->signal;
+        struct k_poll_signal *sig = (*pev)->signal;
 
-        pfd->revents = signal->result & pfd->events;
+        pfd->revents = sig->result & pfd->events;
         if (pfd->revents != 0) {
-            k_poll_signal_reset(signal);
+            k_poll_signal_reset(sig);
         }
 
         (*pev)++; // Move to next poll event
