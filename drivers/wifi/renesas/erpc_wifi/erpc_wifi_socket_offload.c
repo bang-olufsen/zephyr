@@ -400,6 +400,28 @@ static ssize_t erpc_wifi_socket_sendto(void *obj, const void *buf, size_t len, i
 	return ret;
 }
 
+ssize_t erpc_wifi_socket_sendmsg(void *obj, const struct msghdr *msg, int flags)
+{
+
+	if (msg->msg_iov) {
+		ssize_t len = 0;
+
+		for (int i = 0; i < msg->msg_iovlen; i++) {
+			int ret = erpc_wifi_socket_sendto(obj, msg->msg_iov[i].iov_base, msg->msg_iov[i].iov_len, flags, NULL, 0);
+
+		if (ret < 0) {
+			return ret;
+		}
+
+		len += ret;
+	}
+
+	return len;
+}
+
+return -ENODATA;
+}
+
 static ssize_t erpc_wifi_socket_recvfrom(void *obj, void *buf, size_t max_len, int flags,
 			    struct sockaddr *src_addr, socklen_t *addrlen)
 {
@@ -713,6 +735,8 @@ static const struct socket_op_vtable erpc_wifi_socket_fd_op_vtable = {
 	.recvfrom = erpc_wifi_socket_recvfrom,
 	.getsockopt = erpc_wifi_socket_getsockopt,
 	.setsockopt = erpc_wifi_socket_setsockopt,
+	.sendmsg = erpc_wifi_socket_sendmsg,
+
 };
 
 static int erpc_wifi_socket_create(int family, int type, int proto)
