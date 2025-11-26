@@ -3,7 +3,7 @@
  *
  * SPDX-License-Identifier: Apache-2.0
  */
-
+#include <stdio.h>
 #include "zephyr/kernel.h"
 
 #if defined(CONFIG_ERPC_TRANSPORT_UART)
@@ -44,6 +44,17 @@ static struct k_thread erpc_wifi_server_thread_data;
 
 K_KERNEL_STACK_DEFINE(erpc_wifi_workq_stack,
 		      CONFIG_WIFI_ERPC_WIFI_WORKQ_STACK_SIZE);
+
+#define EVENT_MONITOR_STACK_SIZE 2048
+K_THREAD_STACK_DEFINE(event_monitor_stack, EVENT_MONITOR_STACK_SIZE);
+
+// Thread control structure
+static struct k_thread event_monitor_thread;
+static k_tid_t event_monitor_tid;
+
+// Thread status
+static bool event_monitor_running = false;
+
 
 // TODO can this be static?
 struct erpc_wifi_data erpc_wifi_driver_data;
@@ -558,6 +569,62 @@ static void erpc_wifi_client_error_handler(erpc_status_t err, uint32_t func_id)
 	}
 }
 
+static void erpc_wifi_apply_dhcp_lease(struct net_if *iface, struct WIFIIPConfiguration_t *config)
+{
+	if (!iface) return;
+
+	struct in_addr ip, netmask, gateway;
+	char ip_str[16];
+	char netmask_str[16];
+	char gateway_str[16];
+
+	// Extract IPv4 address from WIFIIPAddress_t structure
+	uint32_t ip_raw = config->xIPAddress.ulAddress[0];
+	uint32_t netmask_raw = config->xNetMask.ulAddress[0];
+	uint32_t gateway_raw = config->xGateway.ulAddress[0];
+
+	// Convert from network byte order to individual bytes
+	uint8_t *ip_bytes = (uint8_t *)&ip_raw;
+	uint8_t *netmask_bytes = (uint8_t *)&netmask_raw;
+	uint8_t *gateway_bytes = (uint8_t *)&gateway_raw;
+
+	// Create IP strings for net_addr_pton
+	snprintf(ip_str, sizeof(ip_str), "%d.%d.%d.%d",
+		ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3]);
+	snprintf(netmask_str, sizeof(netmask_str), "%d.%d.%d.%d",
+		netmask_bytes[0], netmask_bytes[1], netmask_bytes[2], netmask_bytes[3]);
+	snprintf(gateway_str, sizeof(gateway_str), "%d.%d.%d.%d",
+		gateway_bytes[0], gateway_bytes[1], gateway_bytes[2], gateway_bytes[3]);
+
+	// Convert to in_addr structures
+	net_addr_pton(AF_INET, ip_str, &ip);
+	net_addr_pton(AF_INET, netmask_str, &netmask);
+	net_addr_pton(AF_INET, gateway_str, &gateway);
+
+	// Clear existing addresses and add new one
+	net_if_ipv4_addr_rm(iface, NULL);
+	struct net_if_addr *ifaddr = net_if_ipv4_addr_add(iface, &ip, NET_ADDR_MANUAL, 0);
+
+	if (ifaddr) {
+		net_if_ipv4_set_netmask(iface, &netmask);
+		net_if_ipv4_set_gw(iface, &gateway);
+
+		LOG_INF("DHCP IP applied: %s", ip_str);
+		LOG_INF("Netmask: %s, Gateway: %s", netmask_str, gateway_str);
+
+		// CRITICAL: Notify the network management system about IP assignment
+		net_mgmt_event_notify(NET_EVENT_IPV4_ADDR_ADD, iface);
+		net_mgmt_event_notify(NET_EVENT_IPV4_DHCP_BOUND, iface);
+
+	        // Also ensure interface is up
+		net_if_up(iface);
+
+		LOG_INF("DHCP events notified to application");
+	} else {
+		LOG_ERR("Failed to add IP address to interface");
+	}
+}
+
 #ifdef CONFIG_ERPC_TRANSPORT_UART
 static void erpc_wifi_server_thread(void *arg1, void *unused1, void *unused2) 
 {
@@ -627,7 +694,115 @@ void ra_erpc_server_event_handler(const ra_erp_server_event_t * event)
 			break;
 	}
 }
+#else
+static void erpc_wifi_server_event_monitor_thread(void *arg1, void *arg2, void *arg3)
+{
+	struct erpc_wifi_data *data = (struct erpc_wifi_data *)arg1;
+	struct ra_erp_server_event_t event;
+	int ret;
+	enum wifi_iface_state state;
+
+	LOG_INF("Server event monitor thread started");
+
+	while (event_monitor_running) {
+		memset(&event, 0, sizeof(event));
+		printk("Waiting for server event in loop...\n");
+		state = data->state;
+		if (state != WIFI_STATE_COMPLETED) {
+			k_sleep(K_SECONDS(2));
+			continue;
+		}
+
+		erpc_get_server_event(&event);
+
+		struct net_if *iface = data->net_iface;
+		if (!iface) {
+			LOG_WRN("No network interface available for event handling, waiting...");
+			continue;
+		}
+
+		switch (event.event_id) {
+		case eNetworkInterfaceUp:
+			LOG_INF("Server: Network interface up");
+			// net_if_set_up(iface);
+			net_mgmt_event_notify(NET_EVENT_IF_UP, iface);
+			break;
+
+		case eNetworkInterfaceDown:
+			LOG_INF("Server: Network interface down");
+			// net_if_set_down(iface);
+			net_mgmt_event_notify(NET_EVENT_IF_DOWN, iface);
+			// erpc_wifi_clear_ip();
+			break;
+
+		case eNetworkInterfaceIPAssigned:
+			LOG_INF("Server: IP assigned - applying IP");
+			erpc_wifi_apply_dhcp_lease(iface, &event.event_data.xConfig);
+			break;
+
+		default:
+			LOG_WRN("Unknown server event: %d", event.event_id);
+			break;
+		}
+
+		k_sleep(K_SECONDS(3));
+	}
+}
 #endif
+
+// Function to start the event monitor thread
+int erpc_wifi_start_event_monitor(struct erpc_wifi_data *data)
+{
+	printk("Starting event monitor thread...\n");
+	if (event_monitor_running) {
+		LOG_WRN("Event monitor already running");
+		return -EALREADY;
+	}
+
+	event_monitor_running = true;
+
+	// Create and start the thread
+	event_monitor_tid = k_thread_create(
+        &event_monitor_thread,
+        event_monitor_stack,
+        K_THREAD_STACK_SIZEOF(event_monitor_stack),
+        erpc_wifi_server_event_monitor_thread,
+        data, NULL, NULL,
+        K_PRIO_PREEMPT(8),
+        0, K_NO_WAIT
+	);
+
+	k_sleep(K_MSEC(100));
+	LOG_INF("Thread started successfully");
+	if (!event_monitor_tid) {
+		LOG_ERR("Failed to create event monitor thread");
+		event_monitor_running = false;
+		return -ENOMEM;
+	}
+
+	LOG_INF("Event monitor thread started successfully");
+	return 0;
+}
+
+// Function to stop the event monitor thread
+int erpc_wifi_stop_event_monitor(void)
+{
+	if (!event_monitor_running) {
+		LOG_WRN("Event monitor not running");
+		return -EALREADY;
+	}
+
+	event_monitor_running = false;
+
+	// Wait for thread to exit
+	if (event_monitor_tid) {
+		k_thread_join(&event_monitor_thread, K_FOREVER);
+		event_monitor_tid = NULL;
+	}
+
+	LOG_INF("Event monitor thread stopped");
+	return 0;
+}
 
 static const struct wifi_mgmt_ops erpc_wifi_mgmt_ops = {
 	.scan		   		= erpc_wifi_mgmt_scan,
@@ -667,7 +842,7 @@ static int erpc_wifi_init(const struct device *dev)
 	erpc_service_t service;
 	erpc_transport_t arbitrator;
 #endif
-
+	int ret;
 	struct erpc_wifi_data *data = dev->data;
 
 	LOG_DBG("initializing...");
@@ -731,6 +906,13 @@ static int erpc_wifi_init(const struct device *dev)
 					data, NULL, NULL,
 					CONFIG_WIFI_ERPC_WIFI_SERVER_THREAD_PRIORITY, 0,
 					K_NO_WAIT);
+#else
+    // Start event monitor thread
+    ret = erpc_wifi_start_event_monitor(data);
+    if (ret < 0 && ret != -EALREADY) {
+        LOG_ERR("Failed to start event monitor: %d", ret);
+        return ret;
+    }
 #endif
 
 	data->net_iface = NET_IF_GET(Z_DEVICE_DT_DEV_ID(DT_DRV_INST(0)), 0);
