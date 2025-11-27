@@ -577,7 +577,7 @@ static int erpc_wifi_socket_poll_offload(struct zvfs_pollfd *fds, int nfds, int 
         }
 
         // Check socket events via eRPC
-        uint32_t events = get_socket_events(sock->fd);
+        events = erpc_get_socket_event(sock->fd);
         fds[i].revents = 0;
 
         if ((events & SOCKET_EVENT_RX) && (fds[i].events & ZVFS_POLLIN)) {

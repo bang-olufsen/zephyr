@@ -785,6 +785,16 @@ int erpc_wifi_start_event_monitor(struct erpc_wifi_data *data)
 	return 0;
 }
 
+int erpc_get_socket_event(int socket)
+{
+
+	if (event_monitor_running) {
+		return -EALREADY;
+	}
+
+	return get_socket_events(socket);
+}
+
 // Function to stop the event monitor thread
 int erpc_wifi_stop_event_monitor(void)
 {
