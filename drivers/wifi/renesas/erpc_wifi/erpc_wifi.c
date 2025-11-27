@@ -738,6 +738,7 @@ static void erpc_wifi_server_event_monitor_thread(void *arg1, void *arg2, void *
 		case eNetworkInterfaceIPAssigned:
 			LOG_INF("Server: IP assigned - applying IP");
 			erpc_wifi_apply_dhcp_lease(iface, &event.event_data.xConfig);
+			event_monitor_running = false;
 			break;
 
 		default:
