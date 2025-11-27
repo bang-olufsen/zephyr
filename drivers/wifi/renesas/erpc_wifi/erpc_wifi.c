@@ -702,11 +702,9 @@ static void erpc_wifi_server_event_monitor_thread(void *arg1, void *arg2, void *
 	int ret;
 	enum wifi_iface_state state;
 
-	LOG_INF("Server event monitor thread started");
 
 	while (event_monitor_running) {
 		memset(&event, 0, sizeof(event));
-		printk("Waiting for server event in loop...\n");
 		state = data->state;
 		if (state != WIFI_STATE_COMPLETED) {
 			k_sleep(K_SECONDS(2));
@@ -742,7 +740,6 @@ static void erpc_wifi_server_event_monitor_thread(void *arg1, void *arg2, void *
 			break;
 
 		default:
-			LOG_WRN("Unknown server event: %d", event.event_id);
 			break;
 		}
 
