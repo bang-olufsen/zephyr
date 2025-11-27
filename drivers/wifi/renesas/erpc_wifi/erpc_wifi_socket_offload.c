@@ -565,8 +565,6 @@ static int erpc_wifi_socket_poll_offload(struct zvfs_pollfd *fds, int nfds, int 
     bool forever = (timeout == SYS_FOREVER_MS);
 	uint32_t events = 0;
 
-    LOG_DBG("Poll offload: %d fds, timeout: %d ms", nfds, timeout);
-
     // First, check current state of all sockets
     for (int i = 0; i < nfds; i++) {
         struct erpc_wifi_socket *sock = find_socket_by_fd(fds[i].fd);
