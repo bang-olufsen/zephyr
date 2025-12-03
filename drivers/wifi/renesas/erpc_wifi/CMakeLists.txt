@@ -5,6 +5,7 @@ if(CONFIG_WIFI_ERPC_WIFI)
   zephyr_library_sources(
     erpc_wifi.c
 	erpc_wifi_socket_offload.c
+	erpc_dns_offload.c
 	service/c_wifi_host_to_ra_client.cpp
 	service/wifi_host_to_ra_client.cpp
 	service/wifi_host_to_ra_interface.cpp

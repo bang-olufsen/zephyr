@@ -806,6 +806,7 @@ int erpc_wifi_socket_offload_init(struct net_if *iface)
 
 	net_if_socket_offload_set(iface, erpc_wifi_socket_create);
 
+	erpc_wifi_dns_offload_init();
 	return 0;
 }
 

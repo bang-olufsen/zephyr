@@ -613,7 +613,6 @@ static void erpc_wifi_apply_dhcp_lease(struct net_if *iface, struct WIFIIPConfig
 		LOG_INF("Netmask: %s, Gateway: %s", netmask_str, gateway_str);
 
 		// CRITICAL: Notify the network management system about IP assignment
-		net_mgmt_event_notify(NET_EVENT_IPV4_ADDR_ADD, iface);
 		net_mgmt_event_notify(NET_EVENT_IPV4_DHCP_BOUND, iface);
 
 	        // Also ensure interface is up
