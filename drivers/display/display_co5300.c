@@ -20,6 +20,12 @@ LOG_MODULE_REGISTER(co5300, CONFIG_DISPLAY_LOG_LEVEL);
 /* Users can adjust the length as needed */
 #define CO5300_MAX_CMD_LEN 32
 
+/*
+ * The circular panel actually starts to show from column 6, columns
+ * 0~5 are cut off physically.
+ */
+#define CO5300_MISSING_COLUMNS 6U
+
 struct co5300_config {
 #if (DT_HAS_COMPAT_ON_BUS_STATUS_OKAY(chipone_co5300, mipi_dsi))
 	const struct device *mipi_dsi;
@@ -141,6 +147,7 @@ static int co5300_write(const struct device *dev, uint16_t x, uint16_t y,
 	(void)pm_device_runtime_get(cfg->mipi_dsi);
 #endif
 
+	x += CO5300_MISSING_COLUMNS;
 	if (data->xstart != x || data->width != desc->width) {
 		data->xstart = x;
 		data->width = desc->width;
@@ -299,7 +306,7 @@ static int co5300_configure(const struct device *dev)
 	cmd[0] = 0x02;
 	ret = co5300_dcs_write(dev, MIPI_DCS_SET_TEAR_ON, cmd, 1);
 
-	data->xstart = 0;
+	data->xstart = CO5300_MISSING_COLUMNS;
 	data->width = DT_INST_PROP_OR(0, width, 0);
 
 	cmd[0] = data->xstart >> 8U;
@@ -437,3 +444,4 @@ static int co5300_init(const struct device *dev)
 #endif
 
 DT_FOREACH_STATUS_OKAY(chipone_co5300, CO5300_DEFINE)
+
