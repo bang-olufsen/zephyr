@@ -59,6 +59,33 @@ static bool event_monitor_running = false;
 // TODO can this be static?
 struct erpc_wifi_data erpc_wifi_driver_data;
 
+
+/* ---------------- PMGR DPM timer callback (RA6W1 -> Host) ----------------
+ * ra_pmgr_timer_fired() is an async eRPC callback invoked by RA6W1 when a PMGR
+ * DPM timer expires. We must NOT do heavy work in the callback context.
+ * We enqueue the event and process it in a workqueue context.
+ */
+#ifndef ERPC_WIFI_TIMER_NAME_MAX
+#define ERPC_WIFI_TIMER_NAME_MAX 64
+#endif
+
+struct pmgr_timer_evt {
+	uint32_t job_id;
+	char name[ERPC_WIFI_TIMER_NAME_MAX];
+};
+
+K_MSGQ_DEFINE(pmgr_timer_msgq, sizeof(struct pmgr_timer_evt), 8, 4);
+
+static void pmgr_timer_work_handler(struct k_work *work);
+static K_WORK_DEFINE(pmgr_timer_work, pmgr_timer_work_handler);
+
+/* Weak hook: applications can override this to perform their TCP/telemetry work. */
+__weak void erpc_wifi_pmgr_timer_fired_hook(uint32_t job_id, const char *timer_name)
+{
+	LOG_INF("PMGR timer fired: job_id=%u name=%s", job_id, timer_name ? timer_name : "(null)");
+}
+
+
 static uint8_t wifi_chan_to_band(uint16_t chan)
 {
 	uint8_t band;
@@ -481,6 +508,53 @@ static void erpc_wifi_mgmt_disconnect_work(struct k_work *work)
 	wifi_mgmt_raise_disconnect_result_event(dev->net_iface, status);
 	net_if_dormant_on(dev->net_iface);
 }
+
+/* -------------------------------------------------------------------------- */
+/* Wi-Fi Power Save (DPM)
+ *
+ * If this driver doesn't implement wifi_mgmt_ops.set_power_save(), Zephyr's
+ * NET_REQUEST_WIFI_PS will fail with -ENOTSUP (often seen as -134). This is
+ * exactly what your app is printing.
+ *
+ * We implement set_power_save and forward the request to the RA6W1 side via
+ * the eRPC power-save APIs added to wifi.erpc.
+ */
+static int erpc_wifi_mgmt_set_power_save(const struct device *dev,
+                                        struct wifi_ps_params *params)
+{
+	ARG_UNUSED(dev);
+
+	if (params == NULL) {
+		return -EINVAL;
+	}
+
+	/* If caller disables PS, treat it as a no-op for now (keep link working). */
+	if (!params->enabled) {
+		return 0;
+	}
+
+	/* Push wakeup mode + listen interval, then apply. */
+	int32_t rc;
+
+	rc = ra6w1_wifi_ps_set_param((ra_wifi_ps_param_t)RA_WIFI_PS_PARAM_WAKEUP_MODE,
+	                           (int32_t)params->wakeup_mode);
+	if (rc != 0) {
+		return -EIO;
+	}
+
+	rc = ra6w1_wifi_ps_set_param((ra_wifi_ps_param_t)RA_WIFI_PS_PARAM_LISTEN_INTERVAL,
+	                           (int32_t)params->listen_interval);
+	if (rc != 0) {
+		return -EIO;
+	}
+
+	rc = ra6w1_wifi_ps_apply();
+	if (rc != 0) {
+		return -EIO;
+	}
+
+	return 0;
+}
 /*
 	Parameters returned from this function via wifi_iface_status:
 
@@ -693,6 +767,42 @@ void ra_erpc_server_event_handler(const ra_erp_server_event_t * event)
 			break;
 	}
 }
+
+/* Async callback from RA6W1 (wifi_async.ra_pmgr_timer_fired) */
+void ra_pmgr_timer_fired(uint32_t job_id, const char *timer_name, uint8_t name_max)
+{
+	struct pmgr_timer_evt evt;
+
+	memset(&evt, 0, sizeof(evt));
+	evt.job_id = job_id;
+
+	if (timer_name != NULL) {
+		size_t n = (size_t)name_max;
+		if (n >= sizeof(evt.name)) {
+			n = sizeof(evt.name) - 1U;
+		}
+		memcpy(evt.name, timer_name, n);
+		evt.name[n] = '\0';
+	}
+
+	/* Queue + defer work (avoid doing work in callback context) */
+	if (k_msgq_put(&pmgr_timer_msgq, &evt, K_NO_WAIT) != 0) {
+		LOG_WRN("PMGR timer evt dropped (queue full)");
+		return;
+	}
+
+	k_work_submit_to_queue(&erpc_wifi_driver_data.workq, &pmgr_timer_work);
+}
+
+static void pmgr_timer_work_handler(struct k_work *work)
+{
+	ARG_UNUSED(work);
+
+	struct pmgr_timer_evt evt;
+	while (k_msgq_get(&pmgr_timer_msgq, &evt, K_NO_WAIT) == 0) {
+		erpc_wifi_pmgr_timer_fired_hook(evt.job_id, evt.name);
+	}
+}
 #else
 static void erpc_wifi_server_event_monitor_thread(void *arg1, void *arg2, void *arg3)
 {
@@ -815,6 +925,7 @@ static const struct wifi_mgmt_ops erpc_wifi_mgmt_ops = {
 	.scan		   		= erpc_wifi_mgmt_scan,
 	.connect	   		= erpc_wifi_mgmt_connect,
 	.disconnect	   		= erpc_wifi_mgmt_disconnect,
+	.set_power_save		= erpc_wifi_mgmt_set_power_save,
 	.iface_status		= erpc_wifi_mgmt_iface_status,
 	.get_version        = erpc_wifi_mgmt_get_version,
 #ifdef CONFIG_WIFI_ERPC_WIFI_SOFTAP_SUPPORT

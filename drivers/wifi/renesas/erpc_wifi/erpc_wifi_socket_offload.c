@@ -69,6 +69,10 @@ struct erpc_wifi_socket {
     struct k_poll_signal poll_signal;  // Add this
     short poll_events;                 // Events poll is waiting for
     short triggered_events;            // Events that occurred
+    int type;        // POSIX socket type (e.g. SOCK_STREAM)
+    uint16_t bound_port;   // Local port from bind() (host order)
+    bool tcp_dpm_filter_set; // true if TCP DPM wake filter installed
+
 };
 #endif 
 struct erpc_wifi_socket {
@@ -104,6 +108,8 @@ struct erpc_wifi_socket {
  
 	struct k_mutex *lock;              /* for ZFD_IOCTL_SET_LOCK */
     uint32_t flags;              /* O_NONBLOCK etc */
+	uint16_t bound_port;   // Local port from bind() (host order)
+    bool tcp_dpm_filter_set; // true if TCP DPM wake filter installed
 };
  
 
@@ -291,6 +297,22 @@ static int erpc_wifi_socket_bind(void *obj, const struct sockaddr *addr, socklen
 	struct ra_erpc_sockaddr addr_erpc_wifi;
 	struct erpc_wifi_socket *sock = (struct erpc_wifi_socket *)obj;
 
+
+/* Remove TCP DPM wake filter if it was installed for this socket */
+if (sock->tcp_dpm_filter_set && sock->bound_port != 0) {
+	(void)ra6w1_wifi_dpm_tcp_port_delete(sock->bound_port);
+	sock->tcp_dpm_filter_set = false;
+	LOG_INF("TCP DPM wake filter removed for port %u", sock->bound_port);
+}
+
+	/* Capture local port for TCP DPM wake filter setup on listen() */
+	sock->bound_port = 0;
+	if (addr && addr->sa_family == AF_INET) {
+		const struct sockaddr_in *sin = (const struct sockaddr_in *)addr;
+		sock->bound_port = ntohs(sin->sin_port);
+		LOG_DBG("bind: local port=%u", sock->bound_port);
+	}
+
 	LOG_DBG("fd: %d", sock->fd);
 
 	ret = erpc_wifi_socket_addr_from_posix(addr, &addr_erpc_wifi);
@@ -350,6 +372,23 @@ static int erpc_wifi_socket_listen(void *obj, int backlog)
 	ret = ra6w1_listen(sock->fd, backlog);
 
 	LOG_DBG("ra6w1_listen: %d", ret);
+
+
+/* If DPM is enabled on RA6W1, install a TCP wake filter for server sockets.
+ * This allows incoming SYN/data on bound_port to wake the module from DPM.
+ */
+if (ret == 0 && sock->type == SOCK_STREAM && sock->bound_port != 0 && !sock->tcp_dpm_filter_set) {
+	int32_t dpm_on = ra6w1_pmgr_dpm_is_enabled();
+	if (dpm_on == 1) {
+		int32_t rc = ra6w1_wifi_dpm_tcp_port_filter_set(sock->bound_port);
+		if (rc == 0) {
+			sock->tcp_dpm_filter_set = true;
+			LOG_INF("TCP DPM wake filter set for port %u", sock->bound_port);
+		} else {
+			LOG_WRN("Failed to set TCP DPM wake filter for port %u (rc=%d)", sock->bound_port, rc);
+		}
+	}
+}
 
 	return ret;
 }
