@@ -60,11 +60,6 @@ static bool event_monitor_running = false;
 struct erpc_wifi_data erpc_wifi_driver_data;
 
 
-/* ---------------- PMGR DPM timer callback (RA6W1 -> Host) ----------------
- * ra_pmgr_timer_fired() is an async eRPC callback invoked by RA6W1 when a PMGR
- * DPM timer expires. We must NOT do heavy work in the callback context.
- * We enqueue the event and process it in a workqueue context.
- */
 #ifndef ERPC_WIFI_TIMER_NAME_MAX
 #define ERPC_WIFI_TIMER_NAME_MAX 64
 #endif
@@ -79,7 +74,6 @@ K_MSGQ_DEFINE(pmgr_timer_msgq, sizeof(struct pmgr_timer_evt), 8, 4);
 static void pmgr_timer_work_handler(struct k_work *work);
 static K_WORK_DEFINE(pmgr_timer_work, pmgr_timer_work_handler);
 
-/* Weak hook: applications can override this to perform their TCP/telemetry work. */
 __weak void erpc_wifi_pmgr_timer_fired_hook(uint32_t job_id, const char *timer_name)
 {
 	LOG_INF("PMGR timer fired: job_id=%u name=%s", job_id, timer_name ? timer_name : "(null)");
@@ -512,42 +506,48 @@ static void erpc_wifi_mgmt_disconnect_work(struct k_work *work)
 /* -------------------------------------------------------------------------- */
 /* Wi-Fi Power Save (DPM)
  *
- * If this driver doesn't implement wifi_mgmt_ops.set_power_save(), Zephyr's
- * NET_REQUEST_WIFI_PS will fail with -ENOTSUP (often seen as -134). This is
- * exactly what your app is printing.
- *
- * We implement set_power_save and forward the request to the RA6W1 side via
- * the eRPC power-save APIs added to wifi.erpc.
+ *set_power_save and forward the request to the RA6W1 side via
+ *the eRPC power-save APIs added to wifi.erpc.
  */
-static int erpc_wifi_mgmt_set_power_save(const struct device *dev,
-                                        struct wifi_ps_params *params)
+static int erpc_wifi_mgmt_set_power_save(struct net_if *iface,
+					  struct wifi_ps_params *params)
 {
-	ARG_UNUSED(dev);
+	ARG_UNUSED(iface);
 
 	if (params == NULL) {
 		return -EINVAL;
 	}
 
-	/* If caller disables PS, treat it as a no-op for now (keep link working). */
-	if (!params->enabled) {
-		return 0;
-	}
-
-	/* Push wakeup mode + listen interval, then apply. */
 	int32_t rc;
 
-	rc = ra6w1_wifi_ps_set_param((ra_wifi_ps_param_t)RA_WIFI_PS_PARAM_WAKEUP_MODE,
-	                           (int32_t)params->wakeup_mode);
+	switch (params->type) {
+	case WIFI_PS_PARAM_LISTEN_INTERVAL:
+		rc = ra6w1_wifi_ps_set_param((ra_wifi_ps_param_t)RA_WIFI_PS_PARAM_LISTEN_INTERVAL,
+					     (uint32_t)params->listen_interval);
+		break;
+
+	case WIFI_PS_PARAM_WAKEUP_MODE:
+		rc = ra6w1_wifi_ps_set_param((ra_wifi_ps_param_t)RA_WIFI_PS_PARAM_WAKEUP_MODE,
+					     (uint32_t)params->wakeup_mode);
+		break;
+
+	case WIFI_PS_PARAM_EXIT_STRATEGY:
+		rc = ra6w1_wifi_ps_set_param((ra_wifi_ps_param_t)RA_WIFI_PS_PARAM_EXIT_STRATEGY,
+					     (uint32_t)params->exit_strategy);
+		break;
+
+	case WIFI_PS_PARAM_TIMEOUT:
+		rc = ra6w1_wifi_ps_set_param((ra_wifi_ps_param_t)RA_WIFI_PS_PARAM_TIMEOUT_MS,
+					     (uint32_t)params->timeout_ms);
+		break;
+
+	default:
+		return -ENOTSUP;
+	}
+
 	if (rc != 0) {
 		return -EIO;
 	}
-
-	rc = ra6w1_wifi_ps_set_param((ra_wifi_ps_param_t)RA_WIFI_PS_PARAM_LISTEN_INTERVAL,
-	                           (int32_t)params->listen_interval);
-	if (rc != 0) {
-		return -EIO;
-	}
-
 	rc = ra6w1_wifi_ps_apply();
 	if (rc != 0) {
 		return -EIO;
@@ -555,6 +555,7 @@ static int erpc_wifi_mgmt_set_power_save(const struct device *dev,
 
 	return 0;
 }
+
 /*
 	Parameters returned from this function via wifi_iface_status:
 
