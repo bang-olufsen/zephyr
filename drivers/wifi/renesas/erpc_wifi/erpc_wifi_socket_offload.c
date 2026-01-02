@@ -5,7 +5,46 @@
  */
 
 #include <zephyr/logging/log.h>
+#ifndef ERPC_PMGR_JOB_ID_SEND
+#define ERPC_PMGR_JOB_ID_SEND  (1U)
+#endif
+#ifndef ERPC_PMGR_JOB_ID_RECV
+#define ERPC_PMGR_JOB_ID_RECV  (2U)
+#endif
+
 LOG_MODULE_REGISTER(erpc_wifi_socket_offload, CONFIG_WIFI_LOG_LEVEL);
+
+
+#ifndef PMGR_CONSTRAINT_POWER_RAM
+#define PMGR_CONSTRAINT_POWER_RAM   (1U)
+#endif
+
+static int pmgr_dpm_cached_enabled(void)
+{
+	static int cached = -1;
+
+	if (cached >= 0) {
+		return cached;
+	}
+
+	int32_t en = ra6w1_pmgr_dpm_is_enabled();
+	cached = (en == 1) ? 1 : 0;
+	return cached;
+}
+
+static inline void pmgr_ram_hold(void)
+{
+	if (pmgr_dpm_cached_enabled()) {
+		(void)ra6w1_pmgr_add_sleep_constraint(PMGR_CONSTRAINT_POWER_RAM);
+	}
+}
+
+static inline void pmgr_ram_release(void)
+{
+	if (pmgr_dpm_cached_enabled()) {
+		(void)ra6w1_pmgr_remove_sleep_constraint(PMGR_CONSTRAINT_POWER_RAM);
+	}
+}
 
 #include <zephyr/kernel.h>
 #include <zephyr/device.h>
@@ -298,14 +337,12 @@ static int erpc_wifi_socket_bind(void *obj, const struct sockaddr *addr, socklen
 	struct erpc_wifi_socket *sock = (struct erpc_wifi_socket *)obj;
 
 
-/* Remove TCP DPM wake filter if it was installed for this socket */
 if (sock->tcp_dpm_filter_set && sock->bound_port != 0) {
 	(void)ra6w1_wifi_dpm_tcp_port_delete(sock->bound_port);
 	sock->tcp_dpm_filter_set = false;
 	LOG_INF("TCP DPM wake filter removed for port %u", sock->bound_port);
 }
 
-	/* Capture local port for TCP DPM wake filter setup on listen() */
 	sock->bound_port = 0;
 	if (addr && addr->sa_family == AF_INET) {
 		const struct sockaddr_in *sin = (const struct sockaddr_in *)addr;
@@ -354,7 +391,9 @@ static int erpc_wifi_socket_connect(void *obj, const struct sockaddr *addr,
 		return ret;
 	}
 
+	pmgr_ram_hold();
 	ret = ra6w1_connect(sock->fd, &addr_erpc_wifi, sizeof(struct ra_erpc_sockaddr));
+	pmgr_ram_release();
 
 	LOG_DBG("ra6w1_connect: %d", ret);
 
@@ -373,10 +412,6 @@ static int erpc_wifi_socket_listen(void *obj, int backlog)
 
 	LOG_DBG("ra6w1_listen: %d", ret);
 
-
-/* If DPM is enabled on RA6W1, install a TCP wake filter for server sockets.
- * This allows incoming SYN/data on bound_port to wake the module from DPM.
- */
 if (ret == 0 && sock->type == SOCK_STREAM && sock->bound_port != 0 && !sock->tcp_dpm_filter_set) {
 	int32_t dpm_on = ra6w1_pmgr_dpm_is_enabled();
 	if (dpm_on == 1) {
@@ -457,7 +492,9 @@ static ssize_t erpc_wifi_socket_sendto(void *obj, const void *buf, size_t len, i
 			return ret;
 		}
 
+	pmgr_ram_hold();
     	ret = ra6w1_sendto(sock->fd, buf, len, flags, &addr_erpc_wifi, sizeof(ra_erpc_sockaddr));
+	pmgr_ram_release();
 
 		LOG_DBG("ra6w1_sendto: %d", ret);
 
@@ -510,7 +547,9 @@ static ssize_t erpc_wifi_socket_recvfrom(void *obj, void *buf, size_t max_len, i
 	LOG_DBG("addrlen: %x", (uint32_t)addrlen);
 
 	if (src_addr) {
+	pmgr_ram_hold();
 		ret = ra6w1_recvfrom(sock->fd, buf, max_len, flags, (ra_erpc_sockaddr *)src_addr, addrlen);
+	pmgr_ram_release();
 
 		LOG_DBG("ra6w1_recvfrom: %d", ret);
 	
@@ -531,6 +570,13 @@ static ssize_t erpc_wifi_socket_recvfrom(void *obj, void *buf, size_t max_len, i
 			src_addr->sa_family = AF_INET;
 		}
 	} else {
+
+
+
+(void)ra6w1_pmgr_dpm_job_name_set(ERPC_PMGR_JOB_ID_RECV, "ERPC_TCP_RECV");
+
+(void)ra6w1_pmgr_dpm_rcv_ready_set(ERPC_PMGR_JOB_ID_RECV);
+
 		ret = ra6w1_recv(sock->fd, buf, max_len, flags);
 
 		LOG_DBG("ra6w1_recvfrom: %d", ret);
@@ -618,7 +664,9 @@ static int erpc_wifi_socket_close(void *obj)
 
 	erpc_wifi_socket_free(sock->fd);
 
+	pmgr_ram_hold();
 	ret = ra6w1_close(sock->fd);
+	pmgr_ram_release();
 
 	LOG_DBG("ra6w1_close: %d", ret);
 
@@ -927,7 +975,9 @@ static int erpc_wifi_socket_create(int family, int type, int proto)
 		return err;
 	}
 
+	pmgr_ram_hold();
 	sock = ra6w1_socket(family_erpc_wifi, type, proto);
+	pmgr_ram_release();
 
 	LOG_DBG("ra6w1_socket: %d", sock);
 
