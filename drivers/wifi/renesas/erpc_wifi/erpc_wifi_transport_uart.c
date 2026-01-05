@@ -28,3 +28,8 @@ erpc_transport_t erpc_wifi_transport_init(void)
 
     return erpc_transport_zephyr_uart_init((void *)dev);
 }
+
+void erpc_wifi_transport_deinit(erpc_transport_t transport)
+{
+    erpc_transport_zephyr_uart_deinit(transport);
+}

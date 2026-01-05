@@ -15,6 +15,10 @@
 #include <stdlib.h>
 
 #include <zephyr/logging/log.h>
+
+/* Gate socket/eRPC TX while RA6W1 is in DPM */
+extern void erpc_wifi_socket_tx_block_set(bool enable, uint32_t timeout_ms);
+
 LOG_MODULE_REGISTER(wifi_erpc_wifi, CONFIG_WIFI_LOG_LEVEL);
 
 #include <zephyr/net/wifi_mgmt.h>
@@ -51,7 +55,7 @@ K_THREAD_STACK_DEFINE(event_monitor_stack, EVENT_MONITOR_STACK_SIZE);
 // Thread control structure
 static struct k_thread event_monitor_thread;
 static k_tid_t event_monitor_tid;
-
+static struct k_mutex g_erpc_wifi_mutex;
 // Thread status
 static bool event_monitor_running = false;
 
@@ -60,6 +64,27 @@ static bool event_monitor_running = false;
 struct erpc_wifi_data erpc_wifi_driver_data;
 
 
+/* RA6W1 PMGR constraint bit masks (rm_pmgr_w_api.h) */
+#ifndef PMGR_CONSTRAINT_SLEEP_PROHIBITED
+#define PMGR_CONSTRAINT_SLEEP_PROHIBITED   (1U << 0)
+#endif
+
+void erpc_wifi_lock(void)
+{
+	k_mutex_lock(&g_erpc_wifi_mutex, K_FOREVER);
+}
+
+void erpc_wifi_unlock(void)
+{
+	k_mutex_unlock(&g_erpc_wifi_mutex);
+}
+
+
+/* ---------------- PMGR DPM timer callback (RA6W1 -> Host) ----------------
+ * ra_pmgr_timer_fired() is an async eRPC callback invoked by RA6W1 when a PMGR
+ * DPM timer expires. We must NOT do heavy work in the callback context.
+ * We enqueue the event and process it in a workqueue context.
+ */
 #ifndef ERPC_WIFI_TIMER_NAME_MAX
 #define ERPC_WIFI_TIMER_NAME_MAX 64
 #endif
@@ -506,8 +531,6 @@ static void erpc_wifi_mgmt_disconnect_work(struct k_work *work)
 /* -------------------------------------------------------------------------- */
 /* Wi-Fi Power Save (DPM)
  *
- *set_power_save and forward the request to the RA6W1 side via
- *the eRPC power-save APIs added to wifi.erpc.
  */
 static int erpc_wifi_mgmt_set_power_save(struct net_if *iface,
 					  struct wifi_ps_params *params)
@@ -519,11 +542,14 @@ static int erpc_wifi_mgmt_set_power_save(struct net_if *iface,
 	}
 
 	int32_t rc;
-
+	LOG_INF("PS set: type=%u li=%u wm=%u exit=%u tmo=%u",
+        params->type, params->listen_interval,
+        params->wakeup_mode, params->exit_strategy, params->timeout_ms);
 	switch (params->type) {
 	case WIFI_PS_PARAM_LISTEN_INTERVAL:
 		rc = ra6w1_wifi_ps_set_param((ra_wifi_ps_param_t)RA_WIFI_PS_PARAM_LISTEN_INTERVAL,
 					     (uint32_t)params->listen_interval);
+		LOG_INF("Set LISTEN_INTERVAL rc=%d", rc);
 		break;
 
 	case WIFI_PS_PARAM_WAKEUP_MODE:
@@ -537,20 +563,40 @@ static int erpc_wifi_mgmt_set_power_save(struct net_if *iface,
 		break;
 
 	case WIFI_PS_PARAM_TIMEOUT:
-		rc = ra6w1_wifi_ps_set_param((ra_wifi_ps_param_t)RA_WIFI_PS_PARAM_TIMEOUT_MS,
-					     (uint32_t)params->timeout_ms);
-		break;
+	rc = ra6w1_wifi_ps_set_param(
+		(ra_wifi_ps_param_t)RA_WIFI_PS_PARAM_TIMEOUT_MS,
+		(uint32_t)params->timeout_ms);
+
+	if (rc != 0) {
+		return -EIO;
+	}
+
+	rc = ra6w1_wifi_ps_apply();
+	if (rc != 0) {
+		return -EIO;
+	}
+
+	(void)ra6w1_pmgr_remove_sleep_constraint(1U << 0);
+	break;
 
 	default:
 		return -ENOTSUP;
 	}
 
+
 	if (rc != 0) {
 		return -EIO;
 	}
-	rc = ra6w1_wifi_ps_apply();
-	if (rc != 0) {
-		return -EIO;
+
+	/* Gate socket/eRPC TX while in low power mode.
+	 * - timeout_ms > 0  => low power active (block until RA wakes)
+	 * - timeout_ms == 0 => active mode (unblock)
+	 */
+	if (params->timeout_ms > 0U) {
+		/* Give some headroom over the configured timeout for wake polling */
+		erpc_wifi_socket_tx_block_set(true, params->timeout_ms + 5000U);
+	} else {
+		erpc_wifi_socket_tx_block_set(false, 0U);
 	}
 
 	return 0;
@@ -737,7 +783,12 @@ void ra_erpc_server_event_handler(const ra_erp_server_event_t * event)
 		{
 			LOG_DBG("eDeviceReset");
 
-			data->reset_msg_received = true;
+			if (data->driver_state == ERPC_WIFI_DRIVER_INITIALIZED) {
+				LOG_WRN("Server reset detected during runtime, triggering recovery");
+				k_work_submit_to_queue(&data->workq, &data->reinit_work);
+			} else {
+				data->reset_msg_received = true;
+			}
 			break;
 		}
 		case eNetworkInterfaceIPAssigned:
@@ -921,7 +972,6 @@ int erpc_wifi_stop_event_monitor(void)
 	LOG_INF("Event monitor thread stopped");
 	return 0;
 }
-
 static const struct wifi_mgmt_ops erpc_wifi_mgmt_ops = {
 	.scan		   		= erpc_wifi_mgmt_scan,
 	.connect	   		= erpc_wifi_mgmt_connect,
@@ -943,6 +993,130 @@ static const struct net_wifi_mgmt_offload erpc_wifi_api = {
 	.wifi_mgmt_api = &erpc_wifi_mgmt_ops,
 };
 
+static void erpc_wifi_deinit_erpc(struct erpc_wifi_data *data)
+{
+	if (data->server_thread_id) {
+		k_thread_abort(data->server_thread_id);
+		data->server_thread_id = NULL;
+	}
+
+#ifdef CONFIG_ERPC_TRANSPORT_UART
+	if (data->erpc_server) {
+		erpc_server_stop(data->erpc_server);
+		erpc_server_deinit(data->erpc_server);
+		data->erpc_server = NULL;
+	}
+#else
+	erpc_wifi_stop_event_monitor();
+#endif
+
+	if (data->client_manager) {
+		erpc_client_deinit(data->client_manager);
+		data->client_manager = NULL;
+	}
+
+	if (data->mbf) {
+		erpc_mbf_dynamic_deinit(data->mbf);
+		data->mbf = NULL;
+	}
+
+	if (data->transport) {
+		erpc_wifi_transport_deinit(data->transport);
+		data->transport = NULL;
+	}
+}
+
+static int erpc_wifi_init_erpc(struct erpc_wifi_data *data)
+{
+	erpc_transport_t transport;
+	erpc_mbf_t mbf;
+	erpc_client_t client_manager;
+#ifdef CONFIG_ERPC_TRANSPORT_UART
+	erpc_service_t service;
+	erpc_transport_t arbitrator;
+#endif
+	int ret;
+
+	/* Initialize the eRPC client infrastructure */	
+	transport = erpc_wifi_transport_init();
+	if (transport == NULL) {
+		LOG_ERR("Failed to initialize eRPC transport");
+		return -ENODEV;
+	}
+	data->transport = transport;
+
+	mbf = erpc_mbf_dynamic_init();
+	if (mbf == NULL) {
+		LOG_ERR("Failed to initialize eRPC message buffer factory");
+		return -ENODEV;
+	}
+	data->mbf = mbf;
+
+#ifdef CONFIG_ERPC_TRANSPORT_UART
+	client_manager = erpc_arbitrated_client_init(transport, mbf, &arbitrator);
+	data->arbitrator = arbitrator;
+#else
+	client_manager = erpc_client_init(transport, mbf);
+#endif
+
+	if (client_manager == NULL) {
+		LOG_ERR("Failed to initialize eRPC client");
+		return -ENODEV;
+	}
+	data->client_manager = client_manager;
+
+	/* Initialize eRPC client interface */
+	erpc_client_set_error_handler(client_manager, erpc_wifi_client_error_handler);
+	initwifi_client(client_manager);
+
+#ifdef CONFIG_ERPC_TRANSPORT_UART
+	/* Initialize eRPC server interface */
+	data->erpc_server = erpc_server_init(arbitrator, mbf);
+	service = create_wifi_async_service();
+	data->service = (void *)service;
+
+	/* Add custom service implementation to the server */
+	erpc_add_service_to_server(data->erpc_server, service);
+
+	data->server_thread_id = k_thread_create(&erpc_wifi_server_thread_data,
+					erpc_wifi_server_thread_stack,
+					CONFIG_WIFI_ERPC_WIFI_SERVER_THREAD_STACK_SIZE,
+					erpc_wifi_server_thread,
+					data, NULL, NULL,
+					CONFIG_WIFI_ERPC_WIFI_SERVER_THREAD_PRIORITY, 0,
+					K_NO_WAIT);
+#else
+	// Start event monitor thread
+	ret = erpc_wifi_start_event_monitor(data);
+	if (ret < 0 && ret != -EALREADY) {
+		LOG_ERR("Failed to start event monitor: %d", ret);
+		return ret;
+	}
+#endif
+
+	return 0;
+}
+
+static void erpc_wifi_reinit_work_handler(struct k_work *work)
+{
+	struct erpc_wifi_data *data = CONTAINER_OF(work, struct erpc_wifi_data, reinit_work);
+
+	LOG_WRN("Re-initializing eRPC stack due to device reset...");
+
+	erpc_wifi_deinit_erpc(data);
+
+	/* Short delay to allow resource cleanup and device stabilization */
+	k_sleep(K_MSEC(100));
+
+	int ret = erpc_wifi_init_erpc(data);
+	if (ret != 0) {
+		LOG_ERR("Failed to re-initialize eRPC stack: %d", ret);
+	} else {
+		LOG_INF("eRPC re-initialization complete");
+		data->driver_state = ERPC_WIFI_DRIVER_INITIALIZED;
+	}
+}
+
 static int erpc_wifi_init(const struct device *dev);
 
 NET_DEVICE_DT_INST_OFFLOAD_DEFINE(0, erpc_wifi_init, NULL,
@@ -954,15 +1128,8 @@ CONNECTIVITY_WIFI_MGMT_BIND(Z_DEVICE_DT_DEV_ID(DT_DRV_INST(0)));
 
 static int erpc_wifi_init(const struct device *dev)
 {
-	erpc_transport_t transport;
-	erpc_mbf_t mbf;
-	erpc_client_t client_manager;
-#ifdef CONFIG_ERPC_TRANSPORT_UART
-	erpc_service_t service;
-	erpc_transport_t arbitrator;
-#endif
-	int ret;
 	struct erpc_wifi_data *data = dev->data;
+	int ret;
 
 	LOG_DBG("initializing...");
 
@@ -972,6 +1139,7 @@ static int erpc_wifi_init(const struct device *dev)
 	k_work_init(&data->scan_work, erpc_wifi_mgmt_scan_work);
 	k_work_init(&data->connect_work, erpc_wifi_mgmt_connect_work);
 	k_work_init(&data->disconnect_work, erpc_wifi_mgmt_disconnect_work);
+	k_work_init(&data->reinit_work, erpc_wifi_reinit_work_handler);
 
 	k_sem_init(&data->sem_if_ready, 0, 1);
 
@@ -983,56 +1151,10 @@ static int erpc_wifi_init(const struct device *dev)
 	k_thread_name_set(&data->workq.thread, "erpc_wifi_workq");
 
 	/* Initialize the eRPC client infrastructure */	
-	transport = erpc_wifi_transport_init();
-	if (transport == NULL) {
-		LOG_ERR("Failed to initialize eRPC transport");
-		return -ENODEV;
+	ret = erpc_wifi_init_erpc(data);
+	if (ret != 0) {
+		return ret;
 	}
-
-	mbf = erpc_mbf_dynamic_init();
-	if (mbf == NULL) {
-		LOG_ERR("Failed to initialize eRPC message buffer factory");
-		return -ENODEV;
-	}
-
-#ifdef CONFIG_ERPC_TRANSPORT_UART
-	client_manager = erpc_arbitrated_client_init(transport, mbf, &arbitrator);
-#else
-	client_manager = erpc_client_init(transport, mbf);
-#endif
-
-	if (client_manager == NULL) {
-		LOG_ERR("Failed to initialize eRPC client");
-		return -ENODEV;
-	}
-
-	/* Initialize eRPC client interface */
-	erpc_client_set_error_handler(client_manager, erpc_wifi_client_error_handler);
-	initwifi_client(client_manager);
-
-#ifdef CONFIG_ERPC_TRANSPORT_UART
-	/* Initialize eRPC server interface */
-	data->erpc_server = erpc_server_init(arbitrator, mbf);
-	service = create_wifi_async_service();
-
-	/* Add custom service implementation to the server */
-	erpc_add_service_to_server(data->erpc_server, service);
-
-	k_thread_create(&erpc_wifi_server_thread_data,
-					erpc_wifi_server_thread_stack,
-					CONFIG_WIFI_ERPC_WIFI_SERVER_THREAD_STACK_SIZE,
-					erpc_wifi_server_thread,
-					data, NULL, NULL,
-					CONFIG_WIFI_ERPC_WIFI_SERVER_THREAD_PRIORITY, 0,
-					K_NO_WAIT);
-#else
-    // Start event monitor thread
-    ret = erpc_wifi_start_event_monitor(data);
-    if (ret < 0 && ret != -EALREADY) {
-        LOG_ERR("Failed to start event monitor: %d", ret);
-        return ret;
-    }
-#endif
 
 	data->net_iface = NET_IF_GET(Z_DEVICE_DT_DEV_ID(DT_DRV_INST(0)), 0);
 
