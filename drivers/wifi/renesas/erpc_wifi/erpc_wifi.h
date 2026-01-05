@@ -10,7 +10,11 @@
 #include <zephyr/net/wifi_mgmt.h>
 #include <zephyr/drivers/spi.h>
 #include <wifi_host_to_ra_common.h>
+#include <wifi_host_to_ra_common.h>
 #include <erpc_server_setup.h>
+#include <erpc_client_setup.h>
+#include <erpc_transport_setup.h>
+#include <erpc_mbf_setup.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -31,6 +35,13 @@ struct erpc_wifi_data {
 	uint16_t scan_max_bss_cnt;
 	struct WIFINetworkParams_t drv_nwk_params;
 	erpc_server_t erpc_server;
+	erpc_client_t client_manager;
+	erpc_transport_t transport;
+	erpc_transport_t arbitrator;
+	erpc_mbf_t mbf;
+	void* service;
+	k_tid_t server_thread_id;
+	
 	enum erpc_wifi_driver_state driver_state;
 	bool reset_msg_received;
 
@@ -38,6 +49,7 @@ struct erpc_wifi_data {
 	struct k_work scan_work;
 	struct k_work connect_work;
 	struct k_work disconnect_work;
+	struct k_work reinit_work;
 
 	struct k_sem sem_if_ready;
 

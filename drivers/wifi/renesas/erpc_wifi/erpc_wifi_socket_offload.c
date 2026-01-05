@@ -5,6 +5,8 @@
  */
 
 #include <zephyr/logging/log.h>
+#include <zephyr/kernel.h>
+/* PMGR DPM job ids used by RA6W1 socket shim */
 #ifndef ERPC_PMGR_JOB_ID_SEND
 #define ERPC_PMGR_JOB_ID_SEND  (1U)
 #endif
@@ -14,9 +16,57 @@
 
 LOG_MODULE_REGISTER(erpc_wifi_socket_offload, CONFIG_WIFI_LOG_LEVEL);
 
+static atomic_t g_erpc_tx_blocked;
+static atomic_t g_erpc_tx_block_timeout_ms;
+void erpc_wifi_socket_tx_block_set(bool enable, uint32_t timeout_ms)
+{
+	atomic_set(&g_erpc_tx_blocked, enable ? 1 : 0);
+	atomic_set(&g_erpc_tx_block_timeout_ms, (atomic_val_t)timeout_ms);
+}
 
+/* eRPC PMGR hooks (provided by RA6W1 eRPC PMGR service) */
+extern int32_t ra6w1_pmgr_dpm_is_wakeup(void);
+extern int32_t ra6w1_pmgr_dpm_wakeup_done(uint32_t job_id);
+
+static int wait_ra_awake(uint32_t job_id)
+{
+	if (atomic_get(&g_erpc_tx_blocked) == 0) {
+		return 0;
+	}
+
+	int64_t start = k_uptime_get();
+	uint32_t tmo = (uint32_t)atomic_get(&g_erpc_tx_block_timeout_ms);
+
+	for (;;) {
+		int32_t awake;
+
+		erpc_wifi_lock();
+		awake = ra6w1_pmgr_dpm_is_wakeup();
+		erpc_wifi_unlock();
+
+		if (awake == 1) {
+			erpc_wifi_lock();
+			(void)ra6w1_pmgr_dpm_wakeup_done(job_id);
+			erpc_wifi_unlock();
+			return 0;
+		}
+
+		if (tmo > 0U && (k_uptime_get() - start) > (int64_t)tmo) {
+			return -EAGAIN;
+		}
+
+		k_msleep(50);
+	}
+}
+extern void erpc_wifi_lock(void);
+extern void erpc_wifi_unlock(void);
+
+
+#ifndef PMGR_CONSTRAINT_SLEEP_PROHIBITED
+#define PMGR_CONSTRAINT_SLEEP_PROHIBITED   (1U << 0)
+#endif
 #ifndef PMGR_CONSTRAINT_POWER_RAM
-#define PMGR_CONSTRAINT_POWER_RAM   (1U)
+#define PMGR_CONSTRAINT_POWER_RAM          (1U << 2)
 #endif
 
 static int pmgr_dpm_cached_enabled(void)
@@ -27,7 +77,9 @@ static int pmgr_dpm_cached_enabled(void)
 		return cached;
 	}
 
+	erpc_wifi_lock();
 	int32_t en = ra6w1_pmgr_dpm_is_enabled();
+	erpc_wifi_unlock();
 	cached = (en == 1) ? 1 : 0;
 	return cached;
 }
@@ -35,18 +87,22 @@ static int pmgr_dpm_cached_enabled(void)
 static inline void pmgr_ram_hold(void)
 {
 	if (pmgr_dpm_cached_enabled()) {
+		erpc_wifi_lock();
 		(void)ra6w1_pmgr_add_sleep_constraint(PMGR_CONSTRAINT_POWER_RAM);
+		erpc_wifi_unlock();
 	}
 }
 
 static inline void pmgr_ram_release(void)
 {
 	if (pmgr_dpm_cached_enabled()) {
+		erpc_wifi_lock();
 		(void)ra6w1_pmgr_remove_sleep_constraint(PMGR_CONSTRAINT_POWER_RAM);
+		erpc_wifi_unlock();
 	}
 }
 
-#include <zephyr/kernel.h>
+#include <zephyr/sys/atomic.h>
 #include <zephyr/device.h>
 #include <string.h>
 #include <stdlib.h>
@@ -367,6 +423,9 @@ if (sock->tcp_dpm_filter_set && sock->bound_port != 0) {
 static int erpc_wifi_socket_connect(void *obj, const struct sockaddr *addr,
 		       socklen_t addrlen)
 {
+	int __w = wait_ra_awake(ERPC_PMGR_JOB_ID_SEND);
+	if (__w != 0) { return __w; }
+
 	int ret;
 	struct ra_erpc_sockaddr addr_erpc_wifi;
 	struct erpc_wifi_socket *sock = (struct erpc_wifi_socket *)obj;
@@ -389,13 +448,7 @@ static int erpc_wifi_socket_connect(void *obj, const struct sockaddr *addr,
 	ret = erpc_wifi_socket_addr_from_posix(addr, &addr_erpc_wifi);
 	if (ret) {
 		return ret;
-	}
-
-	pmgr_ram_hold();
-	ret = ra6w1_connect(sock->fd, &addr_erpc_wifi, sizeof(struct ra_erpc_sockaddr));
-	pmgr_ram_release();
-
-	LOG_DBG("ra6w1_connect: %d", ret);
+	}	ret = ra6w1_connect(sock->fd, &addr_erpc_wifi, sizeof(struct ra_erpc_sockaddr));	LOG_DBG("ra6w1_connect: %d", ret);
 
 	return ret;
 }
@@ -440,7 +493,7 @@ static int erpc_wifi_socket_accept(void *obj, struct sockaddr *addr, socklen_t *
 
     fd = zvfs_reserve_fd();
 
-    /* Accept returns file descriptor for new connected socket */
+	/* Accept returns file descriptor for new connected socket */
 	conn_fd = ra6w1_accept(sock->fd, &addr_erpc_wifi, addrlen);
     LOG_DBG("ra6w1_accept: %d", conn_fd);
 
@@ -477,6 +530,9 @@ static int erpc_wifi_socket_accept(void *obj, struct sockaddr *addr, socklen_t *
 static ssize_t erpc_wifi_socket_sendto(void *obj, const void *buf, size_t len, int flags,
 			  const struct sockaddr *dest_addr, socklen_t addrlen)
 {
+	int __w = wait_ra_awake(ERPC_PMGR_JOB_ID_SEND);
+	if (__w != 0) { return __w; }
+
 	int ret;
 	struct ra_erpc_sockaddr addr_erpc_wifi;
 	struct erpc_wifi_socket *sock = (struct erpc_wifi_socket *)obj;
@@ -490,11 +546,7 @@ static ssize_t erpc_wifi_socket_sendto(void *obj, const void *buf, size_t len, i
 		ret = erpc_wifi_socket_addr_from_posix(dest_addr, &addr_erpc_wifi);
 		if (ret) {
 			return ret;
-		}
-
-	pmgr_ram_hold();
-    	ret = ra6w1_sendto(sock->fd, buf, len, flags, &addr_erpc_wifi, sizeof(ra_erpc_sockaddr));
-	pmgr_ram_release();
+		}    	ret = ra6w1_sendto(sock->fd, buf, len, flags, &addr_erpc_wifi, sizeof(ra_erpc_sockaddr));		LOG_DBG("ra6w1_sendto: %d", ret);
 
 		LOG_DBG("ra6w1_sendto: %d", ret);
 
@@ -538,6 +590,9 @@ return -ENODATA;
 static ssize_t erpc_wifi_socket_recvfrom(void *obj, void *buf, size_t max_len, int flags,
 			    struct sockaddr *src_addr, socklen_t *addrlen)
 {
+	int __w = wait_ra_awake(ERPC_PMGR_JOB_ID_RECV);
+	if (__w != 0) { return __w; }
+
 	int ret;
 	struct erpc_wifi_socket *sock = (struct erpc_wifi_socket *)obj;
 	
@@ -546,12 +601,7 @@ static ssize_t erpc_wifi_socket_recvfrom(void *obj, void *buf, size_t max_len, i
 	LOG_DBG("src_addr: %x", (uint32_t)src_addr);
 	LOG_DBG("addrlen: %x", (uint32_t)addrlen);
 
-	if (src_addr) {
-	pmgr_ram_hold();
-		ret = ra6w1_recvfrom(sock->fd, buf, max_len, flags, (ra_erpc_sockaddr *)src_addr, addrlen);
-	pmgr_ram_release();
-
-		LOG_DBG("ra6w1_recvfrom: %d", ret);
+	if (src_addr) {		ret = ra6w1_recvfrom(sock->fd, buf, max_len, flags, (ra_erpc_sockaddr *)src_addr, addrlen);		LOG_DBG("ra6w1_recvfrom: %d", ret);
 	
 		if (src_addr) {
 			LOG_DBG("family: %d", src_addr->sa_family);
@@ -572,7 +622,6 @@ static ssize_t erpc_wifi_socket_recvfrom(void *obj, void *buf, size_t max_len, i
 	} else {
 
 
-
 (void)ra6w1_pmgr_dpm_job_name_set(ERPC_PMGR_JOB_ID_RECV, "ERPC_TCP_RECV");
 
 (void)ra6w1_pmgr_dpm_rcv_ready_set(ERPC_PMGR_JOB_ID_RECV);
@@ -587,7 +636,10 @@ static ssize_t erpc_wifi_socket_recvfrom(void *obj, void *buf, size_t max_len, i
 
 static int erpc_wifi_socket_getsockopt(void *obj, int level, int optname,
 			  void *optval, socklen_t *optlen)
-{	
+{
+	int __w = wait_ra_awake(ERPC_PMGR_JOB_ID_SEND);
+	if (__w != 0) { return __w; }
+	
     int ret;
 	int level_erpc_wifi;
 	int optname_erpc_wifi;
@@ -616,7 +668,10 @@ static int erpc_wifi_socket_getsockopt(void *obj, int level, int optname,
 
 static int erpc_wifi_socket_setsockopt(void *obj, int level, int optname,
 			  const void *optval, socklen_t optlen)
-{	
+{
+	int __w = wait_ra_awake(ERPC_PMGR_JOB_ID_SEND);
+	if (__w != 0) { return __w; }
+	
     int ret;
 	int level_erpc_wifi;
 	int optname_erpc_wifi;
@@ -657,17 +712,16 @@ static ssize_t erpc_wifi_socket_write(void *obj, const void *buf, size_t sz)
 
 static int erpc_wifi_socket_close(void *obj)
 {
+	int __w = wait_ra_awake(ERPC_PMGR_JOB_ID_SEND);
+	if (__w != 0) { return __w; }
+
 	int ret;
 	struct erpc_wifi_socket *sock = (struct erpc_wifi_socket *)obj;
 
 	LOG_DBG("erpc_wifi_socket_close");
 
 	erpc_wifi_socket_free(sock->fd);
-
-	pmgr_ram_hold();
 	ret = ra6w1_close(sock->fd);
-	pmgr_ram_release();
-
 	LOG_DBG("ra6w1_close: %d", ret);
 
 	return ret;
@@ -973,13 +1027,7 @@ static int erpc_wifi_socket_create(int family, int type, int proto)
 	if (err) {
 		LOG_ERR("unsupported family: %d", family);
 		return err;
-	}
-
-	pmgr_ram_hold();
-	sock = ra6w1_socket(family_erpc_wifi, type, proto);
-	pmgr_ram_release();
-
-	LOG_DBG("ra6w1_socket: %d", sock);
+	}	sock = ra6w1_socket(family_erpc_wifi, type, proto);	LOG_DBG("ra6w1_socket: %d", sock);
 
 	if (sock < 0) {
 		zvfs_free_fd(fd);
