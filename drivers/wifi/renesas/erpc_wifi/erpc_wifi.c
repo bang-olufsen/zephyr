@@ -79,12 +79,6 @@ void erpc_wifi_unlock(void)
 	k_mutex_unlock(&g_erpc_wifi_mutex);
 }
 
-
-/* ---------------- PMGR DPM timer callback (RA6W1 -> Host) ----------------
- * ra_pmgr_timer_fired() is an async eRPC callback invoked by RA6W1 when a PMGR
- * DPM timer expires. We must NOT do heavy work in the callback context.
- * We enqueue the event and process it in a workqueue context.
- */
 #ifndef ERPC_WIFI_TIMER_NAME_MAX
 #define ERPC_WIFI_TIMER_NAME_MAX 64
 #endif
@@ -532,8 +526,140 @@ static void erpc_wifi_mgmt_disconnect_work(struct k_work *work)
 /* Wi-Fi Power Save (DPM)
  *
  */
+
+/* ---------------- Wi-Fi Power Save mapping ----------------
+ *
+ * Customer expectation (Zephyr net_mgmt):
+ *  - LISTEN_INTERVAL / WAKEUP_MODE / EXIT_STRATEGY / TIMEOUT are "parameters"
+ *  - STATE (enable/disable) actually turns low-power behavior on/off
+ *
+ * IMPORTANT (this project):
+ *  - Host owns enabling/disabling DPM sleep via RA6W1 PMGR sleep constraint.
+ *  - RA6W1 wifi_ps_apply() only configures parameters (PTIM etc). It does not force sleep.
+ *
+ * TIMEOUT semantics:
+ *  - We interpret params.timeout_ms as "delay before allowing RA6W1 to enter DPM sleep"
+ *    after STATE is enabled (common app behavior: finish work window, then sleep).
+ */
+
+struct erpc_ps_cache {
+	uint32_t listen_interval;
+	uint32_t wakeup_mode;
+	uint32_t exit_strategy;
+	uint32_t timeout_ms;
+
+	bool li_set;
+	bool wm_set;
+	bool ex_set;
+	bool tmo_set;
+
+	bool enabled;          /* last STATE */
+	bool allow_sleep_sent; /* whether we have removed the sleep constraint */
+};
+
+static struct erpc_ps_cache g_ps;
+
+/* Delayable work: after TIMEOUT, allow RA6W1 to sleep */
+static struct k_work_delayable g_ps_enable_work;
+static void ps_send_param_to_ra(ra_wifi_ps_param_t p, uint32_t v)
+{
+	(void)ra6w1_wifi_ps_set_param(p, v);
+}
+static void ps_allow_sleep_work(struct k_work *work)
+{
+	ARG_UNUSED(work);
+	LOG_INF("PS allow sleep work fired");
+	if (!g_ps.enabled) {
+		return;
+	}
+    if (g_ps.li_set) {
+		LOG_INF("PS set: LISTEN_INTERVAL=%u", g_ps.listen_interval);
+        ps_send_param_to_ra((ra_wifi_ps_param_t)RA_WIFI_PS_PARAM_LISTEN_INTERVAL,
+                            g_ps.listen_interval);
+    }
+    if (g_ps.wm_set) {
+		LOG_INF("PS set: WAKEUP_MODE=%u", g_ps.wakeup_mode);
+        ps_send_param_to_ra((ra_wifi_ps_param_t)RA_WIFI_PS_PARAM_WAKEUP_MODE,
+                            g_ps.wakeup_mode);
+    }
+    if (g_ps.ex_set) {
+        ps_send_param_to_ra((ra_wifi_ps_param_t)RA_WIFI_PS_PARAM_EXIT_STRATEGY,
+                            g_ps.exit_strategy);
+    }
+    if (g_ps.tmo_set) {
+        ps_send_param_to_ra((ra_wifi_ps_param_t)RA_WIFI_PS_PARAM_TIMEOUT_MS,
+                            g_ps.timeout_ms);
+    }
+	#if 1
+	int32_t rc = ra6w1_wifi_ps_apply();
+	if (rc != 0) {
+		LOG_INF("wifi_ps_apply failed rc=%d", rc);
+		return;
+	}
+#endif
+LOG_INF("PS allow sleep work: removing sleep constraint");
+	(void)ra6w1_pmgr_remove_sleep_constraint(1U << 0);
+	g_ps.allow_sleep_sent = true;
+
+	uint32_t gate_ms = 30000U;
+	if (g_ps.tmo_set && g_ps.timeout_ms > 0U) {
+		gate_ms = g_ps.timeout_ms + 5000U;
+	}
+	erpc_wifi_socket_tx_block_set(true, gate_ms);
+
+	LOG_INF("PS ENABLED: allow sleep (timeout=%u, gate=%u)", g_ps.timeout_ms, gate_ms);
+}
+
+
+int erpc_wifi_ping(uint32_t timeout_ms)
+{
+	int64_t const deadline = k_uptime_get() + (int64_t)timeout_ms;
+
+	while (k_uptime_get() < deadline) {
+		int32_t rc = ra6w1_wifi_ps_apply();
+		//int32_t rc= ra6w1_pmgr_dpm_is_enabled();
+		if (rc == 0) {
+			return 0;
+		}
+		k_msleep(50);
+	}
+
+	return -EIO;
+}
+/* Enable/disable is owned by STATE only */
+static int ps_set_state(bool enable)
+{
+	if (enable) {
+		g_ps.enabled = true;
+
+		
+		g_ps.allow_sleep_sent = false;
+		(void)ra6w1_pmgr_add_sleep_constraint(1U << 0);
+		uint32_t delay = (g_ps.tmo_set) ? g_ps.timeout_ms : 0U;
+		//printf("in %s delay = %d\n",__func__,delay);
+		k_work_reschedule(&g_ps_enable_work, K_MSEC(delay));
+
+		erpc_wifi_socket_tx_block_set(false, 0U);
+
+		LOG_INF("PS STATE ENABLE requested (delay=%u ms)", delay);
+		//(void)ra6w1_pmgr_remove_sleep_constraint(1U << 0);
+		return 0;
+	}
+	g_ps.enabled = false;
+	k_work_cancel_delayable(&g_ps_enable_work);
+
+	(void)ra6w1_pmgr_add_sleep_constraint(1U << 0);
+	g_ps.allow_sleep_sent = false;
+
+	erpc_wifi_socket_tx_block_set(false, 0U);
+
+	LOG_INF("PS STATE DISABLED");
+	return 0;
+}
+
+
 static int erpc_wifi_mgmt_set_power_save(struct net_if *iface,
-					  struct wifi_ps_params *params)
+					struct wifi_ps_params *params)
 {
 	ARG_UNUSED(iface);
 
@@ -541,66 +667,57 @@ static int erpc_wifi_mgmt_set_power_save(struct net_if *iface,
 		return -EINVAL;
 	}
 
-	int32_t rc;
-	LOG_INF("PS set: type=%u li=%u wm=%u exit=%u tmo=%u",
-        params->type, params->listen_interval,
-        params->wakeup_mode, params->exit_strategy, params->timeout_ms);
+	LOG_INF("PS set: type=%u enabled=%u li=%u wm=%u exit=%u tmo=%u",
+		params->type, params->enabled,
+		params->listen_interval, params->wakeup_mode,
+		params->exit_strategy, params->timeout_ms);
+
 	switch (params->type) {
+
 	case WIFI_PS_PARAM_LISTEN_INTERVAL:
-		rc = ra6w1_wifi_ps_set_param((ra_wifi_ps_param_t)RA_WIFI_PS_PARAM_LISTEN_INTERVAL,
-					     (uint32_t)params->listen_interval);
-		LOG_INF("Set LISTEN_INTERVAL rc=%d", rc);
-		break;
+		g_ps.listen_interval = (uint32_t)params->listen_interval;
+		g_ps.li_set = true;
+		ps_send_param_to_ra((ra_wifi_ps_param_t)RA_WIFI_PS_PARAM_LISTEN_INTERVAL,
+				    g_ps.listen_interval);
+		return 0;
 
 	case WIFI_PS_PARAM_WAKEUP_MODE:
-		rc = ra6w1_wifi_ps_set_param((ra_wifi_ps_param_t)RA_WIFI_PS_PARAM_WAKEUP_MODE,
-					     (uint32_t)params->wakeup_mode);
-		break;
+		g_ps.wakeup_mode = (uint32_t)params->wakeup_mode;
+		g_ps.wm_set = true;
+		ps_send_param_to_ra((ra_wifi_ps_param_t)RA_WIFI_PS_PARAM_WAKEUP_MODE,
+				    g_ps.wakeup_mode);
+		return 0;
 
 	case WIFI_PS_PARAM_EXIT_STRATEGY:
-		rc = ra6w1_wifi_ps_set_param((ra_wifi_ps_param_t)RA_WIFI_PS_PARAM_EXIT_STRATEGY,
-					     (uint32_t)params->exit_strategy);
-		break;
+		g_ps.exit_strategy = (uint32_t)params->exit_strategy;
+		g_ps.ex_set = true;
+		ps_send_param_to_ra((ra_wifi_ps_param_t)RA_WIFI_PS_PARAM_EXIT_STRATEGY,
+				    g_ps.exit_strategy);
+		return 0;
 
 	case WIFI_PS_PARAM_TIMEOUT:
-	rc = ra6w1_wifi_ps_set_param(
-		(ra_wifi_ps_param_t)RA_WIFI_PS_PARAM_TIMEOUT_MS,
-		(uint32_t)params->timeout_ms);
+		g_ps.timeout_ms = (uint32_t)params->timeout_ms;
+		g_ps.tmo_set = true;
+		ps_send_param_to_ra((ra_wifi_ps_param_t)RA_WIFI_PS_PARAM_TIMEOUT_MS,
+				    g_ps.timeout_ms);
+		if (g_ps.enabled && !g_ps.allow_sleep_sent) {
+			k_work_reschedule(&g_ps_enable_work, K_MSEC(g_ps.timeout_ms));
+		}
+		return 0;
 
-	if (rc != 0) {
-		return -EIO;
-	}
-
-	rc = ra6w1_wifi_ps_apply();
-	if (rc != 0) {
-		return -EIO;
-	}
-
-	(void)ra6w1_pmgr_remove_sleep_constraint(1U << 0);
-	break;
+	case WIFI_PS_PARAM_STATE:
+		if (params->enabled == WIFI_PS_ENABLED) {
+			return ps_set_state(true);
+		} else if (params->enabled == WIFI_PS_DISABLED) {
+			return ps_set_state(false);
+		}
+		return -EINVAL;
 
 	default:
 		return -ENOTSUP;
 	}
-
-
-	if (rc != 0) {
-		return -EIO;
-	}
-
-	/* Gate socket/eRPC TX while in low power mode.
-	 * - timeout_ms > 0  => low power active (block until RA wakes)
-	 * - timeout_ms == 0 => active mode (unblock)
-	 */
-	if (params->timeout_ms > 0U) {
-		/* Give some headroom over the configured timeout for wake polling */
-		erpc_wifi_socket_tx_block_set(true, params->timeout_ms + 5000U);
-	} else {
-		erpc_wifi_socket_tx_block_set(false, 0U);
-	}
-
-	return 0;
 }
+
 
 /*
 	Parameters returned from this function via wifi_iface_status:
@@ -1140,6 +1257,8 @@ static int erpc_wifi_init(const struct device *dev)
 	k_work_init(&data->connect_work, erpc_wifi_mgmt_connect_work);
 	k_work_init(&data->disconnect_work, erpc_wifi_mgmt_disconnect_work);
 	k_work_init(&data->reinit_work, erpc_wifi_reinit_work_handler);
+
+	k_work_init_delayable(&g_ps_enable_work, ps_allow_sleep_work);
 
 	k_sem_init(&data->sem_if_ready, 0, 1);
 
