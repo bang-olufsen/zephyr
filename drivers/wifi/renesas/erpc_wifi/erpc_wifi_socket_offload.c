@@ -995,6 +995,83 @@ static int erpc_wifi_socket_poll_offload(struct zvfs_pollfd *fds, int nfds, int 
 #endif 
 static int erpc_wifi_socket_poll_offload(struct zvfs_pollfd *fds, int nfds, int timeout)
 {
+    int64_t start_time = k_uptime_get();
+    bool forever = (timeout == SYS_FOREVER_MS);
+
+    LOG_INF("poll start nfds=%d timeout=%d", nfds, timeout);
+
+    for (int i = 0; i < nfds; i++) {
+        fds[i].revents = 0;
+    }
+
+    while (1) {
+        int ret = 0;
+        int w = wait_ra_awake( ERPC_PMGR_JOB_ID_RECV);
+        if (w != 0) {
+            if (!forever) {
+                int64_t elapsed = k_uptime_get() - start_time;
+                if (elapsed >= timeout) {
+                    LOG_INF("poll timed out (wake failed) elapsed=%lld", elapsed);
+                    return 0;
+                }
+            }
+            k_msleep(10);
+            continue;
+        }
+
+        for (int i = 0; i < nfds; i++) {
+            uint16_t events;
+
+            fds[i].revents = 0;
+
+            struct erpc_wifi_socket *sock = find_socket_by_fd(fds[i].fd);
+            if (!sock) {
+                fds[i].revents = ZVFS_POLLNVAL;
+                ret++;
+                continue;
+            }
+
+            events = get_socket_events(sock->fd);
+
+            if ((events & SOCKET_EVENT_RX) && (fds[i].events & ZVFS_POLLIN)) {
+                fds[i].revents |= ZVFS_POLLIN;
+            }
+            if ((events & SOCKET_EVENT_TX) && (fds[i].events & ZVFS_POLLOUT)) {
+                fds[i].revents |= ZVFS_POLLOUT;
+            }
+            if ((events & SOCKET_EVENT_ERR) && (fds[i].events & ZVFS_POLLERR)) {
+                fds[i].revents |= ZVFS_POLLERR;
+            }
+            if ((events & SOCKET_EVENT_CLOSE) && (fds[i].events & ZVFS_POLLHUP)) {
+                fds[i].revents |= ZVFS_POLLHUP;
+            }
+
+            if (fds[i].revents != 0) {
+                ret++;
+            }
+        }
+
+        if (ret > 0) {
+            LOG_INF("poll ready ret=%d", ret);
+            return ret;
+        }
+
+        if (!forever) {
+            int64_t elapsed = k_uptime_get() - start_time;
+            if (elapsed >= timeout) {
+                LOG_INF("poll timed out elapsed=%lld", elapsed);
+                return 0;
+            }
+        }
+
+        k_msleep(10);
+    }
+}
+
+#if 0
+/* Original version before fix */
+static int erpc_wifi_socket_poll_offload(struct zvfs_pollfd *fds, int nfds, int timeout)
+{
     int ret = 0;
     int64_t start_time = k_uptime_get();
     bool forever = (timeout == SYS_FOREVER_MS);
@@ -1071,6 +1148,8 @@ static int erpc_wifi_socket_poll_offload(struct zvfs_pollfd *fds, int nfds, int 
  
     return ret;
 }
+#endif
+
 static int erpc_wifi_socket_poll_update(struct zvfs_pollfd *pfd, struct k_poll_event **pev)
 {
     // For mixed polling - if you have both offloaded and regular sockets
