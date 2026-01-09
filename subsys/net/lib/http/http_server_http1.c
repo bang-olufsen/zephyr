@@ -378,6 +378,14 @@ static int dynamic_get_del_req(struct http_resource_detail_dynamic *dynamic_deta
 		return ret;
 	}
 
+	ret = dynamic_detail->cb(client, HTTP_SERVER_TRANSACTION_COMPLETE, &request_ctx,
+				 &response_ctx, dynamic_detail->user_data);
+	if (ret < 0) {
+		return ret;
+	}
+
+	dynamic_detail->holder = NULL;
+
 	return 0;
 }
 
@@ -455,6 +463,12 @@ static int dynamic_post_put_req(struct http_resource_detail_dynamic *dynamic_det
 
 		ret = http_server_sendall(client, final_chunk,
 					sizeof(final_chunk) - 1);
+		if (ret < 0) {
+			return ret;
+		}
+
+		ret = dynamic_detail->cb(client, HTTP_SERVER_TRANSACTION_COMPLETE, &request_ctx,
+					 &response_ctx, dynamic_detail->user_data);
 		if (ret < 0) {
 			return ret;
 		}
