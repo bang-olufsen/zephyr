@@ -254,13 +254,13 @@ static uint8_t dynamic_payload[32];
 static size_t dynamic_payload_len = sizeof(dynamic_payload);
 static bool dynamic_error;
 
-static int dynamic_cb(struct http_client_ctx *client, enum http_data_status status,
+static int dynamic_cb(struct http_client_ctx *client, enum http_transaction_status status,
 		      const struct http_request_ctx *request_ctx,
 		      struct http_response_ctx *response_ctx, void *user_data)
 {
 	static size_t offset;
 
-	if (status == HTTP_SERVER_DATA_ABORTED) {
+	if (status == HTTP_SERVER_TRANSACTION_ABORTED) {
 		offset = 0;
 		return 0;
 	}
@@ -292,7 +292,7 @@ static int dynamic_cb(struct http_client_ctx *client, enum http_data_status stat
 			offset += request_ctx->data_len;
 		}
 
-		if (status == HTTP_SERVER_DATA_FINAL) {
+		if (status == HTTP_SERVER_REQUEST_DATA_FINAL) {
 			/* All data received, reset progress. */
 			dynamic_payload_len = offset;
 			offset = 0;
@@ -328,7 +328,8 @@ struct test_headers_clone {
 	enum http_header_status status;
 };
 
-static int dynamic_request_headers_cb(struct http_client_ctx *client, enum http_data_status status,
+static int dynamic_request_headers_cb(struct http_client_ctx *client,
+				      enum http_transaction_status status,
 				      const struct http_request_ctx *request_ctx,
 				      struct http_response_ctx *response_ctx, void *user_data)
 {
@@ -426,7 +427,8 @@ enum dynamic_response_headers_variant {
 static uint8_t dynamic_response_headers_variant;
 static uint8_t dynamic_response_headers_buffer[sizeof(long_payload)];
 
-static int dynamic_response_headers_cb(struct http_client_ctx *client, enum http_data_status status,
+static int dynamic_response_headers_cb(struct http_client_ctx *client,
+				       enum http_transaction_status status,
 				       const struct http_request_ctx *request_ctx,
 				       struct http_response_ctx *response_ctx, void *user_data)
 {
@@ -441,7 +443,7 @@ static int dynamic_response_headers_cb(struct http_client_ctx *client, enum http
 		{.name = "Content-Type", .value = "application/json"},
 	};
 
-	if (status != HTTP_SERVER_DATA_FINAL &&
+	if (status != HTTP_SERVER_REQUEST_DATA_FINAL &&
 	    dynamic_response_headers_variant != DYNAMIC_RESPONSE_HEADERS_VARIANT_BODY_LONG) {
 		/* Long body variant is the only one which needs to take some action before final
 		 * data has been received from server
@@ -516,7 +518,7 @@ static int dynamic_response_headers_cb(struct http_client_ctx *client, enum http
 			       request_ctx->data_len);
 			offset += request_ctx->data_len;
 
-			if (status == HTTP_SERVER_DATA_FINAL) {
+			if (status == HTTP_SERVER_REQUEST_DATA_FINAL) {
 				offset = 0;
 			}
 		} else {
