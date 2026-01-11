@@ -626,7 +626,6 @@ int erpc_wifi_ping(uint32_t timeout_ms)
 
 	return -EIO;
 }
-/* Enable/disable is owned by STATE only */
 static int ps_set_state(bool enable)
 {
 	if (enable) {
@@ -636,13 +635,12 @@ static int ps_set_state(bool enable)
 		g_ps.allow_sleep_sent = false;
 		(void)ra6w1_pmgr_add_sleep_constraint(1U << 0);
 		uint32_t delay = (g_ps.tmo_set) ? g_ps.timeout_ms : 0U;
-		//printf("in %s delay = %d\n",__func__,delay);
+
 		k_work_reschedule(&g_ps_enable_work, K_MSEC(delay));
 
 		erpc_wifi_socket_tx_block_set(false, 0U);
 
 		LOG_INF("PS STATE ENABLE requested (delay=%u ms)", delay);
-		//(void)ra6w1_pmgr_remove_sleep_constraint(1U << 0);
 		return 0;
 	}
 	g_ps.enabled = false;
