@@ -34,7 +34,6 @@ void erpc_wifi_socket_tx_block_set(bool enable, uint32_t timeout_ms)
 	atomic_set(&g_erpc_tx_block_timeout_ms, (atomic_val_t)timeout_ms);
 }
 
-/* eRPC PMGR hooks (provided by RA6W1 eRPC PMGR service) */
 extern int32_t ra6w1_pmgr_dpm_is_wakeup(void);
 extern int32_t ra6w1_pmgr_dpm_wakeup_done(uint32_t job_id);
 
@@ -43,9 +42,6 @@ static int wait_ra_awake(uint32_t job_id)
 	if (atomic_get(&g_erpc_tx_blocked) == 0) {
 		return 0;
 	}
-
-	/* Actively wake RA6W1 (GPIO pulse) before polling, if the app provided it */
-	erpc_wifi_gpio_trigger_wakeup();
 
 	int64_t start = k_uptime_get();
 	uint32_t tmo = (uint32_t)atomic_get(&g_erpc_tx_block_timeout_ms);
@@ -64,10 +60,8 @@ static int wait_ra_awake(uint32_t job_id)
 			erpc_wifi_unlock();
 			return 0;
 		}
-
-		/* Re-pulse periodically in case the first pulse was missed */
 		if ((k_uptime_get() - last_pulse) > 500) {
-			erpc_wifi_gpio_trigger_wakeup();
+			//erpc_wifi_gpio_trigger_wakeup();
 			last_pulse = k_uptime_get();
 		}
 
