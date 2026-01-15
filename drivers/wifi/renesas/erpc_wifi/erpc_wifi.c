@@ -568,6 +568,32 @@ static void ps_send_param_to_ra(ra_wifi_ps_param_t p, uint32_t v)
 static void ps_allow_sleep_work(struct k_work *work)
 {
 	ARG_UNUSED(work);
+
+	if (!g_ps.enabled) {
+		LOG_INF("PS allow sleep: ignored (PS disabled)");
+		return;
+	}
+
+	LOG_INF("PS allow sleep: applying PMGR config and releasing constraint");
+	int32_t rc = ra6w1_wifi_ps_apply();
+	if (rc != 0) {
+		LOG_ERR("wifi_ps_apply failed rc=%d", rc);
+		return;
+	}
+
+	/* Allow RA6W1 to enter DPM */
+	(void) ra6w1_pmgr_remove_sleep_constraint(PMGR_CONSTRAINT_SLEEP_PROHIBITED);
+	g_ps.allow_sleep_sent = true;
+   uint32_t gate_ms = g_ps.tmo_set ?
+                      (g_ps.timeout_ms + 5000U) : 30000U;
+   erpc_wifi_socket_tx_block_set(true, gate_ms);
+
+	LOG_INF("PS enabled: sleep allowed");
+}
+#if 0
+static void ps_allow_sleep_work(struct k_work *work)
+{
+	ARG_UNUSED(work);
 	LOG_INF("PS allow sleep work fired");
 	if (!g_ps.enabled) {
 		return;
@@ -609,7 +635,7 @@ LOG_INF("PS allow sleep work: removing sleep constraint");
 
 	LOG_INF("PS ENABLED: allow sleep (timeout=%u, gate=%u)", g_ps.timeout_ms, gate_ms);
 }
-
+#endif
 
 int erpc_wifi_ping(uint32_t timeout_ms)
 {
@@ -626,6 +652,7 @@ int erpc_wifi_ping(uint32_t timeout_ms)
 
 	return -EIO;
 }
+#if 0
 static int ps_set_state(bool enable)
 {
 	if (enable) {
@@ -654,8 +681,120 @@ static int ps_set_state(bool enable)
 	LOG_INF("PS STATE DISABLED");
 	return 0;
 }
+#endif
 
+static int erpc_wifi_mgmt_set_power_save(struct net_if *iface,
+					struct wifi_ps_params *params)
+{
+	ARG_UNUSED(iface);
 
+	if (params == NULL) {
+		return -EINVAL;
+	}
+
+	LOG_INF("PS set: type=%u enabled=%u li=%u wm=%u exit=%u tmo=%u",
+		params->type,
+		params->enabled,
+		params->listen_interval,
+		params->wakeup_mode,
+		params->exit_strategy,
+		params->timeout_ms);
+
+	switch (params->type) {
+
+	case WIFI_PS_PARAM_LISTEN_INTERVAL:
+		g_ps.listen_interval = (uint32_t)params->listen_interval;
+		g_ps.li_set = true;
+
+		ra6w1_wifi_ps_set_param(RA_WIFI_PS_PARAM_LISTEN_INTERVAL,
+					g_ps.listen_interval);
+		return 0;
+
+	case WIFI_PS_PARAM_WAKEUP_MODE:
+		g_ps.wakeup_mode = (uint32_t)params->wakeup_mode;
+		g_ps.wm_set = true;
+
+		ra6w1_wifi_ps_set_param(RA_WIFI_PS_PARAM_WAKEUP_MODE,
+					g_ps.wakeup_mode);
+		return 0;
+
+	case WIFI_PS_PARAM_EXIT_STRATEGY:
+	{
+		uint32_t ra_exit;
+
+		/* Zephyr → RA enum translation
+		 * Zephyr: CUSTOM=0, EVERY=1
+		 * RA:     EVERY=0,  CUSTOM=1
+		 */
+		if (params->exit_strategy == WIFI_PS_EXIT_CUSTOM_ALGO) {
+			ra_exit = RA_WIFI_PS_EXIT_CUSTOM_ALGO;
+		} else {
+			ra_exit = RA_WIFI_PS_EXIT_EVERY_TIM;
+		}
+
+		g_ps.exit_strategy = ra_exit;
+		g_ps.ex_set = true;
+
+		ra6w1_wifi_ps_set_param(RA_WIFI_PS_PARAM_EXIT_STRATEGY,
+					ra_exit);
+		return 0;
+	}
+
+	case WIFI_PS_PARAM_TIMEOUT:
+		g_ps.timeout_ms = (uint32_t)params->timeout_ms;
+		g_ps.tmo_set = true;
+
+		/* Forward to RA – RA PMGR policy decides post-TX behavior */
+		ra6w1_wifi_ps_set_param(RA_WIFI_PS_PARAM_TIMEOUT_MS,
+					g_ps.timeout_ms);
+   if (g_ps.enabled && !g_ps.allow_sleep_sent) {
+       k_work_cancel_delayable(&g_ps_enable_work);
+       k_work_reschedule(&g_ps_enable_work,
+                         K_MSEC(g_ps.timeout_ms));
+  }
+
+		return 0;
+
+	case WIFI_PS_PARAM_STATE:
+		if (params->enabled == WIFI_PS_ENABLED) {
+
+			LOG_INF("PS STATE ENABLE");
+
+			g_ps.enabled = true;
+			g_ps.allow_sleep_sent = false;
+
+			(void) ra6w1_pmgr_add_sleep_constraint(
+					PMGR_CONSTRAINT_SLEEP_PROHIBITED);
+			
+       k_work_cancel_delayable(&g_ps_enable_work);
+
+    	 uint32_t delay = g_ps.tmo_set ? g_ps.timeout_ms : 0U;
+      		k_work_reschedule(&g_ps_enable_work, K_MSEC(delay));
+			erpc_wifi_socket_tx_block_set(false, 0U);
+
+			return 0;
+
+		} else if (params->enabled == WIFI_PS_DISABLED) {
+
+			LOG_INF("PS STATE DISABLE");
+
+			g_ps.enabled = false;
+			g_ps.allow_sleep_sent = false;
+			k_work_cancel_delayable(&g_ps_enable_work);
+
+			(void) ra6w1_pmgr_add_sleep_constraint(
+					PMGR_CONSTRAINT_SLEEP_PROHIBITED);
+			erpc_wifi_socket_tx_block_set(false, 0U);
+			return 0;
+		}
+		return -EINVAL;
+
+	default:
+		return -ENOTSUP;
+	}
+}
+#if 0
+/* original version */
 static int erpc_wifi_mgmt_set_power_save(struct net_if *iface,
 					struct wifi_ps_params *params)
 {
@@ -715,7 +854,7 @@ static int erpc_wifi_mgmt_set_power_save(struct net_if *iface,
 		return -ENOTSUP;
 	}
 }
-
+#endif
 
 /*
 	Parameters returned from this function via wifi_iface_status:

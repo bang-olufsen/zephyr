@@ -16,7 +16,7 @@ extern "C" {
 erpc_transport_t erpc_wifi_transport_init(void);
 
 void erpc_wifi_transport_deinit(erpc_transport_t transport);
-
+int erpc_wifi_transport_slave_ready(void);
 #ifdef __cplusplus
 }
 #endif
