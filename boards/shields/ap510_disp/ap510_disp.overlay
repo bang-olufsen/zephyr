@@ -37,8 +37,6 @@
 		chsc5x: chsc5x@2e {
 			compatible = "chipsemi,chsc5x";
 			reg = <0x2e>;
-			int-gpios = <&gpio64_95 13 GPIO_ACTIVE_LOW>;
-			reset-gpios = <&gpio64_95 14 GPIO_ACTIVE_LOW>;
 		};
 	};
 };
@@ -60,12 +58,10 @@
 	pinctrl-0 = <&dc_te_default>;
 	pinctrl-names = "default";
 	/*apollo510_evb designed with a loadswitch to control power Vdd18.*/
-	vdd18-gpios = <&gpio32_63 26 (GPIO_PULL_DOWN)>;
 
 	co5300: co5300@0 {
 		status = "okay";
 		compatible = "chipone,co5300";
-		reset-gpios = <&gpio32_63 31 (GPIO_PULL_UP)>;
 		reg = <0x0>;
 		data-lanes = <1>;
 		pixel-format = <PANEL_PIXEL_FORMAT_RGB_888>;
