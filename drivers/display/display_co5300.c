@@ -378,6 +378,28 @@ static int co5300_init(const struct device *dev)
 	return 0;
 }
 
+#ifdef CONFIG_PM_DEVICE
+static int co5300_pm_action(const struct device *dev, enum pm_device_action action)
+{
+	int ret;
+
+	ARG_UNUSED(dev);
+
+	switch (action) {
+	case PM_DEVICE_ACTION_RESUME:
+		ret = co5300_dcs_write(dev, MIPI_DCS_EXIT_SLEEP_MODE, NULL, 0);
+		break;
+	case PM_DEVICE_ACTION_SUSPEND:
+		ret = co5300_dcs_write(dev, MIPI_DCS_ENTER_SLEEP_MODE, NULL, 0);
+		break;
+	default:
+		ret = -ENOTSUP;
+	}
+
+	return ret;
+}
+#endif
+
 #if DT_HAS_COMPAT_ON_BUS_STATUS_OKAY(chipone_co5300, mipi_dsi)
 #define CO5300_DEVICE DT_NODELABEL(chipone_co5300)
 
@@ -416,7 +438,8 @@ static int co5300_init(const struct device *dev)
 			},                                                                         \
 	};                                                                                         \
 	static struct co5300_data co5300_data_##node_id;                                           \
-	DEVICE_DT_DEFINE(node_id, co5300_init, NULL, &co5300_data_##node_id,                       \
+	PM_DEVICE_DT_DEFINE(node_id, co5300_pm_action);                                            \
+	DEVICE_DT_DEFINE(node_id, co5300_init, PM_DEVICE_DT_GET(node_id), &co5300_data_##node_id,                       \
 			 &co5300_config_##node_id, POST_KERNEL, CONFIG_DISPLAY_INIT_PRIORITY,      \
 			 &co5300_api);
 
