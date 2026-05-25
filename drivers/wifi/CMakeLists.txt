@@ -29,4 +29,5 @@ add_subdirectory_ifdef(CONFIG_WIFI_AIROC        infineon)
 add_subdirectory_ifdef(CONFIG_WIFI_NRF70        nrf_wifi)
 add_subdirectory_ifdef(CONFIG_WIFI_SILABS_SIWX91X siwx91x)
 
-add_subdirectory(renesas)
+add_subdirectory_ifdef(CONFIG_WIFI_ERPC_WIFI renesas)
+#add_subdirectory(renesas)

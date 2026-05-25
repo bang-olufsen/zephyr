@@ -20,8 +20,8 @@
 extern "C" {
 #endif
 
-#define ERPC_WIFI_MTU					1500
-#define ERPC_WIFI_DRV_FW_VER_LEN_MAX	32
+#define ERPC_WIFI_MTU                1500
+#define ERPC_WIFI_DRV_FW_VER_LEN_MAX 32
 
 enum erpc_wifi_driver_state {
 	ERPC_WIFI_DRIVER_INITIALIZING = 0,
@@ -39,9 +39,9 @@ struct erpc_wifi_data {
 	erpc_transport_t transport;
 	erpc_transport_t arbitrator;
 	erpc_mbf_t mbf;
-	void* service;
+	void *service;
 	k_tid_t server_thread_id;
-	
+
 	enum erpc_wifi_driver_state driver_state;
 	bool reset_msg_received;
 
@@ -54,6 +54,10 @@ struct erpc_wifi_data {
 	struct k_sem sem_if_ready;
 
 	char fw_version_driver[ERPC_WIFI_DRV_FW_VER_LEN_MAX];
+	bool ipv4_assigned;
+#if defined(CONFIG_NET_IPV6)
+	bool ipv6_assigned;
+#endif
 };
 
 #ifdef __cplusplus
