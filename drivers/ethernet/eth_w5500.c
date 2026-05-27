@@ -21,6 +21,7 @@ LOG_MODULE_REGISTER(eth_w5500, CONFIG_ETHERNET_LOG_LEVEL);
 #include <zephyr/net/net_if.h>
 #include <zephyr/net/ethernet.h>
 #include <ethernet/eth_stats.h>
+#include <zephyr/nvmem.h>
 
 #include "eth.h"
 #include "eth_w5500_priv.h"
@@ -500,6 +501,21 @@ static void w5500_gpio_callback(const struct device *dev,
 static void w5500_set_macaddr(const struct device *dev)
 {
 	struct w5500_runtime *ctx = dev->data;
+
+#if IS_ENABLED(CONFIG_NVMEM) && DT_INST_NVMEM_CELLS_HAS_NAME(0, mac_address)
+	static const struct nvmem_cell mac_cell =
+		NVMEM_CELL_INST_GET_BY_NAME(0, mac_address);
+
+	if (nvmem_cell_is_ready(&mac_cell)) {
+		int res = nvmem_cell_read(&mac_cell, ctx->mac_addr, 0, sizeof(ctx->mac_addr));
+
+		if (res < 0) {
+			LOG_WRN("Failed to read MAC from nvmem (%d), will use default", res);
+		}
+	} else {
+		LOG_WRN("nvmem-cell is not ready, will use default");
+	}
+#endif
 
 #if DT_INST_PROP(0, zephyr_random_mac_address)
 	gen_random_mac(ctx->mac_addr, WIZNET_OUI_B0, WIZNET_OUI_B1, WIZNET_OUI_B2);
