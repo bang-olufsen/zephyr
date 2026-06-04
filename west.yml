@@ -161,7 +161,7 @@ manifest:
       path: modules/lib/erpc
 
     - name: erpc_wifi_service
-      url: https://github.com/Renesas-US-Connectivity/ra_wifi_erpc_service
+      url: git@github.com:Renesas-US-Connectivity/ra_wifi_erpc_service.git
       revision: 283092669fffe58770c8f13f217bb1b1163ec2fc
       path: zephyr/drivers/wifi/renesas/erpc_wifi/service
 
