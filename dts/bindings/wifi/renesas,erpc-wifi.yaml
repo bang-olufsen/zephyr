@@ -7,6 +7,11 @@ properties:
     description: |
       This gpio is used to reset the Wi-Fi device.
 
+  wakeup-gpios:
+    type: phandle-array
+    description: |
+      This gpio is used to wake up the Wi-Fi device from sleep mode.
+
   reset-assert-duration-ms:
     type: int
     description: |

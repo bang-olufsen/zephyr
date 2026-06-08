@@ -76,6 +76,60 @@ void erpc_wifi_unlock(void)
 	k_mutex_unlock(&g_erpc_wifi_mutex);
 }
 
+#if DT_NODE_HAS_STATUS(DT_ALIAS(wakeup_gpio), okay)
+#define GPIO_WAKEUP_NODE DT_ALIAS(wakeup_gpio)
+#define GPIO_WAKEUP_PORT DT_GPIO_CTLR(GPIO_WAKEUP_NODE, gpios)
+#define GPIO_WAKEUP_PIN DT_GPIO_PIN(GPIO_WAKEUP_NODE, gpios)
+#define GPIO_WAKEUP_FLAGS DT_GPIO_FLAGS(GPIO_WAKEUP_NODE, gpios)
+#define WAKEUP_PULSE_DURATION_MS 20
+
+static const struct device *g_gpio_wakeup_dev;
+
+static int gpio_wakeup_init(const struct device **gpio_dev)
+{
+	*gpio_dev = DEVICE_DT_GET(GPIO_WAKEUP_PORT);
+
+	if (!device_is_ready(*gpio_dev)) {
+		LOG_ERR("GPIO device not ready");
+		return -ENODEV;
+	}
+
+	int ret = gpio_pin_configure(*gpio_dev, GPIO_WAKEUP_PIN,
+				     GPIO_OUTPUT_HIGH | GPIO_WAKEUP_FLAGS);
+	if (ret < 0) {
+		LOG_ERR("Failed to configure GPIO wakeup pin: %d", ret);
+		return ret;
+	}
+
+	LOG_INF("GPIO wakeup pin initialized (pin: %d)", GPIO_WAKEUP_PIN);
+	return 0;
+}
+#endif
+
+void erpc_wifi_gpio_trigger_wakeup(void)
+{
+#if DT_NODE_HAS_STATUS(DT_ALIAS(wakeup_gpio), okay)
+	if (g_gpio_wakeup_dev == NULL) {
+		LOG_WRN("GPIO device not initialized");
+		return;
+	}
+
+	LOG_INF("Triggering wakeup pulse on GPIO pin %d (active low for %dms)",
+		GPIO_WAKEUP_PIN, WAKEUP_PULSE_DURATION_MS);
+
+	gpio_pin_set(g_gpio_wakeup_dev, GPIO_WAKEUP_PIN, 0);
+	k_msleep(WAKEUP_PULSE_DURATION_MS);
+
+	gpio_pin_set(g_gpio_wakeup_dev, GPIO_WAKEUP_PIN, 1);
+	k_msleep(WAKEUP_PULSE_DURATION_MS);
+	gpio_pin_set(g_gpio_wakeup_dev, GPIO_WAKEUP_PIN, 0);
+
+	LOG_INF("Wakeup pulse completed");
+#else
+	LOG_WRN("wakeup_gpio alias is not enabled in devicetree; wakeup pulse skipped");
+#endif
+}
+
 #ifndef ERPC_WIFI_TIMER_NAME_MAX
 #define ERPC_WIFI_TIMER_NAME_MAX 64
 #endif
@@ -429,6 +483,9 @@ static void erpc_wifi_mgmt_scan_work(struct k_work *work)
     WIFIPmf_t pmf;
     uint8_t sae_groups[20];
 */
+static void erpc_wifi_ps_set_state_internal(bool enabled);
+static void erpc_wifi_ps_push_defaults(void);
+
 static int erpc_wifi_mgmt_connect(const struct device *dev, struct wifi_connect_req_params *params)
 {
 	struct erpc_wifi_data *data = dev->data;
@@ -476,6 +533,7 @@ static void erpc_wifi_mgmt_connect_work(struct k_work *work)
 
 	if (ret == eWiFiSuccess) {
 		dev->state = WIFI_STATE_COMPLETED;
+		erpc_wifi_ps_set_state_internal(true);
 		status = WIFI_STATUS_CONN_SUCCESS;
 		net_if_dormant_off(dev->net_iface);
 	} else {
@@ -518,6 +576,7 @@ static void erpc_wifi_mgmt_disconnect_work(struct k_work *work)
 	}
 
 	dev->state = WIFI_STATE_DISCONNECTED;
+	erpc_wifi_ps_set_state_internal(false);
 
 	wifi_mgmt_raise_disconnect_result_event(dev->net_iface, status);
 	net_if_dormant_on(dev->net_iface);
@@ -556,31 +615,107 @@ struct erpc_ps_cache {
 
 	bool enabled;          /* last STATE */
 	bool allow_sleep_sent; /* whether we have removed the sleep constraint */
+	bool socket_connect_pending;
 };
 
 static struct erpc_ps_cache g_ps;
 
 /* Delayable work: after TIMEOUT, allow RA6W1 to sleep */
 static struct k_work_delayable g_ps_enable_work;
+
+#define ERPC_WIFI_PS_DEFAULT_TIMEOUT_MS 10000U
+
+static bool erpc_wifi_ps_ip_ready(void)
+{
+#if defined(CONFIG_NET_IPV4) && defined(CONFIG_NET_IPV6)
+	return erpc_wifi_driver_data.ipv4_assigned || erpc_wifi_driver_data.ipv6_assigned;
+#elif defined(CONFIG_NET_IPV4)
+	return erpc_wifi_driver_data.ipv4_assigned;
+#elif defined(CONFIG_NET_IPV6)
+	return erpc_wifi_driver_data.ipv6_assigned;
+#else
+	return true;
+#endif
+}
+
+static void erpc_wifi_ps_schedule_sleep(const char *reason)
+{
+	if (!g_ps.enabled || g_ps.allow_sleep_sent) {
+		return;
+	}
+
+	if (g_ps.socket_connect_pending) {
+		LOG_INF("PS defer sleep (%s): socket connect in progress", reason);
+		return;
+	}
+
+	if (!erpc_wifi_ps_ip_ready()) {
+		LOG_INF("PS defer sleep (%s): waiting for IP assignment", reason);
+		return;
+	}
+
+	uint32_t delay = g_ps.tmo_set ? g_ps.timeout_ms : ERPC_WIFI_PS_DEFAULT_TIMEOUT_MS;
+
+	k_work_cancel_delayable(&g_ps_enable_work);
+	k_work_reschedule(&g_ps_enable_work, K_MSEC(delay));
+	erpc_wifi_socket_tx_block_set(false, 0U);
+
+	LOG_INF("PS sleep armed in %u ms (%s)", delay, reason);
+}
+
+static void erpc_wifi_ps_set_state_internal(bool enabled)
+{
+	g_ps.enabled = enabled;
+	g_ps.allow_sleep_sent = false;
+	k_work_cancel_delayable(&g_ps_enable_work);
+
+	/* Keep module awake until PS params are applied and delay expires. */
+	(void)ra6w1_pmgr_add_sleep_constraint(PMGR_CONSTRAINT_SLEEP_PROHIBITED);
+
+	if (enabled) {
+		erpc_wifi_ps_schedule_sleep("state-enable");
+	}
+
+	erpc_wifi_socket_tx_block_set(false, 0U);
+}
+
+void erpc_wifi_ps_notify_socket_connected(void)
+{
+	if (!g_ps.enabled) {
+		return;
+	}
+
+	g_ps.socket_connect_pending = false;
+	g_ps.allow_sleep_sent = false;
+	(void)ra6w1_pmgr_add_sleep_constraint(PMGR_CONSTRAINT_SLEEP_PROHIBITED);
+	erpc_wifi_ps_schedule_sleep("tcp-connect");
+}
+
+void erpc_wifi_ps_notify_socket_connect_start(void)
+{
+	if (!g_ps.enabled) {
+		return;
+	}
+
+	g_ps.socket_connect_pending = true;
+	g_ps.allow_sleep_sent = false;
+	k_work_cancel_delayable(&g_ps_enable_work);
+	(void)ra6w1_pmgr_add_sleep_constraint(PMGR_CONSTRAINT_SLEEP_PROHIBITED);
+	erpc_wifi_socket_tx_block_set(false, 0U);
+}
+
 static void ps_send_param_to_ra(ra_wifi_ps_param_t p, uint32_t v)
 {
 	(void)ra6w1_wifi_ps_set_param(p, v);
 }
-static void ps_allow_sleep_work(struct k_work *work)
-{
-	ARG_UNUSED(work);
 
-	if (!g_ps.enabled) {
-		LOG_INF("PS allow sleep: ignored (PS disabled)");
-		return;
-	}
+static void erpc_wifi_ps_push_defaults(void)
+{
 	if (g_ps.li_set) {
-		LOG_INF("PS set: LISTEN_INTERVAL=%u", g_ps.listen_interval);
 		ps_send_param_to_ra((ra_wifi_ps_param_t)RA_WIFI_PS_PARAM_LISTEN_INTERVAL,
 				    g_ps.listen_interval);
 	}
 	if (g_ps.wm_set) {
-		LOG_INF("PS set: WAKEUP_MODE=%u", g_ps.wakeup_mode);
 		ps_send_param_to_ra((ra_wifi_ps_param_t)RA_WIFI_PS_PARAM_WAKEUP_MODE,
 				    g_ps.wakeup_mode);
 	}
@@ -592,6 +727,17 @@ static void ps_allow_sleep_work(struct k_work *work)
 		ps_send_param_to_ra((ra_wifi_ps_param_t)RA_WIFI_PS_PARAM_TIMEOUT_MS,
 				    g_ps.timeout_ms);
 	}
+}
+
+static void ps_allow_sleep_work(struct k_work *work)
+{
+	ARG_UNUSED(work);
+
+	if (!g_ps.enabled) {
+		LOG_INF("PS allow sleep: ignored (PS disabled)");
+		return;
+	}
+	/* DPM params are pushed once at driver startup. STATE only applies/release sleep. */
 	LOG_INF("PS allow sleep: applying PMGR config and releasing constraint");
 	int32_t rc = ra6w1_wifi_ps_apply();
 	if (rc != 0) {
@@ -724,8 +870,7 @@ static int erpc_wifi_mgmt_set_power_save(struct net_if *iface, struct wifi_ps_pa
 		/* Forward to RA – RA PMGR policy decides post-TX behavior */
 		ra6w1_wifi_ps_set_param(RA_WIFI_PS_PARAM_TIMEOUT_MS, g_ps.timeout_ms);
 		if (g_ps.enabled && !g_ps.allow_sleep_sent) {
-			k_work_cancel_delayable(&g_ps_enable_work);
-			k_work_reschedule(&g_ps_enable_work, K_MSEC(g_ps.timeout_ms));
+			erpc_wifi_ps_schedule_sleep("timeout-update");
 		}
 
 		return 0;
@@ -734,30 +879,14 @@ static int erpc_wifi_mgmt_set_power_save(struct net_if *iface, struct wifi_ps_pa
 		if (params->enabled == WIFI_PS_ENABLED) {
 
 			LOG_INF("PS STATE ENABLE");
-
-			g_ps.enabled = true;
-			g_ps.allow_sleep_sent = false;
-
-			(void)ra6w1_pmgr_add_sleep_constraint(PMGR_CONSTRAINT_SLEEP_PROHIBITED);
-
-			k_work_cancel_delayable(&g_ps_enable_work);
-
-			uint32_t delay = g_ps.tmo_set ? g_ps.timeout_ms : 0U;
-			k_work_reschedule(&g_ps_enable_work, K_MSEC(delay));
-			erpc_wifi_socket_tx_block_set(false, 0U);
+			erpc_wifi_ps_set_state_internal(true);
 
 			return 0;
 
 		} else if (params->enabled == WIFI_PS_DISABLED) {
 
 			LOG_INF("PS STATE DISABLE");
-
-			g_ps.enabled = false;
-			g_ps.allow_sleep_sent = false;
-			k_work_cancel_delayable(&g_ps_enable_work);
-
-			(void)ra6w1_pmgr_add_sleep_constraint(PMGR_CONSTRAINT_SLEEP_PROHIBITED);
-			erpc_wifi_socket_tx_block_set(false, 0U);
+			erpc_wifi_ps_set_state_internal(false);
 			return 0;
 		}
 		return -EINVAL;
@@ -962,6 +1091,7 @@ static void erpc_wifi_apply_dhcp_lease(struct net_if *iface, struct WIFIIPConfig
 			LOG_INF("Netmask: %s, Gateway: %s", netmask_str, gateway_str);
 
 			erpc_wifi_driver_data.ipv4_assigned = true;
+			erpc_wifi_ps_schedule_sleep("ipv4-assigned");
 
 			// Notify the network management system about IPv4 assignment
 			net_mgmt_event_notify(NET_EVENT_IPV4_DHCP_BOUND, iface);
@@ -989,6 +1119,7 @@ static void erpc_wifi_apply_dhcp_lease(struct net_if *iface, struct WIFIIPConfig
 			} else {
 				LOG_INF("Global IPv6 address applied: %s", ip6_str);
 				erpc_wifi_driver_data.ipv6_assigned = true;
+					erpc_wifi_ps_schedule_sleep("ipv6-assigned");
 			}
 
 			// Notify the network management system about IPv6 assignment
@@ -1411,6 +1542,14 @@ static int erpc_wifi_init(const struct device *dev)
 
 	k_work_init_delayable(&g_ps_enable_work, ps_allow_sleep_work);
 
+	/* Driver-owned default PS policy for apps that only toggle STATE. */
+	g_ps.wakeup_mode = (uint32_t)WIFI_PS_WAKEUP_MODE_DTIM;
+	g_ps.wm_set = true;
+	g_ps.exit_strategy = (uint32_t)RA_WIFI_PS_EXIT_EVERY_TIM;
+	g_ps.ex_set = true;
+	g_ps.timeout_ms = ERPC_WIFI_PS_DEFAULT_TIMEOUT_MS;
+	g_ps.tmo_set = true;
+
 	k_sem_init(&data->sem_if_ready, 0, 1);
 
 	/* Initialize the work queue */
@@ -1424,6 +1563,19 @@ static int erpc_wifi_init(const struct device *dev)
 	if (ret != 0) {
 		return ret;
 	}
+
+	/* Push default DPM params early; app controls only STATE. */
+	erpc_wifi_ps_push_defaults();
+
+#if DT_NODE_HAS_STATUS(DT_ALIAS(wakeup_gpio), okay)
+	ret = gpio_wakeup_init(&g_gpio_wakeup_dev);
+	if (ret != 0) {
+		LOG_WRN("Failed to initialize GPIO wakeup pin, continuing without it");
+		g_gpio_wakeup_dev = NULL;
+	}
+#else
+	LOG_WRN("wakeup_gpio alias is not enabled in devicetree");
+#endif
 
 	data->net_iface = NET_IF_GET(Z_DEVICE_DT_DEV_ID(DT_DRV_INST(0)), 0);
 
