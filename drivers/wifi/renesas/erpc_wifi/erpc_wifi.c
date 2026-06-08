@@ -623,7 +623,7 @@ static struct erpc_ps_cache g_ps;
 /* Delayable work: after TIMEOUT, allow RA6W1 to sleep */
 static struct k_work_delayable g_ps_enable_work;
 
-#define ERPC_WIFI_PS_DEFAULT_TIMEOUT_MS 10000U
+#define ERPC_WIFI_PS_DEFAULT_TIMEOUT_MS 1000U
 
 static bool erpc_wifi_ps_ip_ready(void)
 {
