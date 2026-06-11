@@ -33,10 +33,15 @@ void erpc_wifi_socket_tx_block_set(bool enable, uint32_t timeout_ms)
 }
 
 extern int32_t ra6w1_pmgr_dpm_is_wakeup(void);
+extern int32_t ra6w1_pmgr_dpm_is_enabled(void);
 extern int32_t ra6w1_pmgr_dpm_wakeup_done(uint32_t job_id);
 extern int32_t ra6w1_pmgr_dpm_rcv_ready_set(uint32_t job_id);
 extern int32_t ra6w1_pmgr_dpm_job_name_set(uint32_t job_id, const char *job_name);
+extern int32_t ra6w1_pmgr_add_sleep_constraint(uint32_t constraint);
 extern int erpc_wifi_transport_slave_ready(void);
+
+/* Forward declaration for pmgr_ram_hold used in erpc_wifi_ensure_awake_tx */
+static inline void pmgr_ram_hold(void);
 
 static int erpc_wifi_ensure_awake_tx(uint32_t job_id)
 {
@@ -49,26 +54,41 @@ static int erpc_wifi_ensure_awake_tx(uint32_t job_id)
 	uint32_t tmo = (uint32_t)atomic_get(&g_erpc_tx_block_timeout_ms);
 	int64_t last_pulse = start;
 
-	if (job_id == ERPC_PMGR_JOB_ID_SEND) {
-		(void)ra6w1_pmgr_dpm_job_name_set(job_id, "ERPC_TCP_SEND");
-	} else {
-		(void)ra6w1_pmgr_dpm_job_name_set(job_id, "ERPC_TCP_RECV");
-	}
-
-	/* Tell PMGR this module has pending I/O work before waking via GPIO. */
-	(void)ra6w1_pmgr_dpm_rcv_ready_set(job_id);
-
 	/* Proactively pulse Wakeup GPIO */
 	erpc_wifi_gpio_trigger_wakeup();
 
 	for (;;) {
 		int32_t awake;
+		int sr = erpc_wifi_transport_slave_ready();
+
+		/* SPI slave-ready going active means RA side is up enough for eRPC traffic. */
+		if (sr == 1) {
+			if (job_id == ERPC_PMGR_JOB_ID_SEND) {
+				(void)ra6w1_pmgr_dpm_job_name_set(job_id, "ERPC_TCP_SEND");
+			} else {
+				(void)ra6w1_pmgr_dpm_job_name_set(job_id, "ERPC_TCP_RECV");
+			}
+			/* Tell PMGR this module has pending I/O work only after wake is visible. */
+			(void)ra6w1_pmgr_dpm_rcv_ready_set(job_id);
+			pmgr_ram_hold();
+			return 0;
+		}
 
 		erpc_wifi_lock();
 		awake = ra6w1_pmgr_dpm_is_wakeup();
 		erpc_wifi_unlock();
 
 		if (awake == 1) {
+			if (job_id == ERPC_PMGR_JOB_ID_SEND) {
+				(void)ra6w1_pmgr_dpm_job_name_set(job_id, "ERPC_TCP_SEND");
+			} else {
+				(void)ra6w1_pmgr_dpm_job_name_set(job_id, "ERPC_TCP_RECV");
+			}
+			/* Tell PMGR this module has pending I/O work only after wake is visible. */
+			(void)ra6w1_pmgr_dpm_rcv_ready_set(job_id);
+			/* EXPLICIT CONSTRAINT ADDITION */
+			pmgr_ram_hold();
+			
 			erpc_wifi_lock();
 			(void)ra6w1_pmgr_dpm_wakeup_done(job_id);
 			erpc_wifi_unlock();
@@ -257,6 +277,7 @@ static void erpc_wifi_socket_poll_task(void *arg1, void *arg2, void *arg3)
 	ARG_UNUSED(arg1);
 	ARG_UNUSED(arg2);
 	ARG_UNUSED(arg3);
+	int64_t last_not_ready_log = 0;
 
 	while (1) {
 		/* Wait until signaled that a socket is waiting for events */
@@ -270,9 +291,25 @@ static void erpc_wifi_socket_poll_task(void *arg1, void *arg2, void *arg3)
 
 				if (sock->in_use && sock->waiting) {
 					activity = true;
+					int srdy = erpc_wifi_transport_slave_ready();
+
+					/* Do not query socket events while RA is still waking from sleep. */
+					if (!srdy) {
+						int64_t now = k_uptime_get();
+						if ((now - last_not_ready_log) > 1000) {
+							LOG_INF("poll wait: fd=%d srdy=0 waiting for module ready", sock->fd);
+							last_not_ready_log = now;
+						}
+						continue;
+					}
+
 					erpc_wifi_lock();
 					uint32_t events = get_socket_events(sock->fd);
 					erpc_wifi_unlock();
+
+					if (events != 0U) {
+						LOG_INF("poll events: fd=%d ev=0x%x", sock->fd, events);
+					}
 
 					if (events & (SOCKET_EVENT_RX | SOCKET_EVENT_ERR |
 						      SOCKET_EVENT_CLOSE)) {
