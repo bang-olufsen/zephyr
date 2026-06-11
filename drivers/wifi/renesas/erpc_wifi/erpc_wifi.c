@@ -95,13 +95,13 @@ static int gpio_wakeup_init(const struct device **gpio_dev)
 	}
 
 	int ret = gpio_pin_configure(*gpio_dev, GPIO_WAKEUP_PIN,
-				     GPIO_OUTPUT_HIGH | GPIO_WAKEUP_FLAGS);
+				     GPIO_OUTPUT_ACTIVE | GPIO_WAKEUP_FLAGS);
 	if (ret < 0) {
 		LOG_ERR("Failed to configure GPIO wakeup pin: %d", ret);
 		return ret;
 	}
 
-	LOG_INF("GPIO wakeup pin initialized (pin: %d)", GPIO_WAKEUP_PIN);
+	LOG_INF("GPIO wakeup pin initialized to inactive (pin: %d)", GPIO_WAKEUP_PIN);
 	return 0;
 }
 #endif
@@ -114,7 +114,7 @@ void erpc_wifi_gpio_trigger_wakeup(void)
 		return;
 	}
 
-	LOG_INF("Triggering wakeup pulse on GPIO pin %d (active low for %dms)",
+	LOG_INF("Triggering wakeup pulse on GPIO pin %d (active high for %dms)",
 		GPIO_WAKEUP_PIN, WAKEUP_PULSE_DURATION_MS);
 
 	gpio_pin_set(g_gpio_wakeup_dev, GPIO_WAKEUP_PIN, 0);
@@ -512,6 +512,7 @@ static int erpc_wifi_mgmt_connect(const struct device *dev, struct wifi_connect_
 
 static void erpc_wifi_mgmt_connect_work(struct k_work *work)
 {
+	
 	struct erpc_wifi_data *dev;
 	WIFIReturnCode_t ret;
 	int status;
@@ -525,9 +526,16 @@ static void erpc_wifi_mgmt_connect_work(struct k_work *work)
 	LOG_DBG("xWPA.ucLength: %d", dev->drv_nwk_params.xPassword.xWPA.ucLength);
 	LOG_DBG("ucChannel: %d", dev->drv_nwk_params.ucChannel);
 
+	/* Server may be in Sleep2 on POR; wake it before eRPC Wi-Fi connect. */
+	LOG_INF("WiFi connect API: triggering wakeup");
+	erpc_wifi_gpio_trigger_wakeup();
+	k_msleep(30);
+	//erpc_wifi_ps_push_defaults();
+	LOG_INF("WiFi connect API: calling WIFI_ConnectAP");
 	erpc_wifi_lock();
 	ret = WIFI_ConnectAP(&dev->drv_nwk_params);
 	erpc_wifi_unlock();
+	LOG_INF("WiFi connect API: WIFI_ConnectAP returned %d", ret);
 
 	LOG_DBG("WIFI_ConnectAP: %d", ret);
 
@@ -624,6 +632,7 @@ static struct erpc_ps_cache g_ps;
 static struct k_work_delayable g_ps_enable_work;
 
 #define ERPC_WIFI_PS_DEFAULT_TIMEOUT_MS 1000U
+#define ERPC_WIFI_PS_DEFAULT_LISTEN_INTERVAL 10U
 
 static bool erpc_wifi_ps_ip_ready(void)
 {
@@ -737,7 +746,11 @@ static void ps_allow_sleep_work(struct k_work *work)
 		LOG_INF("PS allow sleep: ignored (PS disabled)");
 		return;
 	}
-	/* DPM params are pushed once at driver startup. STATE only applies/release sleep. */
+	/* Re-push all cached PS params before apply: after DPM wake the RA6W1 server
+	 * reinitialises its config struct to zero, so we must restore every param. */
+	LOG_INF("PS allow sleep: pushing cached PS params to RA");
+	erpc_wifi_ps_push_defaults();
+
 	LOG_INF("PS allow sleep: applying PMGR config and releasing constraint");
 	int32_t rc = ra6w1_wifi_ps_apply();
 	if (rc != 0) {
@@ -837,29 +850,28 @@ static int erpc_wifi_mgmt_set_power_save(struct net_if *iface, struct wifi_ps_pa
 		return 0;
 
 	case WIFI_PS_PARAM_WAKEUP_MODE:
-		g_ps.wakeup_mode = (uint32_t)params->wakeup_mode;
+		if (params->wakeup_mode == WIFI_PS_WAKEUP_MODE_LISTEN_INTERVAL) {
+			g_ps.wakeup_mode = (uint32_t)RA_WIFI_PS_WAKEUP_MODE_LISTEN_INTERVAL;
+		} else {
+			g_ps.wakeup_mode = (uint32_t)RA_WIFI_PS_WAKEUP_MODE_DTIM;
+		}
 		g_ps.wm_set = true;
+		LOG_INF("PS set: WAKEUP_MODE zephyr=%u ra=%u", params->wakeup_mode,
+			g_ps.wakeup_mode);
 
 		ra6w1_wifi_ps_set_param(RA_WIFI_PS_PARAM_WAKEUP_MODE, g_ps.wakeup_mode);
 		return 0;
 
 	case WIFI_PS_PARAM_EXIT_STRATEGY: {
-		uint32_t ra_exit;
-
-		/* Zephyr → RA enum translation
-		 * Zephyr: CUSTOM=0, EVERY=1
-		 * RA:     EVERY=0,  CUSTOM=1
+		/*
+		 * Server currently contains Zephyr->RA exit-strategy workaround.
+		 * Send Zephyr enum as-is to avoid double translation.
 		 */
-		if (params->exit_strategy == WIFI_PS_EXIT_CUSTOM_ALGO) {
-			ra_exit = RA_WIFI_PS_EXIT_CUSTOM_ALGO;
-		} else {
-			ra_exit = RA_WIFI_PS_EXIT_EVERY_TIM;
-		}
-
-		g_ps.exit_strategy = ra_exit;
+		g_ps.exit_strategy = (uint32_t)params->exit_strategy;
 		g_ps.ex_set = true;
 
-		ra6w1_wifi_ps_set_param(RA_WIFI_PS_PARAM_EXIT_STRATEGY, ra_exit);
+		LOG_INF("PS set: EXIT_STRATEGY zephyr=%u (sent-as-is)", params->exit_strategy);
+		ra6w1_wifi_ps_set_param(RA_WIFI_PS_PARAM_EXIT_STRATEGY, g_ps.exit_strategy);
 		return 0;
 	}
 
@@ -1273,8 +1285,10 @@ static void erpc_wifi_server_event_monitor_thread(void *arg1, void *arg2, void *
 #endif
 
 		erpc_wifi_lock();
+		LOG_DBG("Event monitor: calling erpc_get_server_event");
 		erpc_get_server_event(&event);
 		erpc_wifi_unlock();
+		LOG_DBG("Event monitor: erpc_get_server_event returned, event_id=%d", event.event_id);
 
 		struct net_if *iface = data->net_iface;
 		if (!iface) {
@@ -1441,12 +1455,14 @@ static int erpc_wifi_init_erpc(struct erpc_wifi_data *data)
 #endif
 	int ret;
 
+	LOG_INF("eRPC init_erpc: transport init start");
 	/* Initialize the eRPC client infrastructure */
 	transport = erpc_wifi_transport_init();
 	if (transport == NULL) {
 		LOG_ERR("Failed to initialize eRPC transport");
 		return -ENODEV;
 	}
+	LOG_INF("eRPC init_erpc: transport init done");
 	data->transport = transport;
 
 	mbf = erpc_mbf_dynamic_init();
@@ -1460,7 +1476,9 @@ static int erpc_wifi_init_erpc(struct erpc_wifi_data *data)
 	client_manager = erpc_arbitrated_client_init(transport, mbf, &arbitrator);
 	data->arbitrator = arbitrator;
 #else
+	LOG_INF("eRPC init_erpc: erpc_client_init start");
 	client_manager = erpc_client_init(transport, mbf);
+	LOG_INF("eRPC init_erpc: erpc_client_init done");
 #endif
 
 	if (client_manager == NULL) {
@@ -1470,8 +1488,10 @@ static int erpc_wifi_init_erpc(struct erpc_wifi_data *data)
 	data->client_manager = client_manager;
 
 	/* Initialize eRPC client interface */
+	LOG_INF("eRPC init_erpc: initwifi_client start");
 	erpc_client_set_error_handler(client_manager, erpc_wifi_client_error_handler);
 	initwifi_client(client_manager);
+	LOG_INF("eRPC init_erpc: initwifi_client done");
 
 #ifdef CONFIG_ERPC_TRANSPORT_UART
 	/* Initialize eRPC server interface */
@@ -1509,6 +1529,7 @@ static void erpc_wifi_reinit_work_handler(struct k_work *work)
 	/* Short delay to allow resource cleanup and device stabilization */
 	k_sleep(K_MSEC(100));
 
+	LOG_INF("eRPC reinit: calling erpc_wifi_init_erpc");
 	int ret = erpc_wifi_init_erpc(data);
 	if (ret != 0) {
 		LOG_ERR("Failed to re-initialize eRPC stack: %d", ret);
@@ -1543,9 +1564,11 @@ static int erpc_wifi_init(const struct device *dev)
 	k_work_init_delayable(&g_ps_enable_work, ps_allow_sleep_work);
 
 	/* Driver-owned default PS policy for apps that only toggle STATE. */
-	g_ps.wakeup_mode = (uint32_t)WIFI_PS_WAKEUP_MODE_DTIM;
+	g_ps.listen_interval = ERPC_WIFI_PS_DEFAULT_LISTEN_INTERVAL;
+	g_ps.li_set = true;
+	g_ps.wakeup_mode = (uint32_t)RA_WIFI_PS_WAKEUP_MODE_LISTEN_INTERVAL;
 	g_ps.wm_set = true;
-	g_ps.exit_strategy = (uint32_t)RA_WIFI_PS_EXIT_EVERY_TIM;
+	g_ps.exit_strategy = (uint32_t)WIFI_PS_EXIT_CUSTOM_ALGO;
 	g_ps.ex_set = true;
 	g_ps.timeout_ms = ERPC_WIFI_PS_DEFAULT_TIMEOUT_MS;
 	g_ps.tmo_set = true;
@@ -1558,24 +1581,31 @@ static int erpc_wifi_init(const struct device *dev)
 			   K_PRIO_COOP(CONFIG_WIFI_ERPC_WIFI_WORKQ_THREAD_PRIORITY), NULL);
 	k_thread_name_set(&data->workq.thread, "erpc_wifi_workq");
 
-	/* Initialize the eRPC client infrastructure */
-	ret = erpc_wifi_init_erpc(data);
-	if (ret != 0) {
-		return ret;
-	}
-
-	/* Push default DPM params early; app controls only STATE. */
-	erpc_wifi_ps_push_defaults();
-
 #if DT_NODE_HAS_STATUS(DT_ALIAS(wakeup_gpio), okay)
 	ret = gpio_wakeup_init(&g_gpio_wakeup_dev);
 	if (ret != 0) {
 		LOG_WRN("Failed to initialize GPIO wakeup pin, continuing without it");
 		g_gpio_wakeup_dev = NULL;
-	}
+	 } 
+	// else {
+	// 	/* Wake RA6W1 before first eRPC transaction when server boots into Sleep2. */
+	// 	LOG_INF("eRPC init: triggering wakeup");
+	// 	erpc_wifi_gpio_trigger_wakeup();
+	// 	k_msleep(30);
+	// }
 #else
 	LOG_WRN("wakeup_gpio alias is not enabled in devicetree");
 #endif
+
+	/* Initialize the eRPC client infrastructure */
+	LOG_INF("eRPC init: calling erpc_wifi_init_erpc");
+	ret = erpc_wifi_init_erpc(data);
+	if (ret != 0) {
+		return ret;
+	}
+	LOG_INF("eRPC init: erpc_wifi_init_erpc returned OK");
+
+	/* Do not wake RA on init. RA stays in Sleep2 after POR until connect API is called. */
 
 	data->net_iface = NET_IF_GET(Z_DEVICE_DT_DEV_ID(DT_DRV_INST(0)), 0);
 

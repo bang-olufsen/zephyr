@@ -65,5 +65,9 @@ int erpc_wifi_transport_slave_ready(void)
 	if (v < 0) {
 		return false;
 	}
-	return (v == 0);
+	if ((g_slave_ready_gpio->dt_flags & GPIO_ACTIVE_LOW) != 0U) {
+		return (v == 0);
+	}
+
+	return (v != 0);
 }
