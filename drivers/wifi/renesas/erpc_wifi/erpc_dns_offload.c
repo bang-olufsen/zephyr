@@ -1,3 +1,6 @@
+#include <zephyr/logging/log.h>
+LOG_MODULE_DECLARE(wifi_erpc_wifi, CONFIG_WIFI_LOG_LEVEL);
+
 #include <zephyr/net/socket_offload.h>
 #include <zephyr/net/socket.h>
 #include "erpc_wifi.h"
@@ -21,11 +24,26 @@ static int offload_getaddrinfo(const char *node, const char *service,
 	*res = NULL;
 
 	result = malloc(DNS_MAX_ADDRESSES * sizeof(WIFIIPAddress_t));
-	// 2. Call the eRPC generated client stub
+	if (!result) {
+		return EAI_MEMORY;
+	}
+
+	// 2. Wake RA6W1 if in DPM sleep before issuing the blocking eRPC DNS call.
+	int wake_ret = erpc_wifi_wake_for_tx();
+	if (wake_ret != 0) {
+		LOG_WRN("DNS: wake-for-tx failed (%d), aborting getaddrinfo", wake_ret);
+		free(result);
+		return EAI_AGAIN;
+	}
+
+	// 3. Call the eRPC generated client stub.
 	// The addresses buffer is filled by the eRPC framework.
 	erpc_wifi_lock();
 	server_status = ra6w1_dns_getaddrinfo(node, result, DNS_MAX_ADDRESSES, &actual_count);
 	erpc_wifi_unlock();
+
+	// Re-arm the PS sleep timer now that the DNS eRPC round-trip is done.
+	erpc_wifi_ps_notify_wakeup();
 
 	// 3. Check eRPC Transport Error
 	if (server_status != eWiFiSuccess) {
@@ -117,4 +135,6 @@ void erpc_wifi_dns_offload_init(void)
 {
 	printk("Registering eRPC WiFi DNS offload\n");
 	socket_offload_dns_register(&dns_ops);
+	socket_offload_dns_enable(false);
+	printk("eRPC WiFi DNS offload disabled; using Zephyr DNS resolver over socket offload\n");
 }
