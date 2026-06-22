@@ -62,6 +62,9 @@ struct erpc_wifi_data {
 
 void erpc_wifi_ps_notify_socket_connected(void);
 void erpc_wifi_ps_notify_socket_connect_start(void);
+void erpc_wifi_ps_notify_wakeup(void);
+bool erpc_wifi_ps_is_enabled(void);
+int erpc_wifi_wake_for_tx(void);
 
 #ifdef __cplusplus
 }
