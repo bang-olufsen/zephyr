@@ -20,6 +20,7 @@ LOG_MODULE_REGISTER(erpc_wifi_socket_offload, CONFIG_WIFI_LOG_LEVEL);
 void erpc_wifi_lock(void);
 void erpc_wifi_unlock(void);
 uint32_t get_socket_events(int32_t fd);
+extern bool erpc_wifi_ps_is_enabled(void);
 
 extern void erpc_wifi_gpio_trigger_wakeup(void);
 
@@ -43,11 +44,55 @@ extern int erpc_wifi_transport_slave_ready(void);
 /* Forward declaration for pmgr_ram_hold used in erpc_wifi_ensure_awake_tx */
 static inline void pmgr_ram_hold(void);
 
+/*
+ * erpc_wifi_ensure_awake_rx - Wait for RA module to assert slave-ready for an
+ * incoming RX operation.  Unlike erpc_wifi_ensure_awake_tx() this function
+ * does NOT pulse the wakeup GPIO because the RA6W1 already woke itself when it
+ * received the TCP packet and will assert slave-ready to notify the host.
+ * Pulsing the GPIO on an RX path is incorrect: the direction of wakeup is
+ * RA→Host, not Host→RA.
+ */
+static int erpc_wifi_ensure_awake_rx(uint32_t job_id)
+{
+	int64_t start = k_uptime_get();
+	/* Use same timeout as TX path default */
+	int64_t tmo_ms = 5000;
+
+	for (;;) {
+		int sr = erpc_wifi_transport_slave_ready();
+
+		if (sr == 1) {
+			if (job_id == ERPC_PMGR_JOB_ID_RECV) {
+				erpc_wifi_lock();
+				(void)ra6w1_pmgr_dpm_job_name_set(job_id, "ERPC_TCP_RECV");
+				erpc_wifi_unlock();
+			}
+			erpc_wifi_lock();
+			(void)ra6w1_pmgr_dpm_rcv_ready_set(job_id);
+			erpc_wifi_unlock();
+			pmgr_ram_hold();
+			return 0;
+		}
+
+		if ((k_uptime_get() - start) > tmo_ms) {
+			LOG_WRN("RX wait timeout: slave-ready not asserted after %lldms", tmo_ms);
+			return -EAGAIN;
+		}
+
+		k_msleep(10);
+	}
+}
+
 static int erpc_wifi_ensure_awake_tx(uint32_t job_id)
 {
 	if (atomic_get(&g_erpc_tx_blocked) == 0) {
-		LOG_DBG("TX wake skipped (tx_blocked=0, job=%u)", job_id);
-		return 0;
+		if (!erpc_wifi_ps_is_enabled() || erpc_wifi_transport_slave_ready() == 1) {
+			LOG_DBG("TX wake skipped (tx_blocked=0, job=%u)", job_id);
+			return 0;
+		}
+
+		LOG_INF("TX wake override (job=%u): tx_blocked=0 but slave-ready=0 while PS enabled",
+			job_id);
 	}
 
 	int64_t start = k_uptime_get();
@@ -64,13 +109,21 @@ static int erpc_wifi_ensure_awake_tx(uint32_t job_id)
 		/* SPI slave-ready going active means RA side is up enough for eRPC traffic. */
 		if (sr == 1) {
 			if (job_id == ERPC_PMGR_JOB_ID_SEND) {
+				erpc_wifi_lock();
 				(void)ra6w1_pmgr_dpm_job_name_set(job_id, "ERPC_TCP_SEND");
+				erpc_wifi_unlock();
 			} else {
+				erpc_wifi_lock();
 				(void)ra6w1_pmgr_dpm_job_name_set(job_id, "ERPC_TCP_RECV");
+				erpc_wifi_unlock();
 			}
 			/* Tell PMGR this module has pending I/O work only after wake is visible. */
+			erpc_wifi_lock();
 			(void)ra6w1_pmgr_dpm_rcv_ready_set(job_id);
+			erpc_wifi_unlock();
 			pmgr_ram_hold();
+			/* Re-arm sleep timer so module returns to DPM after this I/O. */
+			erpc_wifi_ps_notify_wakeup();
 			return 0;
 		}
 
@@ -80,15 +133,20 @@ static int erpc_wifi_ensure_awake_tx(uint32_t job_id)
 
 		if (awake == 1) {
 			if (job_id == ERPC_PMGR_JOB_ID_SEND) {
+				erpc_wifi_lock();
 				(void)ra6w1_pmgr_dpm_job_name_set(job_id, "ERPC_TCP_SEND");
+				erpc_wifi_unlock();
 			} else {
+				erpc_wifi_lock();
 				(void)ra6w1_pmgr_dpm_job_name_set(job_id, "ERPC_TCP_RECV");
+				erpc_wifi_unlock();
 			}
 			/* Tell PMGR this module has pending I/O work only after wake is visible. */
+			erpc_wifi_lock();
 			(void)ra6w1_pmgr_dpm_rcv_ready_set(job_id);
+			erpc_wifi_unlock();
 			/* EXPLICIT CONSTRAINT ADDITION */
 			pmgr_ram_hold();
-			
 			erpc_wifi_lock();
 			(void)ra6w1_pmgr_dpm_wakeup_done(job_id);
 			erpc_wifi_unlock();
@@ -159,6 +217,19 @@ static inline void pmgr_ram_release(void)
 		}
 		erpc_wifi_unlock();
 	}
+}
+
+/*
+ * erpc_wifi_wake_for_tx - exported wrapper for callers outside this file
+ * (e.g. DNS offload) that need to perform a host-initiated eRPC operation
+ * while the RA6W1 may be in DPM sleep.
+ */
+int erpc_wifi_wake_for_tx(void)
+{
+	if (erpc_wifi_ps_is_enabled()) {
+		erpc_wifi_gpio_trigger_wakeup();
+	}
+	return erpc_wifi_ensure_awake_tx(ERPC_PMGR_JOB_ID_SEND);
 }
 
 #include <zephyr/sys/atomic.h>
@@ -306,6 +377,11 @@ static void erpc_wifi_socket_poll_task(void *arg1, void *arg2, void *arg3)
 					erpc_wifi_lock();
 					uint32_t events = get_socket_events(sock->fd);
 					erpc_wifi_unlock();
+
+					if (events == UINT32_MAX) {
+						LOG_WRN("poll get_socket_events failed fd=%d; deferring", sock->fd);
+						continue;
+					}
 
 					if (events != 0U) {
 						LOG_INF("poll events: fd=%d ev=0x%x", sock->fd, events);
@@ -566,7 +642,9 @@ static int erpc_wifi_socket_bind(void *obj, const struct sockaddr *addr, socklen
 	struct erpc_wifi_socket *sock = (struct erpc_wifi_socket *)obj;
 
 	if (sock->tcp_dpm_filter_set && sock->bound_port != 0) {
+		erpc_wifi_lock();
 		(void)ra6w1_wifi_dpm_tcp_port_delete(sock->bound_port);
+		erpc_wifi_unlock();
 		sock->tcp_dpm_filter_set = false;
 		LOG_INF("TCP DPM wake filter removed for port %u", sock->bound_port);
 	}
@@ -638,6 +716,27 @@ static int erpc_wifi_socket_connect(void *obj, const struct sockaddr *addr, sock
 	LOG_DBG("ra6w1_connect: %d", ret);
 
 	if (ret == 0) {
+		if (sock->type == SOCK_STREAM && sock->bound_port != 0 &&
+		    !sock->tcp_dpm_filter_set) {
+			erpc_wifi_lock();
+			int32_t dpm_on = ra6w1_pmgr_dpm_is_enabled();
+			int32_t rc = -1;
+			if (dpm_on == 1) {
+				rc = ra6w1_wifi_dpm_tcp_port_filter_set(sock->bound_port);
+			}
+			erpc_wifi_unlock();
+			if (dpm_on == 1) {
+				if (rc == 0) {
+					sock->tcp_dpm_filter_set = true;
+					LOG_INF("TCP DPM wake filter set for connected port %u",
+						sock->bound_port);
+				} else {
+					LOG_WRN("Failed to set TCP DPM wake filter for connected port %u (rc=%d)",
+						sock->bound_port, rc);
+				}
+			}
+		}
+
 		erpc_wifi_ps_notify_socket_connected();
 	}
 
@@ -727,9 +826,13 @@ static int erpc_wifi_socket_accept(void *obj, struct sockaddr *addr, socklen_t *
 static ssize_t erpc_wifi_socket_sendto(void *obj, const void *buf, size_t len, int flags,
 				       const struct sockaddr *dest_addr, socklen_t addrlen)
 {
-	/* Always pulse wakeup on application TX requests. */
-	LOG_INF("TX wake pulse request (len=%u)", (unsigned int)len);
-	erpc_wifi_gpio_trigger_wakeup();
+	/* Only pulse wakeup if power save is enabled. If PS is disabled, module should stay awake. */
+	if (erpc_wifi_ps_is_enabled()) {
+		LOG_INF("TX wake pulse request (len=%u)", (unsigned int)len);
+		erpc_wifi_gpio_trigger_wakeup();
+	} else {
+		LOG_DBG("TX wake pulse skipped: PS disabled (len=%u)", (unsigned int)len);
+	}
 
     int __w = erpc_wifi_ensure_awake_tx(ERPC_PMGR_JOB_ID_SEND);
 	if (__w != 0) { 
@@ -775,6 +878,9 @@ static ssize_t erpc_wifi_socket_sendto(void *obj, const void *buf, size_t len, i
 		LOG_DBG("ra6w1_send: %d", ret);
 	}
 
+	/* Re-arm PS only after this TX operation completed. */
+	erpc_wifi_ps_notify_wakeup();
+
 	return ret;
 }
 
@@ -804,12 +910,15 @@ ssize_t erpc_wifi_socket_sendmsg(void *obj, const struct msghdr *msg, int flags)
 static ssize_t erpc_wifi_socket_recvfrom(void *obj, void *buf, size_t max_len, int flags,
 					 struct sockaddr *src_addr, socklen_t *addrlen)
 {
-//	int __w = wait_ra_awake(ERPC_PMGR_JOB_ID_RECV);
-    int __w = erpc_wifi_ensure_awake_tx(ERPC_PMGR_JOB_ID_RECV); // close is TX
+	/* RX path: RA6W1 wakes itself on incoming TCP packet and asserts slave-ready.
+	 * Do NOT pulse the wakeup GPIO here — that is a Host→RA signal used only
+	 * when the host needs to wake a sleeping module for TX.  For RX the direction
+	 * is RA→Host via slave-ready pin.
+	 */
+	int __w = erpc_wifi_ensure_awake_rx(ERPC_PMGR_JOB_ID_RECV);
 	if (__w != 0) {
-		LOG_INF("erpc_wifi_ensure_awake_tx failed: IN %s = %d", __func__,__w);
-		return __w; 
-
+		LOG_INF("erpc_wifi_ensure_awake_rx failed: IN %s = %d", __func__, __w);
+		return __w;
 	}
 
 	int ret;
@@ -848,15 +957,19 @@ static ssize_t erpc_wifi_socket_recvfrom(void *obj, void *buf, size_t max_len, i
 		}
 	} else {
 
+		erpc_wifi_lock();
 		(void)ra6w1_pmgr_dpm_job_name_set(ERPC_PMGR_JOB_ID_RECV, "ERPC_TCP_RECV");
-
 		(void)ra6w1_pmgr_dpm_rcv_ready_set(ERPC_PMGR_JOB_ID_RECV);
+		erpc_wifi_unlock();
 		erpc_wifi_lock();
 		ret = ra6w1_recv(sock->fd, buf, max_len, flags);
 		erpc_wifi_unlock();
 
 		LOG_DBG("ra6w1_recvfrom: %d", ret);
 	}
+
+	/* Re-arm PS only after this RX operation completed. */
+	erpc_wifi_ps_notify_wakeup();
 
 	return ret;
 }

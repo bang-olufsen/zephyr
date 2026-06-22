@@ -15,6 +15,7 @@ extern "C" {
 
 int erpc_wifi_socket_offload_init(struct net_if *iface);
 void erpc_wifi_dns_offload_init(void);
+int erpc_wifi_wake_for_tx();
 
 #ifdef __cplusplus
 }
