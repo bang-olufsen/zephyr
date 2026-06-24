@@ -1303,6 +1303,12 @@ static const struct socket_op_vtable erpc_wifi_socket_fd_op_vtable = {
 
 static int erpc_wifi_socket_create(int family, int type, int proto)
 {
+	int __w = erpc_wifi_ensure_awake_tx(ERPC_PMGR_JOB_ID_SEND);
+	if (__w != 0) { 
+		LOG_INF("erpc_wifi_ensure_awake_tx failed: IN %s = %d", __func__,__w);
+		return __w;
+	}
+
 	int err;
 	int sock;
 	uint8_t family_erpc_wifi;
