@@ -44,21 +44,7 @@ static int offload_getaddrinfo(const char *node, const char *service,
 	// The addresses buffer is filled by the eRPC framework.
 	
 	erpc_wifi_lock();
-bool dpm_was_enabled = erpc_wifi_ps_is_enabled();
-    if (dpm_was_enabled) {
-		(void)ra6w1_wifi_ps_set_param((ra_wifi_ps_param_t)WIFI_PS_PARAM_STATE, 0);
-        (void)ra6w1_wifi_ps_apply();
-    }
-k_msleep(500);
- 
-server_status = ra6w1_dns_getaddrinfo(node, result, DNS_MAX_ADDRESSES, &actual_count);
- 
- 
-    if (dpm_was_enabled) {
-		(void)ra6w1_wifi_ps_set_param((ra_wifi_ps_param_t)WIFI_PS_PARAM_STATE, 1);
-        (void)ra6w1_wifi_ps_apply();
-    }
-k_msleep(100);
+    server_status = ra6w1_dns_getaddrinfo(node, result, DNS_MAX_ADDRESSES, &actual_count);
     erpc_wifi_unlock();
 	
 	// Release RAM constraint and mark DPM job as complete
@@ -66,21 +52,6 @@ k_msleep(100);
 
 	// Re-arm the PS sleep timer now that the DNS eRPC round-trip is done.
 	erpc_wifi_ps_notify_wakeup();
-
-	// // 3. Check eRPC Transport Error
-	// if (server_status != eWiFiSuccess) {
-	// 	// Assume non-success means a transport error or unrecoverable LwIP error
-	// 	free(result);
-	// 	return EAI_SYSTEM;
-	// }
-
-	// // 4. Check LwIP Error (The server returns the LwIP error code in WIFIReturnCode_t)
-	// // NOTE: If your server uses a dedicated error_code field, you must check that instead.
-	// if (server_status < 0) {
-	// 	// If the return code is a negative LwIP error, map it to EAI_FAIL
-	// 	free(result);
-	// 	return EAI_FAIL;
-	// }
 
 	/* Map known server/LwIP status first, then fallback. */
 	if (server_status < 0) {
