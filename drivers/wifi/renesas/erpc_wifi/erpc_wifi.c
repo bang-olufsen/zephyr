@@ -99,7 +99,7 @@ static int gpio_wakeup_init(const struct device **gpio_dev)
 	}
 
 	int ret = gpio_pin_configure(*gpio_dev, GPIO_WAKEUP_PIN,
-				     GPIO_OUTPUT_ACTIVE | GPIO_WAKEUP_FLAGS);
+				     GPIO_OUTPUT_INACTIVE | GPIO_WAKEUP_FLAGS);
 	if (ret < 0) {
 		LOG_ERR("Failed to configure GPIO wakeup pin: %d", ret);
 		return ret;
@@ -533,7 +533,28 @@ static void erpc_wifi_mgmt_connect_work(struct k_work *work)
 	/* Server may be in Sleep2 on POR; wake it before eRPC Wi-Fi connect. */
 	LOG_INF("WiFi connect API: triggering wakeup");
 	erpc_wifi_gpio_trigger_wakeup();
-	k_msleep(30);
+	/* old delay was fixed and can be too short/too long across wake cycles */
+	// k_msleep(30);
+	{
+		int64_t start = k_uptime_get();
+		int64_t last_pulse = start;
+
+		while (!erpc_wifi_transport_slave_ready()) {
+			if ((k_uptime_get() - start) > 5000) {
+				LOG_WRN("WiFi connect API: wake handshake timeout, proceeding with connect");
+				break;
+			}
+
+			if ((k_uptime_get() - last_pulse) > 300) {
+				erpc_wifi_gpio_trigger_wakeup();
+				last_pulse = k_uptime_get();
+			}
+
+			k_msleep(20);
+		}
+
+		k_msleep(10);
+	}
 	//erpc_wifi_ps_push_defaults();
 	LOG_INF("WiFi connect API: calling WIFI_ConnectAP");
 	erpc_wifi_lock();
@@ -629,6 +650,7 @@ struct erpc_ps_cache {
 	bool enabled;          /* last STATE */
 	bool allow_sleep_sent; /* whether we have removed the sleep constraint */
 	bool socket_connect_pending;
+	bool sleep_constraint_held;
 };
 
 static struct erpc_ps_cache g_ps;
@@ -699,6 +721,30 @@ static void erpc_wifi_ps_schedule_sleep(const char *reason)
 	LOG_INF("PS sleep armed in %u ms (%s)", delay, reason);
 }
 
+static void erpc_wifi_ps_hold_awake(const char *reason)
+{
+	if (g_ps.sleep_constraint_held) {
+		return;
+	}
+	erpc_wifi_lock();
+	(void)ra6w1_pmgr_add_sleep_constraint(PMGR_CONSTRAINT_SLEEP_PROHIBITED);
+	erpc_wifi_unlock();
+	g_ps.sleep_constraint_held = true;
+	LOG_INF("PS hold awake (%s)", reason);
+}
+
+static void erpc_wifi_ps_release_awake(const char *reason)
+{
+	if (!g_ps.sleep_constraint_held) {
+		return;
+	}
+	erpc_wifi_lock();
+	(void)ra6w1_pmgr_remove_sleep_constraint(PMGR_CONSTRAINT_SLEEP_PROHIBITED);
+	erpc_wifi_unlock();
+	g_ps.sleep_constraint_held = false;
+	LOG_INF("PS release awake (%s)", reason);
+}
+
 static void erpc_wifi_ps_set_state_internal(bool enabled, const char *source)
 {
 	LOG_INF("PS TRACE: erpc_wifi_ps_set_state_internal(source=%s) requested enabled=%d current_enabled=%d allow_sleep_sent=%d socket_connect_pending=%d",
@@ -709,11 +755,18 @@ static void erpc_wifi_ps_set_state_internal(bool enabled, const char *source)
 	g_ps.allow_sleep_sent = false;
 	k_work_cancel_delayable(&g_ps_enable_work);
 
-	/* Keep module awake until PS params are applied and delay expires. */
-	erpc_wifi_lock();
-	(void)ra6w1_pmgr_add_sleep_constraint(PMGR_CONSTRAINT_SLEEP_PROHIBITED);
-	erpc_wifi_unlock();
+	// /* Keep module awake until PS params are applied and delay expires. */
+	// erpc_wifi_lock();
+	// (void)ra6w1_pmgr_add_sleep_constraint(PMGR_CONSTRAINT_SLEEP_PROHIBITED);
+	// erpc_wifi_unlock();
 
+	if (enabled) {
+		/* Keep module awake until PS params are applied and delay expires. */
+		erpc_wifi_ps_hold_awake("ps-enable");
+	} else {
+		/* Disabling PS must release any held sleep prohibition. */
+		erpc_wifi_ps_release_awake("ps-disable");
+	}
 	if (enabled) {
 		erpc_wifi_ps_schedule_sleep("state-enable");
 	}
@@ -729,10 +782,20 @@ void erpc_wifi_ps_notify_socket_connected(void)
 
 	g_ps.socket_connect_pending = false;
 	g_ps.allow_sleep_sent = false;
-	erpc_wifi_lock();
-	(void)ra6w1_pmgr_add_sleep_constraint(PMGR_CONSTRAINT_SLEEP_PROHIBITED);
-	erpc_wifi_unlock();
+	// erpc_wifi_lock();
+	// (void)ra6w1_pmgr_add_sleep_constraint(PMGR_CONSTRAINT_SLEEP_PROHIBITED);
+	// erpc_wifi_unlock();
+	erpc_wifi_ps_hold_awake("tcp-connect-success");
 	erpc_wifi_ps_schedule_sleep("tcp-connect");
+}
+
+void erpc_wifi_ps_notify_socket_connect_failed(void)
+{
+	if (!g_ps.enabled) {
+		return;
+	}
+	g_ps.socket_connect_pending = false;
+	erpc_wifi_ps_schedule_sleep("tcp-connect-failed");
 }
 
 void erpc_wifi_ps_notify_socket_connect_start(void)
@@ -744,9 +807,18 @@ void erpc_wifi_ps_notify_socket_connect_start(void)
 	g_ps.socket_connect_pending = true;
 	g_ps.allow_sleep_sent = false;
 	k_work_cancel_delayable(&g_ps_enable_work);
-	erpc_wifi_lock();
-	(void)ra6w1_pmgr_add_sleep_constraint(PMGR_CONSTRAINT_SLEEP_PROHIBITED);
-	erpc_wifi_unlock();
+	/* Avoid issuing a blocking PMGR eRPC call while RA may still be asleep.
+	 * Caller re-invokes this after wake confirmation when needed.
+	 */
+	if (!erpc_wifi_transport_slave_ready()) {
+		LOG_INF("PS TRACE: connect-start deferred remote constraint add until SRDY=1");
+		erpc_wifi_socket_tx_block_set(false, 0U);
+		return;
+	}
+	// erpc_wifi_lock();
+	// (void)ra6w1_pmgr_add_sleep_constraint(PMGR_CONSTRAINT_SLEEP_PROHIBITED);
+	// erpc_wifi_unlock();
+	erpc_wifi_ps_hold_awake("tcp-connect-start");
 	erpc_wifi_socket_tx_block_set(false, 0U);
 }
 
@@ -760,14 +832,24 @@ void erpc_wifi_ps_notify_wakeup(void)
 	 * Reset allow_sleep_sent so erpc_wifi_ps_schedule_sleep() will
 	 * re-arm the sleep timer once the I/O is done.
 	 */
-	if (g_ps.allow_sleep_sent) {
-		LOG_INF("PS TRACE: wakeup detected - re-arming sleep timer");
-		g_ps.allow_sleep_sent = false;
-		erpc_wifi_lock();
-		(void)ra6w1_pmgr_add_sleep_constraint(PMGR_CONSTRAINT_SLEEP_PROHIBITED);
-		erpc_wifi_unlock();
-		erpc_wifi_ps_schedule_sleep("wakeup-rearm");
+	LOG_INF("PS TRACE: wakeup/io detected - re-arming sleep timer");
+	g_ps.allow_sleep_sent = false;
+	erpc_wifi_ps_hold_awake("wakeup-rearm");
+	erpc_wifi_ps_schedule_sleep("wakeup-rearm");
+}
+
+void erpc_wifi_ps_hold_during_recv(void)
+{
+	if (!g_ps.enabled) {
+		return;
 	}
+
+	k_work_cancel_delayable(&g_ps_enable_work);
+	g_ps.allow_sleep_sent = false;
+	// erpc_wifi_lock();
+	// (void)ra6w1_pmgr_add_sleep_constraint(PMGR_CONSTRAINT_SLEEP_PROHIBITED);
+	// erpc_wifi_unlock();
+	erpc_wifi_ps_hold_awake("recv-blocking");
 }
 
 bool erpc_wifi_ps_is_enabled(void)
@@ -880,9 +962,11 @@ static void ps_allow_sleep_work(struct k_work *work)
 	}
 
 	/* Allow RA6W1 to enter DPM */
-	erpc_wifi_lock();
-	(void)ra6w1_pmgr_remove_sleep_constraint(PMGR_CONSTRAINT_SLEEP_PROHIBITED);
-	erpc_wifi_unlock();
+	// erpc_wifi_lock();
+	// (void)ra6w1_pmgr_remove_sleep_constraint(PMGR_CONSTRAINT_SLEEP_PROHIBITED);
+	// erpc_wifi_unlock();
+		/* Allow RA6W1 to enter DPM */
+	erpc_wifi_ps_release_awake("allow-sleep-work");
 	g_ps.allow_sleep_sent = true;
 	uint32_t gate_ms = g_ps.tmo_set ? (g_ps.timeout_ms + 5000U) : 30000U;
 	erpc_wifi_socket_tx_block_set(true, gate_ms);
@@ -1446,10 +1530,10 @@ static void erpc_wifi_server_event_monitor_thread(void *arg1, void *arg2, void *
 #endif
 
 		erpc_wifi_lock();
-		LOG_DBG("Event monitor: calling erpc_get_server_event");
+		// LOG_DBG("Event monitor: calling erpc_get_server_event"); // noisy during normal no-event polling
 		erpc_get_server_event(&event);
 		erpc_wifi_unlock();
-		LOG_DBG("Event monitor: erpc_get_server_event returned, event_id=%d", event.event_id);
+		// LOG_DBG("Event monitor: erpc_get_server_event returned, event_id=%d", event.event_id); // noisy during normal no-event polling
 
 		struct net_if *iface = data->net_iface;
 		if (!iface) {
@@ -1459,6 +1543,11 @@ static void erpc_wifi_server_event_monitor_thread(void *arg1, void *arg2, void *
 		}
 
 		switch (event.event_id) {
+		case 0:
+			/* No event queued on server side; this is normal for non-blocking poll. */
+			// LOG_DBG("Server: no pending event"); // expected idle state; suppress spam
+			break;
+
 		case eNetworkInterfaceUp:
 			LOG_INF("Server: Network interface up");
 			net_mgmt_event_notify(NET_EVENT_IF_UP, iface);
@@ -1479,7 +1568,8 @@ static void erpc_wifi_server_event_monitor_thread(void *arg1, void *arg2, void *
 			break;
 
 		default:
-			LOG_INF("%s: Unknown event: %d", __func__, event.event_id);
+			// LOG_INF("%s: Unknown event: %d", __func__, event.event_id); // too noisy for intermittent vendor events
+			LOG_DBG("%s: Unknown event: %d", __func__, event.event_id);
 			break;
 		}
 

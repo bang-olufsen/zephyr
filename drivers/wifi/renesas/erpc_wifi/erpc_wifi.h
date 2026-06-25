@@ -23,6 +23,14 @@ extern "C" {
 #define ERPC_WIFI_MTU                1500
 #define ERPC_WIFI_DRV_FW_VER_LEN_MAX 32
 
+#ifndef ERPC_PMGR_JOB_ID_SEND
+#define ERPC_PMGR_JOB_ID_SEND (1U)
+#endif
+
+#ifndef ERPC_PMGR_JOB_ID_RECV
+#define ERPC_PMGR_JOB_ID_RECV (2U)
+#endif
+
 enum erpc_wifi_driver_state {
 	ERPC_WIFI_DRIVER_INITIALIZING = 0,
 	ERPC_WIFI_DRIVER_INITIALIZED,
@@ -63,8 +71,10 @@ struct erpc_wifi_data {
 void erpc_wifi_ps_notify_socket_connected(void);
 void erpc_wifi_ps_notify_socket_connect_start(void);
 void erpc_wifi_ps_notify_wakeup(void);
+void erpc_wifi_ps_hold_during_recv(void);
 bool erpc_wifi_ps_is_enabled(void);
 int erpc_wifi_wake_for_tx(void);
+void erpc_wifi_pmgr_ram_release(uint32_t job_id);
 
 #ifdef __cplusplus
 }
