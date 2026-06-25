@@ -3,10 +3,14 @@ LOG_MODULE_DECLARE(wifi_erpc_wifi, CONFIG_WIFI_LOG_LEVEL);
 
 #include <zephyr/net/socket_offload.h>
 #include <zephyr/net/socket.h>
+#include <zephyr/net/wifi.h>
 #include "erpc_wifi.h"
 #include "c_wifi_host_to_ra_client.h"
 #include "c_wifi_ra_to_host_client.h"
 #include <c_wifi_host_to_ra_client.h>
+
+void erpc_wifi_lock(void);
+void erpc_wifi_unlock(void);
 
 /* * The Offload Function (Using Compact Struct)
  */
@@ -38,29 +42,60 @@ static int offload_getaddrinfo(const char *node, const char *service,
 
 	// 3. Call the eRPC generated client stub.
 	// The addresses buffer is filled by the eRPC framework.
+	
 	erpc_wifi_lock();
-	server_status = ra6w1_dns_getaddrinfo(node, result, DNS_MAX_ADDRESSES, &actual_count);
-	erpc_wifi_unlock();
+bool dpm_was_enabled = erpc_wifi_ps_is_enabled();
+    if (dpm_was_enabled) {
+		(void)ra6w1_wifi_ps_set_param((ra_wifi_ps_param_t)WIFI_PS_PARAM_STATE, 0);
+        (void)ra6w1_wifi_ps_apply();
+    }
+k_msleep(500);
+ 
+server_status = ra6w1_dns_getaddrinfo(node, result, DNS_MAX_ADDRESSES, &actual_count);
+ 
+ 
+    if (dpm_was_enabled) {
+		(void)ra6w1_wifi_ps_set_param((ra_wifi_ps_param_t)WIFI_PS_PARAM_STATE, 1);
+        (void)ra6w1_wifi_ps_apply();
+    }
+k_msleep(100);
+    erpc_wifi_unlock();
+	
+	// Release RAM constraint and mark DPM job as complete
+	erpc_wifi_pmgr_ram_release(ERPC_PMGR_JOB_ID_SEND);
 
 	// Re-arm the PS sleep timer now that the DNS eRPC round-trip is done.
 	erpc_wifi_ps_notify_wakeup();
 
-	// 3. Check eRPC Transport Error
-	if (server_status != eWiFiSuccess) {
-		// Assume non-success means a transport error or unrecoverable LwIP error
-		return DNS_EAI_SYSTEM;
-	}
+	// // 3. Check eRPC Transport Error
+	// if (server_status != eWiFiSuccess) {
+	// 	// Assume non-success means a transport error or unrecoverable LwIP error
+	// 	free(result);
+	// 	return EAI_SYSTEM;
+	// }
 
-	// 4. Check LwIP Error (The server returns the LwIP error code in WIFIReturnCode_t)
-	// NOTE: If your server uses a dedicated error_code field, you must check that instead.
+	// // 4. Check LwIP Error (The server returns the LwIP error code in WIFIReturnCode_t)
+	// // NOTE: If your server uses a dedicated error_code field, you must check that instead.
+	// if (server_status < 0) {
+	// 	// If the return code is a negative LwIP error, map it to EAI_FAIL
+	// 	free(result);
+	// 	return EAI_FAIL;
+	// }
+
+	/* Map known server/LwIP status first, then fallback. */
 	if (server_status < 0) {
-		// If the return code is a negative LwIP error, map it to EAI_FAIL
-		return DNS_EAI_FAIL;
+		free(result);
+		return EAI_AGAIN;
+	}
+	if (server_status != eWiFiSuccess) {
+		free(result);
+		return EAI_SYSTEM;
 	}
 
 	// 5. Check for No Results Found
 	if (actual_count == 0) {
-		return DNS_EAI_NODATA;
+		free(result);
+		return EAI_NODATA;
 	}
 
 	// 6. Build the Zephyr linked list from the data received over eRPC
@@ -100,6 +135,7 @@ static int offload_getaddrinfo(const char *node, const char *service,
 	}
 
 	*res = head;
+	free(result);
 	return 0;
 
 cleanup:
@@ -135,6 +171,6 @@ void erpc_wifi_dns_offload_init(void)
 {
 	printk("Registering eRPC WiFi DNS offload\n");
 	socket_offload_dns_register(&dns_ops);
-	socket_offload_dns_enable(false);
-	printk("eRPC WiFi DNS offload disabled; using Zephyr DNS resolver over socket offload\n");
+	socket_offload_dns_enable(true);
+	printk("eRPC WiFi DNS offload enabled\n");
 }
