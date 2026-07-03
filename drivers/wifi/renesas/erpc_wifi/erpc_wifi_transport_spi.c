@@ -39,7 +39,7 @@ erpc_transport_t erpc_wifi_transport_init(void)
 		return NULL;
 	};
 	if (!device_is_ready(cfg->n_int.port)) {
-		printf("Slave-ready GPIO controller not ready: %s", cfg->n_int.port->name);
+		//printf("Slave-ready GPIO controller not ready: %s", cfg->n_int.port->name);
 		return NULL;
 	} 
 
@@ -56,8 +56,8 @@ int erpc_wifi_transport_slave_ready(void)
 		return true;
 	}
 	if (!device_is_ready(g_slave_ready_gpio->port)) {
-		printf("Slave-ready GPIO not ready at runtime: %s",
-			g_slave_ready_gpio->port->name);
+		//printf("Slave-ready GPIO not ready at runtime: %s",
+		//	g_slave_ready_gpio->port->name);
 		return false;
 	}
 
