@@ -52,13 +52,13 @@ static struct k_thread erpc_wifi_server_thread_data;
 
 K_KERNEL_STACK_DEFINE(erpc_wifi_workq_stack, CONFIG_WIFI_ERPC_WIFI_WORKQ_STACK_SIZE);
 
-#define EVENT_MONITOR_STACK_SIZE 4096
+#define EVENT_MONITOR_STACK_SIZE 8192
 K_THREAD_STACK_DEFINE(event_monitor_stack, EVENT_MONITOR_STACK_SIZE);
 
 // Thread control structure
 static struct k_thread event_monitor_thread;
 static k_tid_t event_monitor_tid;
-static struct k_mutex g_erpc_wifi_mutex;
+static K_MUTEX_DEFINE(g_erpc_wifi_mutex);
 // Thread status
 static bool event_monitor_running = false;
 
@@ -78,6 +78,10 @@ void erpc_wifi_lock(void)
 void erpc_wifi_unlock(void)
 {
 	k_mutex_unlock(&g_erpc_wifi_mutex);
+	/* Enforce a brief inter-transaction delay to allow the co-processor SPI slave
+	 * DMA and task scheduler to settle between back-to-back eRPC calls.
+	 */
+	k_msleep(5);
 }
 
 #if DT_NODE_HAS_STATUS(DT_ALIAS(wakeup_gpio), okay)
@@ -496,7 +500,7 @@ static int erpc_wifi_mgmt_connect(const struct device *dev, struct wifi_connect_
 
 	LOG_DBG("erpc_wifi_mgmt_connect");
 
-	memset(&data->drv_nwk_params, 0, sizeof(sizeof(WIFINetworkParams_t)));
+	memset(&data->drv_nwk_params, 0, sizeof(data->drv_nwk_params));
 
 	data->drv_nwk_params.ucSSIDLength =
 		MIN(params->ssid_length, sizeof(data->drv_nwk_params.ucSSID));
@@ -553,7 +557,7 @@ static void erpc_wifi_mgmt_connect_work(struct k_work *work)
 			k_msleep(20);
 		}
 
-		k_msleep(10);
+		k_msleep(50);
 	}
 	//erpc_wifi_ps_push_defaults();
 	LOG_INF("WiFi connect API: calling WIFI_ConnectAP");
@@ -1274,6 +1278,13 @@ static void erpc_wifi_iface_init(struct net_if *iface)
 static void erpc_wifi_client_error_handler(erpc_status_t err, uint32_t func_id)
 {
 	if (err > 0) {
+		/* Downgrade transient CRC check failures (err: 8) during wakeup/retry phases
+		 * to prevent flooding the system log.
+		 */
+		if (err == 8) {
+			LOG_DBG("eRPC client transient error - err: %d func_id: %d", err, func_id);
+			return;
+		}
 		/* See wifi_interface.hpp for list of function id's */
 		LOG_ERR("eRPC client error - err: %d func_id: %d", err, func_id);
 	}
@@ -1514,20 +1525,15 @@ static void erpc_wifi_server_event_monitor_thread(void *arg1, void *arg2, void *
 			k_sleep(K_SECONDS(2));
 			continue;
 		}
-#if defined(CONFIG_NET_IPV4) && defined(CONFIG_NET_IPV6)
-		if (data->ipv4_assigned && data->ipv6_assigned) {
-			event_monitor_running = false;
+
+		/* If the co-processor is in DPM sleep, slave-ready will be low (0).
+		 * In this state, we skip issuing eRPC events queries to avoid waking up
+		 * the module, saving host CPU and co-processor power.
+		 */
+		if (erpc_wifi_ps_is_enabled() && !erpc_wifi_transport_slave_ready()) {
+			k_msleep(500);
+			continue;
 		}
-#else
-		if (data->ipv4_assigned
-#if defined(CONFIG_NET_IPV6)
-		    || data->ipv6_assigned
-#endif
-		) {
-			event_monitor_running = false;
-			break;
-		}
-#endif
 
 		erpc_wifi_lock();
 		// LOG_DBG("Event monitor: calling erpc_get_server_event"); // noisy during normal no-event polling
