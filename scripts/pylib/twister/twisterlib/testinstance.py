@@ -332,7 +332,7 @@ class TestInstance:
 
         testsuite_runnable = self.testsuite_runnable(self.testsuite, fixtures)
 
-        if hardware_map:
+        if hardware_map and hardware_map.duts:
             testsuite_runnable = False
             for h in hardware_map.duts:
                 if (h.platform in self.platform.aliases and
