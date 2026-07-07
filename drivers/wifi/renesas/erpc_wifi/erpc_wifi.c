@@ -653,6 +653,7 @@ struct erpc_ps_cache {
 
 	bool enabled;          /* last STATE */
 	bool allow_sleep_sent; /* whether we have removed the sleep constraint */
+	bool sleep_confirmed;  /* whether the module actually fell asleep (SRDY dropped) */
 	bool socket_connect_pending;
 	bool sleep_constraint_held;
 };
@@ -757,6 +758,7 @@ static void erpc_wifi_ps_set_state_internal(bool enabled, const char *source)
 
 	g_ps.enabled = enabled;
 	g_ps.allow_sleep_sent = false;
+	g_ps.sleep_confirmed = false;
 	k_work_cancel_delayable(&g_ps_enable_work);
 
 	// /* Keep module awake until PS params are applied and delay expires. */
@@ -786,6 +788,7 @@ void erpc_wifi_ps_notify_socket_connected(void)
 
 	g_ps.socket_connect_pending = false;
 	g_ps.allow_sleep_sent = false;
+	g_ps.sleep_confirmed = false;
 	// erpc_wifi_lock();
 	// (void)ra6w1_pmgr_add_sleep_constraint(PMGR_CONSTRAINT_SLEEP_PROHIBITED);
 	// erpc_wifi_unlock();
@@ -810,6 +813,7 @@ void erpc_wifi_ps_notify_socket_connect_start(void)
 
 	g_ps.socket_connect_pending = true;
 	g_ps.allow_sleep_sent = false;
+	g_ps.sleep_confirmed = false;
 	k_work_cancel_delayable(&g_ps_enable_work);
 	/* Avoid issuing a blocking PMGR eRPC call while RA may still be asleep.
 	 * Caller re-invokes this after wake confirmation when needed.
@@ -838,6 +842,7 @@ void erpc_wifi_ps_notify_wakeup(void)
 	 */
 	LOG_INF("PS TRACE: wakeup/io detected - re-arming sleep timer");
 	g_ps.allow_sleep_sent = false;
+	g_ps.sleep_confirmed = false;
 	erpc_wifi_ps_hold_awake("wakeup-rearm");
 	erpc_wifi_ps_schedule_sleep("wakeup-rearm");
 }
@@ -850,6 +855,7 @@ void erpc_wifi_ps_hold_during_recv(void)
 
 	k_work_cancel_delayable(&g_ps_enable_work);
 	g_ps.allow_sleep_sent = false;
+	g_ps.sleep_confirmed = false;
 	// erpc_wifi_lock();
 	// (void)ra6w1_pmgr_add_sleep_constraint(PMGR_CONSTRAINT_SLEEP_PROHIBITED);
 	// erpc_wifi_unlock();
@@ -859,6 +865,23 @@ void erpc_wifi_ps_hold_during_recv(void)
 bool erpc_wifi_ps_is_enabled(void)
 {
 	return g_ps.enabled;
+}
+
+bool erpc_wifi_ps_sleep_is_sent(void)
+{
+	return g_ps.enabled && g_ps.allow_sleep_sent;
+}
+
+void erpc_wifi_ps_confirm_sleep(void)
+{
+	if (g_ps.enabled && g_ps.allow_sleep_sent) {
+		g_ps.sleep_confirmed = true;
+	}
+}
+
+bool erpc_wifi_ps_sleep_is_confirmed(void)
+{
+	return g_ps.enabled && g_ps.sleep_confirmed;
 }
 
 static bool erpc_wifi_ps_should_wake_before_disable(void)
@@ -972,6 +995,7 @@ static void ps_allow_sleep_work(struct k_work *work)
 		/* Allow RA6W1 to enter DPM */
 	erpc_wifi_ps_release_awake("allow-sleep-work");
 	g_ps.allow_sleep_sent = true;
+	g_ps.sleep_confirmed = false;
 	uint32_t gate_ms = g_ps.tmo_set ? (g_ps.timeout_ms + 5000U) : 30000U;
 	erpc_wifi_socket_tx_block_set(true, gate_ms);
 
@@ -1056,10 +1080,6 @@ static int erpc_wifi_mgmt_set_power_save(struct net_if *iface, struct wifi_ps_pa
 	case WIFI_PS_PARAM_LISTEN_INTERVAL:
 		g_ps.listen_interval = (uint32_t)params->listen_interval;
 		g_ps.li_set = true;
-
-		erpc_wifi_lock();
-		ra6w1_wifi_ps_set_param(RA_WIFI_PS_PARAM_LISTEN_INTERVAL, g_ps.listen_interval);
-		erpc_wifi_unlock();
 		return 0;
 
 	case WIFI_PS_PARAM_WAKEUP_MODE:
@@ -1069,12 +1089,8 @@ static int erpc_wifi_mgmt_set_power_save(struct net_if *iface, struct wifi_ps_pa
 			g_ps.wakeup_mode = (uint32_t)RA_WIFI_PS_WAKEUP_MODE_DTIM;
 		}
 		g_ps.wm_set = true;
-		LOG_INF("PS set: WAKEUP_MODE zephyr=%u ra=%u", params->wakeup_mode,
+		LOG_INF("PS set: WAKEUP_MODE zephyr=%u ra=%u (cached)", params->wakeup_mode,
 			g_ps.wakeup_mode);
-
-		erpc_wifi_lock();
-		ra6w1_wifi_ps_set_param(RA_WIFI_PS_PARAM_WAKEUP_MODE, g_ps.wakeup_mode);
-		erpc_wifi_unlock();
 		return 0;
 
 	case WIFI_PS_PARAM_EXIT_STRATEGY: {
@@ -1085,10 +1101,7 @@ static int erpc_wifi_mgmt_set_power_save(struct net_if *iface, struct wifi_ps_pa
 		g_ps.exit_strategy = (uint32_t)params->exit_strategy;
 		g_ps.ex_set = true;
 
-		LOG_INF("PS set: EXIT_STRATEGY zephyr=%u (sent-as-is)", params->exit_strategy);
-		erpc_wifi_lock();
-		ra6w1_wifi_ps_set_param(RA_WIFI_PS_PARAM_EXIT_STRATEGY, g_ps.exit_strategy);
-		erpc_wifi_unlock();
+		LOG_INF("PS set: EXIT_STRATEGY zephyr=%u (cached)", params->exit_strategy);
 		return 0;
 	}
 
@@ -1096,10 +1109,7 @@ static int erpc_wifi_mgmt_set_power_save(struct net_if *iface, struct wifi_ps_pa
 		g_ps.timeout_ms = (uint32_t)params->timeout_ms;
 		g_ps.tmo_set = true;
 
-		/* Forward to RA – RA PMGR policy decides post-TX behavior */
-		erpc_wifi_lock();
-		ra6w1_wifi_ps_set_param(RA_WIFI_PS_PARAM_TIMEOUT_MS, g_ps.timeout_ms);
-		erpc_wifi_unlock();
+		LOG_INF("PS set: TIMEOUT_MS=%u (cached)", g_ps.timeout_ms);
 		if (g_ps.enabled && !g_ps.allow_sleep_sent) {
 			erpc_wifi_ps_schedule_sleep("timeout-update");
 		}
@@ -1526,10 +1536,6 @@ static void erpc_wifi_server_event_monitor_thread(void *arg1, void *arg2, void *
 			continue;
 		}
 
-		/* If the co-processor is in DPM sleep, slave-ready will be low (0).
-		 * In this state, we skip issuing eRPC events queries to avoid waking up
-		 * the module, saving host CPU and co-processor power.
-		 */
 		if (erpc_wifi_ps_is_enabled() && !erpc_wifi_transport_slave_ready()) {
 			k_msleep(500);
 			continue;
@@ -1550,8 +1556,7 @@ static void erpc_wifi_server_event_monitor_thread(void *arg1, void *arg2, void *
 
 		switch (event.event_id) {
 		case 0:
-			/* No event queued on server side; this is normal for non-blocking poll. */
-			// LOG_DBG("Server: no pending event"); // expected idle state; suppress spam
+			// LOG_DBG("Server: no pending event"); // less spam
 			break;
 
 		case eNetworkInterfaceUp:

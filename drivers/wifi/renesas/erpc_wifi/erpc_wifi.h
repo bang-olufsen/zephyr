@@ -73,6 +73,9 @@ void erpc_wifi_ps_notify_socket_connect_start(void);
 void erpc_wifi_ps_notify_wakeup(void);
 void erpc_wifi_ps_hold_during_recv(void);
 bool erpc_wifi_ps_is_enabled(void);
+bool erpc_wifi_ps_sleep_is_sent(void);
+void erpc_wifi_ps_confirm_sleep(void);
+bool erpc_wifi_ps_sleep_is_confirmed(void);
 int erpc_wifi_wake_for_tx(void);
 void erpc_wifi_pmgr_ram_release(uint32_t job_id);
 

@@ -377,12 +377,14 @@ static void erpc_wifi_socket_poll_task(void *arg1, void *arg2, void *arg3)
 			for (int i = 0; i < ERPC_WIFI_MAX_SOCKETS; i++) {
 				struct erpc_wifi_socket *sock = &sockets[i];
 
-				if (sock->in_use && sock->waiting) {
+				if (sock->in_use) {
 					activity = true;
 					int srdy = erpc_wifi_transport_slave_ready();
 
-					/* Do not query socket events while RA is still waking from sleep. */
-					if (!srdy) {
+					if (erpc_wifi_ps_is_enabled() && !srdy) {
+						if (erpc_wifi_ps_sleep_is_sent()) {
+							erpc_wifi_ps_confirm_sleep();
+						}
 						int64_t now = k_uptime_get();
 						if ((now - last_not_ready_log) > 1000) {
 							LOG_INF("poll wait: fd=%d srdy=0 waiting for module ready", sock->fd);
@@ -390,8 +392,16 @@ static void erpc_wifi_socket_poll_task(void *arg1, void *arg2, void *arg3)
 						}
 						continue;
 					}
+					if (erpc_wifi_ps_sleep_is_sent()) {
+						if (erpc_wifi_ps_sleep_is_confirmed() && srdy) {
+							LOG_INF("Autonomous DPM wakeup detected (fd=%d), processing events", sock->fd);
+							erpc_wifi_ps_notify_wakeup();
+						} else {
+							/* Waiting for module to sleep. Don't add constraints. */
+							continue;
+						}
+					}
 
-					/* Perform the proper settle/RAM hold handshake before eRPC. */
 					int __w = erpc_wifi_ensure_awake_rx(ERPC_PMGR_JOB_ID_RECV);
 					if (__w != 0) {
 						continue;
@@ -450,7 +460,6 @@ static int erpc_wifi_socket_level_from_posix(int level, int *level_erpc_wifi)
 		*level_erpc_wifi = ERPC_WIFI_SOL_SOCKET;
 		break;
 		case IPPROTO_TCP:
-		/* Keep native TCP level for server/LwIP keepalive options. */
 		*level_erpc_wifi = IPPROTO_TCP;
 		break;
 	default:
@@ -464,7 +473,6 @@ static int erpc_wifi_socket_level_from_posix(int level, int *level_erpc_wifi)
 static int erpc_wifi_socket_option_from_posix(int level, int optname, int *optname_erpc_wifi)
 {
 	if (level == IPPROTO_TCP) {
-		/* Preserve native TCP option IDs (TCP_KEEPIDLE/TCP_KEEPINTVL/TCP_KEEPCNT/TCP_KEEPALIVE). */
 		*optname_erpc_wifi = optname;
 		return 0;
 	}
@@ -654,11 +662,17 @@ static struct erpc_wifi_socket *erpc_wifi_socket_allocate(int fd, int zfd)
 			sockets[i].waiting = false;
 			k_poll_signal_init(&sockets[i].poll_signal);
 			sockets[i].recv_timeout_ms = 0;
+			sockets[i].triggered_events = 0;
 			socket = &sockets[i];
 			break;
 		}
 	}
 	erpc_wifi_unlock();
+
+	if (socket != NULL) {
+		/* Wake the poll task so it begins monitoring the newly allocated socket */
+		k_sem_give(&poll_task_sem);
+	}
 
 	return socket;
 }
@@ -667,7 +681,7 @@ static void erpc_wifi_socket_free(int fd)
 {
 	erpc_wifi_lock();
 	for (int i = 0; i < ERPC_WIFI_MAX_SOCKETS; i++) {
-		if (sockets[i].fd == fd) {
+		if (sockets[i].in_use && sockets[i].fd == fd) {
 			sockets[i].in_use = false;
 			break;
 		}
@@ -747,6 +761,20 @@ static int erpc_wifi_socket_connect(void *obj, const struct sockaddr *addr, sock
 	}
 #endif
 
+	if (sock->type == SOCK_STREAM && sock->bound_port == 0) {
+		struct sockaddr_in local_addr = {
+			.sin_family = AF_INET,
+			.sin_port = htons(55000 + sock->fd),
+			.sin_addr = { .s_addr = INADDR_ANY }
+		};
+		int bind_ret = erpc_wifi_socket_bind(sock, (const struct sockaddr *)&local_addr, sizeof(local_addr));
+		if (bind_ret < 0) {
+			LOG_WRN("Auto-bind to port %u failed: %d", 55000 + sock->fd, bind_ret);
+		} else {
+			LOG_INF("Auto-bound TCP client socket to port %u for DPM tracking", 55000 + sock->fd);
+		}
+	}
+
 	ret = erpc_wifi_socket_addr_from_posix(addr, &addr_erpc_wifi);
 	if (ret) {
 		erpc_wifi_ps_notify_socket_connect_failed();
@@ -756,6 +784,25 @@ static int erpc_wifi_socket_connect(void *obj, const struct sockaddr *addr, sock
 	ret = ra6w1_connect(sock->fd, &addr_erpc_wifi, addr_erpc_wifi.sa_len);
 	erpc_wifi_unlock();
 	k_msleep(100);
+
+	/* Register TCP DPM wake filter BEFORE releasing the RAM/awake constraint.
+	 * If done after pmgr_ram_release + ps_notify_wakeup the module may have
+	 * started its sleep transition and the eRPC call gets a CRC error. */
+	if (ret == 0 && sock->type == SOCK_STREAM && sock->bound_port != 0 &&
+	    !sock->tcp_dpm_filter_set) {
+		erpc_wifi_lock();
+		int32_t rc = ra6w1_wifi_dpm_tcp_port_filter_set(sock->bound_port);
+		erpc_wifi_unlock();
+		if (rc == 0) {
+			sock->tcp_dpm_filter_set = true;
+			LOG_INF("TCP DPM wake filter set for connected port %u",
+				sock->bound_port);
+		} else {
+			LOG_WRN("Failed to set TCP DPM wake filter for connected port %u (rc=%d)",
+				sock->bound_port, rc);
+		}
+	}
+
 	erpc_wifi_pmgr_ram_release(ERPC_PMGR_JOB_ID_SEND);
 	erpc_wifi_ps_notify_wakeup();
 	LOG_DBG("ra6w1_connect: %d", ret);
@@ -785,16 +832,15 @@ static int erpc_wifi_socket_listen(void *obj, int backlog)
 
 	if (ret == 0 && sock->type == SOCK_STREAM && sock->bound_port != 0 &&
 	    !sock->tcp_dpm_filter_set) {
-		int32_t dpm_on = ra6w1_pmgr_dpm_is_enabled();
-		if (dpm_on == 1) {
-			int32_t rc = ra6w1_wifi_dpm_tcp_port_filter_set(sock->bound_port);
-			if (rc == 0) {
-				sock->tcp_dpm_filter_set = true;
-				LOG_INF("TCP DPM wake filter set for port %u", sock->bound_port);
-			} else {
-				LOG_WRN("Failed to set TCP DPM wake filter for port %u (rc=%d)",
-					sock->bound_port, rc);
-			}
+		erpc_wifi_lock();
+		int32_t rc = ra6w1_wifi_dpm_tcp_port_filter_set(sock->bound_port);
+		erpc_wifi_unlock();
+		if (rc == 0) {
+			sock->tcp_dpm_filter_set = true;
+			LOG_INF("TCP DPM wake filter set for port %u", sock->bound_port);
+		} else {
+			LOG_WRN("Failed to set TCP DPM wake filter for port %u (rc=%d)",
+				sock->bound_port, rc);
 		}
 	}
 
@@ -852,13 +898,6 @@ static int erpc_wifi_socket_accept(void *obj, struct sockaddr *addr, socklen_t *
 static ssize_t erpc_wifi_socket_sendto(void *obj, const void *buf, size_t len, int flags,
 				       const struct sockaddr *dest_addr, socklen_t addrlen)
 {
-	/* old behavior pulsed GPIO here; ensure_awake_tx already owns wake/re-pulse policy */
-	// if (erpc_wifi_ps_is_enabled()) {
-	// 	LOG_INF("TX wake pulse request (len=%u)", (unsigned int)len);
-	// 	erpc_wifi_gpio_trigger_wakeup();
-	// } else {
-	// 	LOG_DBG("TX wake pulse skipped: PS disabled (len=%u)", (unsigned int)len);
-	// }
 	LOG_INF("TX wake request (len=%u)", (unsigned int)len);
 
     int __w = erpc_wifi_ensure_awake_tx(ERPC_PMGR_JOB_ID_SEND);
@@ -945,6 +984,12 @@ static ssize_t erpc_wifi_socket_recvfrom(void *obj, void *buf, size_t max_len, i
 					 struct sockaddr *src_addr, socklen_t *addrlen)
 {
 	struct erpc_wifi_socket *sock = (struct erpc_wifi_socket *)obj;
+
+	if ((sock->flags & O_NONBLOCK) &&
+	    !(sock->triggered_events & (SOCKET_EVENT_RX | SOCKET_EVENT_ERR | SOCKET_EVENT_CLOSE))) {
+		return -EAGAIN;
+	}
+
 	int64_t start_time = k_uptime_get();
 	uint32_t timeout_ms = sock->recv_timeout_ms;
 	if (timeout_ms == 0) {
@@ -954,11 +999,6 @@ static ssize_t erpc_wifi_socket_recvfrom(void *obj, void *buf, size_t max_len, i
 	int ret;
 
 	for (;;) {
-		/* RX path: RA6W1 wakes itself on incoming TCP packet and asserts slave-ready.
-		 * Do NOT pulse the wakeup GPIO here — that is a Host→RA signal used only
-		 * when the host needs to wake a sleeping module for TX. For RX the direction
-		 * is RA→Host via slave-ready pin.
-		 */
 		int __w = erpc_wifi_ensure_awake_rx(ERPC_PMGR_JOB_ID_RECV);
 		if (__w != 0) {
 			LOG_INF("erpc_wifi_ensure_awake_rx failed: IN %s = %d", __func__, __w);
@@ -972,15 +1012,6 @@ static ssize_t erpc_wifi_socket_recvfrom(void *obj, void *buf, size_t max_len, i
 		LOG_DBG("src_addr: %x", (uint32_t)src_addr);
 		LOG_DBG("addrlen: %x", (uint32_t)addrlen);
 
-		/* Issue a non-blocking recv/recvfrom call to the RA6W1.
-		 * ZSOCK_MSG_DONTWAIT is 0x40.
-		 */
-		/* Map Zephyr socket flags to LwIP flags expected by the co-processor.
-		 * - Zephyr ZSOCK_MSG_PEEK is 0x02, LwIP MSG_PEEK is 0x02.
-		 * - Zephyr ZSOCK_MSG_DONTWAIT is 0x40, LwIP MSG_DONTWAIT is 0x08.
-		 * We always force LwIP's MSG_DONTWAIT (0x08) to ensure the co-processor
-		 * call is non-blocking.
-		 */
 		int ra_flags = 0x08;
 		if (flags & ZSOCK_MSG_PEEK) {
 			ra_flags |= 0x02;
@@ -1027,10 +1058,13 @@ static ssize_t erpc_wifi_socket_recvfrom(void *obj, void *buf, size_t max_len, i
 		erpc_wifi_pmgr_ram_release(ERPC_PMGR_JOB_ID_RECV);
 		erpc_wifi_ps_notify_wakeup();
 
-		/* If we read data successfully, or encountered a non-retryable error, return it. */
 		if (ret >= 0 || (ret != -EAGAIN && ret != -EWOULDBLOCK && ret != -6)) {
+			if (ret < 0) {
+				LOG_ERR("ra6w1_recv failed: %d", ret);
+			}
 			return ret;
 		}
+		sock->triggered_events &= ~SOCKET_EVENT_RX;
 
 		/* If MSG_DONTWAIT was specified in this call, or O_NONBLOCK is configured on the socket,
 		 * return -EAGAIN immediately.
@@ -1039,6 +1073,7 @@ static ssize_t erpc_wifi_socket_recvfrom(void *obj, void *buf, size_t max_len, i
 			return -EAGAIN;
 		}
 
+wait_poll:
 		/* Check if our receive timeout has expired. */
 		int64_t elapsed = k_uptime_get() - start_time;
 		if (timeout_ms != UINT32_MAX && elapsed >= (int64_t)timeout_ms) {
@@ -1048,16 +1083,10 @@ static ssize_t erpc_wifi_socket_recvfrom(void *obj, void *buf, size_t max_len, i
 		/* Calculate remaining timeout for the poll block. */
 		k_timeout_t rem_timeout = (timeout_ms == UINT32_MAX) ? K_FOREVER : K_MSEC(timeout_ms - elapsed);
 
-		/* Wait on the socket's poll signal. This blocks the current thread locally on the host,
-		 * leaving the eRPC bus completely free for other tasks (like background work)
-		 * and allowing the RA6W1 to remain in low-power sleep until a network packet wakes it.
-		 */
 		sock->triggered_events = 0;
 		sock->waiting = true;
 		sock->poll_events = ZVFS_POLLIN;
 		k_poll_signal_reset(&sock->poll_signal);
-
-		/* Signal the poll task to begin querying the socket. */
 		k_sem_give(&poll_task_sem);
 
 		struct k_poll_event event;
@@ -1192,6 +1221,14 @@ static int erpc_wifi_socket_close(void *obj)
 
 	LOG_DBG("erpc_wifi_socket_close");
 
+	if (sock->tcp_dpm_filter_set && sock->bound_port != 0) {
+		erpc_wifi_lock();
+		(void)ra6w1_wifi_dpm_tcp_port_delete(sock->bound_port);
+		erpc_wifi_unlock();
+		sock->tcp_dpm_filter_set = false;
+		LOG_INF("TCP DPM wake filter removed for port %u", sock->bound_port);
+	}
+
 	erpc_wifi_socket_free(sock->fd);
 	erpc_wifi_lock();
 	ret = ra6w1_close(sock->fd);
@@ -1310,23 +1347,23 @@ static int erpc_wifi_socket_poll_update(struct zvfs_pollfd *pfd, struct k_poll_e
 
 	sock->waiting = false;
 
-	if (*pev != NULL && (*pev)->type == K_POLL_TYPE_SIGNAL &&
-	    (*pev)->state == K_POLL_STATE_SIGNALED) {
-		uint32_t ev = (uint32_t)sock->triggered_events;
+	if (*pev != NULL && (*pev)->type == K_POLL_TYPE_SIGNAL) {
+		if ((*pev)->state == K_POLL_STATE_SIGNALED) {
+			uint32_t ev = (uint32_t)sock->triggered_events;
 
-		if ((ev & SOCKET_EVENT_RX) && (pfd->events & ZVFS_POLLIN)) {
-			pfd->revents |= ZVFS_POLLIN;
+			if ((ev & SOCKET_EVENT_RX) && (pfd->events & ZVFS_POLLIN)) {
+				pfd->revents |= ZVFS_POLLIN;
+			}
+			if ((ev & SOCKET_EVENT_TX) && (pfd->events & ZVFS_POLLOUT)) {
+				pfd->revents |= ZVFS_POLLOUT;
+			}
+			if ((ev & SOCKET_EVENT_ERR) && (pfd->events & ZVFS_POLLERR)) {
+				pfd->revents |= ZVFS_POLLERR;
+			}
+			if ((ev & SOCKET_EVENT_CLOSE) && (pfd->events & ZVFS_POLLHUP)) {
+				pfd->revents |= ZVFS_POLLHUP;
+			}
 		}
-		if ((ev & SOCKET_EVENT_TX) && (pfd->events & ZVFS_POLLOUT)) {
-			pfd->revents |= ZVFS_POLLOUT;
-		}
-		if ((ev & SOCKET_EVENT_ERR) && (pfd->events & ZVFS_POLLERR)) {
-			pfd->revents |= ZVFS_POLLERR;
-		}
-		if ((ev & SOCKET_EVENT_CLOSE) && (pfd->events & ZVFS_POLLHUP)) {
-			pfd->revents |= ZVFS_POLLHUP;
-		}
-
 		(*pev)++;
 	}
 
