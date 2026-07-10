@@ -80,7 +80,7 @@ static int erpc_wifi_ensure_awake_rx(uint32_t job_id)
 				continue;
 			}
 
-			k_msleep(100);
+			k_msleep(500);
 			if (pmgr_ram_hold() < 0) {
 				k_msleep(50);
 				continue;
@@ -145,7 +145,7 @@ static int erpc_wifi_ensure_awake_tx(uint32_t job_id)
 				continue;
 			}
 
-			k_msleep(100);
+			k_msleep(500);
 
 			if (pmgr_ram_hold() < 0) {
 				k_msleep(50);
@@ -368,8 +368,20 @@ static void erpc_wifi_socket_poll_task(void *arg1, void *arg2, void *arg3)
 	int64_t last_not_ready_log = 0;
 
 	while (1) {
-		/* Wait until signaled that a socket is waiting for events */
-		(void)k_sem_take(&poll_task_sem, K_FOREVER);
+		/* Determine if we need to poll for autonomous DPM wakeups */
+		bool dpm_polling_needed = false;
+		if (erpc_wifi_ps_is_enabled()) {
+			for (int i = 0; i < ERPC_WIFI_MAX_SOCKETS; i++) {
+				if (sockets[i].in_use) {
+					dpm_polling_needed = true;
+					break;
+				}
+			}
+		}
+
+		/* Wait until signaled, or timeout if we need to poll DPM srdy */
+		k_timeout_t wait_timeout = dpm_polling_needed ? K_MSEC(200) : K_FOREVER;
+		(void)k_sem_take(&poll_task_sem, wait_timeout);
 
 		bool activity = true;
 		while (activity) {
@@ -377,8 +389,10 @@ static void erpc_wifi_socket_poll_task(void *arg1, void *arg2, void *arg3)
 			for (int i = 0; i < ERPC_WIFI_MAX_SOCKETS; i++) {
 				struct erpc_wifi_socket *sock = &sockets[i];
 
-				if (sock->in_use) {
-					activity = true;
+				if (sock->in_use && (sock->waiting || erpc_wifi_ps_is_enabled())) {
+					if (sock->waiting) {
+						activity = true;
+					}
 					int srdy = erpc_wifi_transport_slave_ready();
 
 					if (erpc_wifi_ps_is_enabled() && !srdy) {
@@ -654,6 +668,24 @@ static struct erpc_wifi_socket *erpc_wifi_socket_allocate(int fd, int zfd)
 	struct erpc_wifi_socket *socket = NULL;
 
 	erpc_wifi_lock();
+	
+	/* If RA6W1 reallocated an FD that Zephyr still thinks is in use (e.g., the RA6W1 implicitly
+	 * closed a DHCP UDP socket and reused the FD for a TLS TCP socket), we must force-close
+	 * the old Zephyr socket so background threads like DHCP don't steal the new socket's data!
+	 */
+	for (int i = 0; i < ERPC_WIFI_MAX_SOCKETS; i++) {
+		if (sockets[i].in_use && sockets[i].fd == fd) {
+			LOG_WRN("RA6W1 FD %d reused! Force-closing stale Zephyr socket (zfd=%d)", 
+				fd, sockets[i].zfd);
+			sockets[i].in_use = false;
+			sockets[i].fd = -1;
+			sockets[i].triggered_events |= SOCKET_EVENT_ERR | SOCKET_EVENT_CLOSE;
+			if (sockets[i].waiting) {
+				k_poll_signal_raise(&sockets[i].poll_signal, 0);
+			}
+		}
+	}
+
 	for (int i = 0; i < ERPC_WIFI_MAX_SOCKETS; i++) {
 		if (sockets[i].in_use == false) {
 			sockets[i].fd = fd;
@@ -750,6 +782,11 @@ static int erpc_wifi_socket_connect(void *obj, const struct sockaddr *addr, sock
 
 		net_addr_ntop(addr->sa_family, &s_addr->sin_addr, addr_str, sizeof(addr_str));
 		LOG_DBG("sin: addr: %s port: %d", addr_str, ntohs(s_addr->sin_port));
+		if (sock->type == SOCK_STREAM) {
+			strncpy(sock->addr_str, addr_str, sizeof(sock->addr_str) - 1);
+			sock->addr_str[sizeof(sock->addr_str) - 1] = '\0';
+			sock->port = ntohs(s_addr->sin_port);
+		}
 	}
 #if defined(CONFIG_NET_IPV6)
 	else if (addr->sa_family == AF_INET6) {
@@ -987,7 +1024,8 @@ static ssize_t erpc_wifi_socket_recvfrom(void *obj, void *buf, size_t max_len, i
 
 	if ((sock->flags & O_NONBLOCK) &&
 	    !(sock->triggered_events & (SOCKET_EVENT_RX | SOCKET_EVENT_ERR | SOCKET_EVENT_CLOSE))) {
-		return -EAGAIN;
+		errno = EAGAIN;
+		return -1;
 	}
 
 	int64_t start_time = k_uptime_get();
@@ -1002,7 +1040,8 @@ static ssize_t erpc_wifi_socket_recvfrom(void *obj, void *buf, size_t max_len, i
 		int __w = erpc_wifi_ensure_awake_rx(ERPC_PMGR_JOB_ID_RECV);
 		if (__w != 0) {
 			LOG_INF("erpc_wifi_ensure_awake_rx failed: IN %s = %d", __func__, __w);
-			return __w;
+			errno = (int)-__w;
+			return -1;
 		}
 
 		erpc_wifi_ps_hold_during_recv();
@@ -1017,7 +1056,7 @@ static ssize_t erpc_wifi_socket_recvfrom(void *obj, void *buf, size_t max_len, i
 			ra_flags |= 0x02;
 		}
 
-		if (src_addr) {
+		if (src_addr && sock->type != SOCK_STREAM) {
 			struct ra_erpc_sockaddr addr_erpc_wifi;
 			uint32_t addrlen_erpc = sizeof(struct ra_erpc_sockaddr);
 
@@ -1053,14 +1092,35 @@ static ssize_t erpc_wifi_socket_recvfrom(void *obj, void *buf, size_t max_len, i
 			ret = ra6w1_recv(sock->fd, buf, max_len, ra_flags);
 			erpc_wifi_unlock();
 			LOG_DBG("ra6w1_recv non-blocking: %d", ret);
+
+			if (ret >= 0 && src_addr && sock->type == SOCK_STREAM) {
+				struct sockaddr_in *sin = net_sin(src_addr);
+
+				(void)memset(sin, 0, sizeof(*sin));
+				sin->sin_family = AF_INET;
+				sin->sin_port = htons((uint16_t)sock->port);
+				if (sock->addr_str[0] != '\0') {
+					(void)net_addr_pton(AF_INET, sock->addr_str, &sin->sin_addr);
+				}
+				if (addrlen) {
+					*addrlen = sizeof(struct sockaddr_in);
+				}
+			}
 		}
 
 		erpc_wifi_pmgr_ram_release(ERPC_PMGR_JOB_ID_RECV);
 		erpc_wifi_ps_notify_wakeup();
 
-		if (ret >= 0 || (ret != -EAGAIN && ret != -EWOULDBLOCK && ret != -6)) {
+		/*
+		 * RA6W1 non-blocking recv may return -1 for "no data yet" instead of
+		 * -EAGAIN/-EWOULDBLOCK. Treat it as transient so higher layers can
+		 * continue polling during TLS handshake.
+		 */
+		if (ret >= 0 || (ret != -EAGAIN && ret != -EWOULDBLOCK && ret != -6 && ret != -1)) {
 			if (ret < 0) {
 				LOG_ERR("ra6w1_recv failed: %d", ret);
+				errno = (ret == -1) ? EIO : (int)-ret;
+				return -1;
 			}
 			return ret;
 		}
@@ -1070,14 +1130,16 @@ static ssize_t erpc_wifi_socket_recvfrom(void *obj, void *buf, size_t max_len, i
 		 * return -EAGAIN immediately.
 		 */
 		if ((flags & ZSOCK_MSG_DONTWAIT) || (sock->flags & O_NONBLOCK)) {
-			return -EAGAIN;
+			errno = EAGAIN;
+			return -1;
 		}
 
 wait_poll:
 		/* Check if our receive timeout has expired. */
 		int64_t elapsed = k_uptime_get() - start_time;
 		if (timeout_ms != UINT32_MAX && elapsed >= (int64_t)timeout_ms) {
-			return -EAGAIN;
+			errno = EAGAIN;
+			return -1;
 		}
 
 		/* Calculate remaining timeout for the poll block. */
@@ -1100,7 +1162,8 @@ wait_poll:
 
 		if (poll_rc != 0) {
 			/* k_poll returned a timeout or error. */
-			return -EAGAIN;
+			errno = EAGAIN;
+			return -1;
 		}
 
 		/* Poll task signaled that data has arrived (SOCKET_EVENT_RX). Retry the non-blocking read. */
@@ -1211,9 +1274,8 @@ static int erpc_wifi_socket_close(void *obj)
 {
 	int __w = erpc_wifi_ensure_awake_tx(ERPC_PMGR_JOB_ID_SEND);
 	if (__w != 0) {
-		LOG_INF("erpc_wifi_ensure_awake_tx failed: IN %s = %d", __func__,__w);
-		//
-		return __w; 
+		LOG_INF("erpc_wifi_ensure_awake_tx failed: IN %s = %d", __func__, __w);
+		return __w;
 	}
 
 	int ret;
@@ -1236,7 +1298,9 @@ static int erpc_wifi_socket_close(void *obj)
 	erpc_wifi_pmgr_ram_release(ERPC_PMGR_JOB_ID_SEND);
 	erpc_wifi_ps_notify_wakeup();
 	LOG_DBG("ra6w1_close: %d", ret);
-	k_mutex_unlock(&sock->lock);
+	if (sock->lock != NULL) {
+		k_mutex_unlock(sock->lock);
+	}
 	return ret;
 }
 
@@ -1501,7 +1565,8 @@ static int erpc_wifi_socket_create(int family, int type, int proto)
 		zvfs_free_fd(fd);
 		return -1;
 	}
-
+	
+	socket->type = type;
 	zvfs_finalize_typed_fd(fd, socket,
 			       (const struct fd_op_vtable *)&erpc_wifi_socket_fd_op_vtable,
 			       ZVFS_MODE_IFSOCK);

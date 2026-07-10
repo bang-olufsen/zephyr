@@ -663,7 +663,7 @@ static struct erpc_ps_cache g_ps;
 /* Delayable work: after TIMEOUT, allow RA6W1 to sleep */
 static struct k_work_delayable g_ps_enable_work;
 
-#define ERPC_WIFI_PS_DEFAULT_TIMEOUT_MS 1000U
+#define ERPC_WIFI_PS_DEFAULT_TIMEOUT_MS 5000U
 #define ERPC_WIFI_PS_DEFAULT_LISTEN_INTERVAL 10U
 
 static bool erpc_wifi_ps_ip_ready(void)
@@ -717,7 +717,7 @@ static void erpc_wifi_ps_schedule_sleep(const char *reason)
 		return;
 	}
 
-	uint32_t delay = g_ps.tmo_set ? g_ps.timeout_ms : ERPC_WIFI_PS_DEFAULT_TIMEOUT_MS;
+	uint32_t delay = g_ps.tmo_set ? g_ps.timeout_ms : 5000U;
 
 	k_work_cancel_delayable(&g_ps_enable_work);
 	k_work_reschedule(&g_ps_enable_work, K_MSEC(delay));
@@ -789,11 +789,14 @@ void erpc_wifi_ps_notify_socket_connected(void)
 	g_ps.socket_connect_pending = false;
 	g_ps.allow_sleep_sent = false;
 	g_ps.sleep_confirmed = false;
-	// erpc_wifi_lock();
-	// (void)ra6w1_pmgr_add_sleep_constraint(PMGR_CONSTRAINT_SLEEP_PROHIBITED);
-	// erpc_wifi_unlock();
 	erpc_wifi_ps_hold_awake("tcp-connect-success");
 	erpc_wifi_ps_schedule_sleep("tcp-connect");
+}
+
+void erpc_wifi_ps_notify_socket_connect_complete(void)
+{
+	/* Keep app compatibility while preserving the original connect-success behavior. */
+	erpc_wifi_ps_notify_socket_connected();
 }
 
 void erpc_wifi_ps_notify_socket_connect_failed(void)
@@ -865,6 +868,11 @@ void erpc_wifi_ps_hold_during_recv(void)
 bool erpc_wifi_ps_is_enabled(void)
 {
 	return g_ps.enabled;
+}
+
+bool erpc_wifi_ps_socket_connect_pending(void)
+{
+	return g_ps.socket_connect_pending;
 }
 
 bool erpc_wifi_ps_sleep_is_sent(void)
