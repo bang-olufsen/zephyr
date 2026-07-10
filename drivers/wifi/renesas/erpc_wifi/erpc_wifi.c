@@ -519,6 +519,12 @@ static int erpc_wifi_mgmt_connect(const struct device *dev, struct wifi_connect_
 	       data->drv_nwk_params.xPassword.xWPA.ucLength);
 	data->drv_nwk_params.ucChannel = params->channel;
 
+	/* Copy BSSID if provided (non-zero) */
+    static const uint8_t zero_bssid[WIFI_MAC_ADDR_LEN] = {0};
+    if (memcmp(params->bssid, zero_bssid, WIFI_MAC_ADDR_LEN) != 0) {
+        memcpy(data->drv_nwk_params.ucBSSID, params->bssid, WIFI_MAC_ADDR_LEN);
+    }
+
 	k_work_submit_to_queue(&data->workq, &data->connect_work);
 
 	return 0;
