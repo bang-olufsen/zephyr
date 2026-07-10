@@ -1331,8 +1331,9 @@ static int erpc_wifi_socket_poll_offload(struct zvfs_pollfd *fds, int nfds, int 
 		struct erpc_wifi_socket *sock = find_socket_by_fd(fds[i].fd);
 
 		if (!sock) {
-			fds[i].revents = ZVFS_POLLNVAL;
-			ready_count++;
+			/* Mixed fd tables are valid in Zephyr (e.g. socket_service eventfd).
+			 * Leave non-driver fds untouched so their owner can handle them.
+			 */
 			continue;
 		}
 
@@ -1367,10 +1368,6 @@ static int erpc_wifi_socket_poll_offload(struct zvfs_pollfd *fds, int nfds, int 
 
 update_revents:
 	for (int i = 0; i < nfds; i++) {
-		if (fds[i].revents == ZVFS_POLLNVAL) {
-			continue;
-		}
-
 		struct erpc_wifi_socket *sock = find_socket_by_fd(fds[i].fd);
 
 		if (sock) {
@@ -1405,7 +1402,7 @@ static int erpc_wifi_socket_poll_update(struct zvfs_pollfd *pfd, struct k_poll_e
 	struct erpc_wifi_socket *sock = find_socket_by_fd(pfd->fd);
 
 	if (!sock) {
-		pfd->revents = ZVFS_POLLNVAL;
+		/* Not owned by this driver: ignore and let owner handle update path. */
 		return 0;
 	}
 
@@ -1598,7 +1595,9 @@ int erpc_wifi_socket_offload_init(struct net_if *iface)
 
 	net_if_socket_offload_set(iface, erpc_wifi_socket_create);
 
+#ifndef CONFIG_DNS_RESOLVER
 	erpc_wifi_dns_offload_init();
+#endif
 
 	return 0;
 }

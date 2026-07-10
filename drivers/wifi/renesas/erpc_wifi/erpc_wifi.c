@@ -25,7 +25,9 @@ LOG_MODULE_REGISTER(wifi_erpc_wifi, CONFIG_WIFI_LOG_LEVEL);
 #include <zephyr/net/wifi_utils.h>
 #include <zephyr/net/conn_mgr/connectivity_wifi_mgmt.h>
 #include <zephyr/net/net_ip.h>
+#ifdef CONFIG_DNS_RESOLVER
 #include <zephyr/net/dns_resolve.h>
+#endif
 #include <zephyr/drivers/gpio.h>
 #include <erpc_client_setup.h>
 #include <erpc_transport_setup.h>
@@ -1308,24 +1310,70 @@ static void erpc_wifi_client_error_handler(erpc_status_t err, uint32_t func_id)
 	}
 }
 
+#ifdef CONFIG_DNS_RESOLVER
+static void apply_dhcp_servers(struct net_if *iface, struct WIFIIPConfiguration_t *config)
+{
+	// erpc Driver is hard coded to 2 entries
+	const int num_servers = MIN(2, CONFIG_DNS_RESOLVER_MAX_SERVERS);
+	const char *dns_servers[CONFIG_DNS_RESOLVER_MAX_SERVERS + 1] = {0};
+	int dns_ifaces[CONFIG_DNS_RESOLVER_MAX_SERVERS + 1] = {0};
+	char addr_strings[num_servers][NET_IPV4_ADDR_LEN + 1];
+	int count = 0;
+	struct dns_resolve_context *ctx;
+
+	for (int i = 0; i < num_servers; i++) {
+		uint32_t addr_raw;
+
+		if (i == 0) {
+			addr_raw = config->xDns1.ulAddress[0];
+		} else if (i == 1) {
+			addr_raw = config->xDns2.ulAddress[0];
+		} else {
+			assert(false);
+			continue;
+		}
+
+		if (addr_raw == 0U) {
+			continue;
+		}
+
+		net_addr_ntop(AF_INET, &addr_raw, addr_strings[i], sizeof(addr_strings[i]));
+		LOG_DBG("DNS%d: %s", i + 1, addr_strings[i]);
+		dns_servers[count] = addr_strings[i];
+		dns_ifaces[count] = net_if_get_by_iface(iface);
+		count++;
+	}
+
+	if (count == 0) {
+		LOG_WRN("No valid DHCP DNS servers to apply");
+		return;
+	}
+
+	ctx = dns_resolve_get_default();
+	if (ctx == NULL) {
+		LOG_WRN("DNS resolver context unavailable");
+		return;
+	}
+
+	int ret = dns_resolve_reconfigure_with_interfaces(ctx, dns_servers, NULL, dns_ifaces,
+							  DNS_SOURCE_DHCPV4);
+	LOG_INF("DNS resolve reconfigure: %d (%s)", ret, strerror(-ret));
+}
+#else
+static void apply_dhcp_servers(struct net_if *iface, struct WIFIIPConfiguration_t *config) {}
+#endif
+
 static void erpc_wifi_apply_dhcp_lease(struct net_if *iface, struct WIFIIPConfiguration_t *config)
 {
 	if (!iface) {
 		return;
 	}
 
-#ifdef CONFIG_DNS_RESOLVER
-	static const char *dns_servers[CONFIG_DNS_RESOLVER_MAX_SERVERS];
-#endif
-
 	if (config->xIPAddress.xType == eWiFiIPAddressTypeV4) {
 		struct in_addr ip, netmask, gateway;
-		struct in_addr dns1, dns2;
 		char ip_str[16];
 		char netmask_str[16];
 		char gateway_str[16];
-		char dns1_str[16];
-		char dns2_str[16];
 
 		// Extract IPv4 address from WIFIIPAddress_t structure
 		uint32_t ip_raw = config->xIPAddress.ulAddress[0];
@@ -1348,24 +1396,16 @@ static void erpc_wifi_apply_dhcp_lease(struct net_if *iface, struct WIFIIPConfig
 			 netmask_bytes[1], netmask_bytes[2], netmask_bytes[3]);
 		snprintf(gateway_str, sizeof(gateway_str), "%d.%d.%d.%d", gateway_bytes[0],
 			 gateway_bytes[1], gateway_bytes[2], gateway_bytes[3]);
-		snprintf(dns1_str, sizeof(dns1_str), "%d.%d.%d.%d", dns1_bytes[0], dns1_bytes[1],
-			 dns1_bytes[2], dns1_bytes[3]);
-		snprintf(dns2_str, sizeof(dns2_str), "%d.%d.%d.%d", dns2_bytes[0], dns2_bytes[1],
-			 dns2_bytes[2], dns2_bytes[3]);
+		LOG_DBG("DHCP DNS1 raw: %d.%d.%d.%d", dns1_bytes[0], dns1_bytes[1],
+			dns1_bytes[2], dns1_bytes[3]);
+		LOG_DBG("DHCP DNS2 raw: %d.%d.%d.%d", dns2_bytes[0], dns2_bytes[1],
+			dns2_bytes[2], dns2_bytes[3]);
 
 		// Convert to in_addr structures
 		net_addr_pton(AF_INET, ip_str, &ip);
 		net_addr_pton(AF_INET, netmask_str, &netmask);
 		net_addr_pton(AF_INET, gateway_str, &gateway);
-		net_addr_pton(AF_INET, dns1_str, &dns1);
-		net_addr_pton(AF_INET, dns2_str, &dns2);
 
-#ifdef CONFIG_DNS_RESOLVER
-		dns_servers[0] = dns1_str;
-		int ret = dns_resolve_reconfigure(dns_resolve_get_default(), dns_servers, NULL,
-						  DNS_SOURCE_DHCPV4);
-		LOG_INF("DNS resolve reconfigure: %d (%s)", ret, strerror(-ret));
-#endif
 
 		// Clear existing addresses and add new one
 #if defined(CONFIG_NET_IPV4)
@@ -1419,6 +1459,9 @@ static void erpc_wifi_apply_dhcp_lease(struct net_if *iface, struct WIFIIPConfig
 ensure_up:
 	// Ensure interface is up
 	net_if_up(iface);
+	if (config->xIPAddress.xType == eWiFiIPAddressTypeV4) {
+		apply_dhcp_servers(iface, config);
+	}
 	LOG_INF("IP configuration applied to interface");
 }
 
