@@ -69,10 +69,13 @@ struct erpc_wifi_data {
 };
 
 void erpc_wifi_ps_notify_socket_connected(void);
+void erpc_wifi_ps_notify_socket_connect_complete(void);
+void erpc_wifi_ps_notify_socket_connect_failed(void);
 void erpc_wifi_ps_notify_socket_connect_start(void);
 void erpc_wifi_ps_notify_wakeup(void);
 void erpc_wifi_ps_hold_during_recv(void);
 bool erpc_wifi_ps_is_enabled(void);
+bool erpc_wifi_ps_socket_connect_pending(void);
 bool erpc_wifi_ps_sleep_is_sent(void);
 void erpc_wifi_ps_confirm_sleep(void);
 bool erpc_wifi_ps_sleep_is_confirmed(void);
