@@ -189,6 +189,8 @@ static inline enum wifi_security_type drv_to_wifi_mgmt_sec(int drv_security_type
 		return WIFI_SECURITY_TYPE_PSK_SHA256;
 	case eWiFiSecurityWPA3:
 		return WIFI_SECURITY_TYPE_SAE;
+	case eWiFiSecurityWPA2_WPA3_ext:
+		return WIFI_SECURITY_TYPE_WPA_AUTO_PERSONAL;
 	default:
 		return WIFI_SECURITY_TYPE_UNKNOWN;
 	}
@@ -209,6 +211,8 @@ static inline enum WIFISecurity_t wifi_mgmt_to_drv_sec(int wifi_mgmt_security_ty
 		return eWiFiSecurityWPA2_ent;
 	case WIFI_SECURITY_TYPE_SAE:
 		return eWiFiSecurityWPA3;
+	case WIFI_SECURITY_TYPE_WPA_AUTO_PERSONAL:
+		return eWiFiSecurityWPA2_WPA3_ext;
 	default:
 		return eWiFiSecurityNotSupported;
 	}
