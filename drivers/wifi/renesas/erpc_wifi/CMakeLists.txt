@@ -5,7 +5,6 @@ if(CONFIG_WIFI_ERPC_WIFI)
   zephyr_library_sources(
     erpc_wifi.c
 	erpc_wifi_socket_offload.c
-	erpc_dns_offload.c
 	service/c_wifi_host_to_ra_client.cpp
 	service/wifi_host_to_ra_client.cpp
 	service/wifi_host_to_ra_interface.cpp
@@ -15,6 +14,7 @@ if(CONFIG_WIFI_ERPC_WIFI)
 	service/wifi_ra_to_host_interface.cpp
   )
 
+  zephyr_library_sources_ifndef(CONFIG_DNS_RESOLVER erpc_dns_offload.c)
   zephyr_library_sources_ifdef(CONFIG_ERPC_TRANSPORT_UART erpc_wifi_transport_uart.c)
   zephyr_library_sources_ifdef(CONFIG_ERPC_TRANSPORT_SPI erpc_wifi_transport_spi.c)
 
