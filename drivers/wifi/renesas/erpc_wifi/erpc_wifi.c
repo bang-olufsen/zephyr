@@ -557,11 +557,15 @@ static int erpc_wifi_mgmt_connect(const struct device *dev, struct wifi_connect_
 		MIN(params->ssid_length, sizeof(data->drv_nwk_params.ucSSID));
 	memcpy(data->drv_nwk_params.ucSSID, params->ssid, data->drv_nwk_params.ucSSIDLength);
 	data->drv_nwk_params.xSecurity = wifi_mgmt_to_drv_sec(params->security);
-	// TODO - copy parameters based on security type
-	data->drv_nwk_params.xPassword.xWPA.ucLength =
-		MIN(params->psk_length, sizeof(data->drv_nwk_params.xPassword.xWPA.cPassphrase));
-	memcpy(data->drv_nwk_params.xPassword.xWPA.cPassphrase, params->psk,
-	       data->drv_nwk_params.xPassword.xWPA.ucLength);
+	
+	/* Copy password only if provided (non-zero length) to handle open network connections */
+	if (params->psk_length > 0 && params->psk != NULL) {
+		data->drv_nwk_params.xPassword.xWPA.ucLength =
+			MIN(params->psk_length, sizeof(data->drv_nwk_params.xPassword.xWPA.cPassphrase));
+		memcpy(data->drv_nwk_params.xPassword.xWPA.cPassphrase, params->psk,
+		       data->drv_nwk_params.xPassword.xWPA.ucLength);
+	}
+
 	data->drv_nwk_params.ucChannel = params->channel;
 
 	/* Copy BSSID if provided (non-zero) */
