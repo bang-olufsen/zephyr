@@ -159,6 +159,51 @@ __weak void erpc_wifi_pmgr_timer_fired_hook(uint32_t job_id, const char *timer_n
 	LOG_INF("PMGR timer fired: job_id=%u name=%s", job_id, timer_name ? timer_name : "(null)");
 }
 
+int erpc_wifi_otp_mac_read(uint8_t mac[WIFI_MAC_ADDR_LEN])
+{
+	WIFIReturnCode_t ret;
+
+	if (mac == NULL) {
+		return -EINVAL;
+	}
+
+	erpc_wifi_lock();
+	ret = WIFI_ReadOTPMAC(mac);
+	erpc_wifi_unlock();
+
+	return (ret == eWiFiSuccess) ? 0 : -EIO;
+}
+
+int erpc_wifi_otp_mac_write(const uint8_t mac[WIFI_MAC_ADDR_LEN])
+{
+	WIFIReturnCode_t ret;
+
+	if (mac == NULL) {
+		return -EINVAL;
+	}
+
+	erpc_wifi_lock();
+	ret = WIFI_WriteOTPMAC(mac);
+	erpc_wifi_unlock();
+
+	return (ret == eWiFiSuccess) ? 0 : -EIO;
+}
+
+int erpc_wifi_get_mac(uint8_t mac[WIFI_MAC_ADDR_LEN])
+{
+	WIFIReturnCode_t ret;
+
+	if (mac == NULL) {
+		return -EINVAL;
+	}
+
+	erpc_wifi_lock();
+	ret = WIFI_GetMAC(mac);
+	erpc_wifi_unlock();
+
+	return (ret == eWiFiSuccess) ? 0 : -EIO;
+}
+
 static uint8_t wifi_chan_to_band(uint16_t chan)
 {
 	uint8_t band;
