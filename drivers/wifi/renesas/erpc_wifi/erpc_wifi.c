@@ -667,6 +667,8 @@ static int erpc_wifi_mgmt_connect(const struct device *dev, struct wifi_connect_
         memcpy(data->drv_nwk_params.ucBSSID, params->bssid, WIFI_MAC_ADDR_LEN);
     }
 
+	data->state = WIFI_STATE_ASSOCIATING;
+	data->wifi_params_read = false;
 	k_work_submit_to_queue(&data->workq, &data->connect_work);
 
 	return 0;
@@ -729,6 +731,7 @@ static void erpc_wifi_mgmt_connect_work(struct k_work *work)
 		status = WIFI_STATUS_CONN_SUCCESS;
 		net_if_dormant_off(dev->net_iface);
 	} else {
+		dev->state = WIFI_STATE_DISCONNECTED;
 		status = WIFI_STATUS_CONN_FAIL;
 	}
 
@@ -741,14 +744,36 @@ static int erpc_wifi_mgmt_disconnect(const struct device *dev)
 
 	LOG_DBG("erpc_wifi_mgmt_disconnect");
 
-	k_work_submit_to_queue(&data->workq, &data->disconnect_work);
-
+ 	switch (data->state) {
+ 	case WIFI_STATE_DISCONNECTED:
+ 	case WIFI_STATE_INACTIVE:
+ 		wifi_mgmt_raise_disconnect_result_event(data->net_iface, WIFI_REASON_DISCONN_SUCCESS);
+ 		k_work_cancel(&data->disconnect_work);
+ 		return -EALREADY;
+ 	case WIFI_STATE_COMPLETED:
+ 		break;
+ 	default:
+ 		k_work_cancel(&data->disconnect_work);
+ 		return -EBUSY;
+ 	}
+ 
+ 	if (k_work_is_pending(&data->disconnect_work)) {
+ 		LOG_WRN("Disconnect worker is pending");
+ 		return -EBUSY;
+ 	}
+ 
+ 	int ret = k_work_submit_to_queue(&data->workq, &data->disconnect_work);
+ 	if (ret < 0) {
+ 		data->state = WIFI_STATE_DISCONNECTED;
+ 		wifi_mgmt_raise_disconnect_result_event(data->net_iface, WIFI_REASON_DISCONN_SUCCESS);
+ 		return ret;
+ 	}
 	return 0;
 }
 
 static void erpc_wifi_mgmt_disconnect_work(struct k_work *work)
 {
-	int status = 0;
+	int status = WIFI_REASON_DISCONN_SUCCESS;
 	struct erpc_wifi_data *dev;
 	WIFIReturnCode_t ret;
 
@@ -762,18 +787,44 @@ static void erpc_wifi_mgmt_disconnect_work(struct k_work *work)
 
 	LOG_DBG("WIFI_Disconnect: %d", ret);
 
-	if (ret != eWiFiSuccess) {
-		// TODO - there an enumerated error code that can be used here?
-		status = -1;
+	if (ret == eWiFiSuccess) {
+		dev->state = WIFI_STATE_DISCONNECTED;
+	} else {
+		LOG_ERR("Disconnect error: %d", ret);
+		status = WIFI_REASON_DISCONN_UNSPECIFIED;
 	}
 
-	dev->state = WIFI_STATE_DISCONNECTED;
+    dev->wifi_params_read = false;
 	erpc_wifi_ps_set_state_internal(false, "erpc_wifi_mgmt_disconnect_work");
 
 	wifi_mgmt_raise_disconnect_result_event(dev->net_iface, status);
-	net_if_dormant_on(dev->net_iface);
+	//net_if_dormant_on(dev->net_iface);
+	
+	net_if_ipv4_addr_rm(dev->net_iface, &dev->addr);
+	memset(&dev->addr, 0, sizeof(dev->addr));
+
+	k_sem_give(&dev->sem_cmd_process);
 }
 
+static void erpc_wifi_iface_disable(const struct device *dev)
+{
+ 	struct erpc_wifi_data *data = dev->data;
+ 	WIFIReturnCode_t ret;
+ 
+ 	LOG_INF("erpc_wifi_iface_disable");
+ 
+ 	/* Queue disconnect first */
+ 	erpc_wifi_mgmt_disconnect(dev);
+ 
+ 	k_sem_take(&data->sem_cmd_process, K_MSEC(300));
+ 
+ 	erpc_wifi_deinit_erpc(data);
+ 	net_mgmt_event_notify(NET_EVENT_IF_DOWN, data->net_iface);
+ 
+ 	data->state = WIFI_STATE_INTERFACE_DISABLED;
+ 
+ 	erpc_wifi_acquire_reset_pin();
+}
 /* -------------------------------------------------------------------------- */
 /* Wi-Fi Power Save (DPM)
  *
@@ -1522,13 +1573,17 @@ static enum offloaded_net_if_types erpc_wifi_offload_get_type(void)
  		}
  
  		erpc_wifi_release_reset_pin();
+		erpc_wifi_reset();
+ 
+		data->state = WIFI_STATE_INACTIVE;
  
  	} else {
  
  		if (data->state != WIFI_STATE_INTERFACE_DISABLED) {
- 			erpc_wifi_deinit_erpc(data);
- 			erpc_wifi_stop_event_monitor();
- 			data->state = WIFI_STATE_INTERFACE_DISABLED;
+ 			// erpc_wifi_deinit_erpc(data);
+ 			// erpc_wifi_stop_event_monitor();
+ 			// data->state = WIFI_STATE_INTERFACE_DISABLED;
+			erpc_wifi_iface_disable(iface->if_dev->dev);
  		}
  	}
  
@@ -1620,6 +1675,7 @@ static void erpc_wifi_apply_dhcp_lease(struct net_if *iface, struct WIFIIPConfig
 	}
 
 	if (config->xIPAddress.xType == eWiFiIPAddressTypeV4) {
+		struct erpc_wifi_data *data = iface->if_dev->dev->data;
 		struct in_addr ip, netmask, gateway;
 		char ip_str[16];
 		char netmask_str[16];
@@ -1665,6 +1721,8 @@ static void erpc_wifi_apply_dhcp_lease(struct net_if *iface, struct WIFIIPConfig
 		if (ifaddr) {
 			net_if_ipv4_set_netmask_by_addr(iface, &ip, &netmask);
 			net_if_ipv4_set_gw(iface, &gateway);
+
+			memcpy(&data->addr, &ip, sizeof(data->addr));
 
 			erpc_wifi_driver_data.ipv4_assigned = true;
 			erpc_wifi_ps_schedule_sleep("ipv4-assigned");
@@ -1994,9 +2052,11 @@ static void erpc_wifi_deinit_erpc(struct erpc_wifi_data *data)
 	erpc_wifi_stop_event_monitor();
 #endif
 
+    deinitwifi_client();
+
 	if (data->client_manager) {
 		erpc_client_deinit(data->client_manager);
-		deinitwifi_client();
+		//deinitwifi_client();
 		data->client_manager = NULL;
 	}
 
@@ -2144,6 +2204,7 @@ static int erpc_wifi_init(const struct device *dev)
 	g_ps.tmo_set = true;
 
 	k_sem_init(&data->sem_if_ready, 0, 1);
+	k_sem_init(&data->sem_cmd_process, 0, 1);
 
 	/* Initialize the work queue */
 	k_work_queue_start(&data->workq, erpc_wifi_workq_stack,

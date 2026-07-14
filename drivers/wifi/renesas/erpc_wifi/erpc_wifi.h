@@ -38,6 +38,7 @@ enum erpc_wifi_driver_state {
 
 struct erpc_wifi_data {
 	struct net_if *net_iface;
+	struct in_addr addr;
 	enum wifi_iface_state state;
 	scan_result_cb_t scan_cb;
 	uint16_t scan_max_bss_cnt;
