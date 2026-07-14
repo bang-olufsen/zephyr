@@ -57,6 +57,9 @@ K_KERNEL_STACK_DEFINE(erpc_wifi_workq_stack, CONFIG_WIFI_ERPC_WIFI_WORKQ_STACK_S
 #define EVENT_MONITOR_STACK_SIZE 8192
 K_THREAD_STACK_DEFINE(event_monitor_stack, EVENT_MONITOR_STACK_SIZE);
 
+static struct gpio_dt_spec n_int_gpio = GPIO_DT_SPEC_GET(DT_DRV_INST(0), int_gpios);
+static struct k_sem sem_if_enabled;
+
 // Thread control structure
 static struct k_thread event_monitor_thread;
 static k_tid_t event_monitor_tid;
@@ -299,8 +302,14 @@ static int erpc_wifi_acquire_reset_pin(void)
  	return 0;
  }
  
+static void n_int_iface_active_cb(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
+{
+	k_sem_give(&sem_if_enabled);
+}
+
  static int erpc_wifi_reset(void)
  {
+	k_timeout_t timeout = K_NO_WAIT;
  	int err = 0;
  
  	err = erpc_wifi_acquire_reset_pin();
@@ -347,8 +356,13 @@ static int erpc_wifi_acquire_reset_pin(void)
  	   priority of the erpc_wifi_server_thread to resolve this issue:
  	   https://docs.zephyrproject.org/latest/kernel/services/threads/system_threads.html
  	*/
- 	err = k_sem_take(&erpc_wifi_driver_data->sem_if_ready, K_MSEC(CONFIG_WIFI_ERPC_WIFI_RESET_TIMEOUT));
- 	if (err) {
+ 	//err = k_sem_take(&erpc_wifi_driver_data->sem_if_ready, K_MSEC(CONFIG_WIFI_ERPC_WIFI_RESET_TIMEOUT));
+ 	
+#ifdef CONFIG_WIFI_ERPC_WIFI_RESET_TIMEOUT
+	timeout = K_MSEC(CONFIG_WIFI_ERPC_WIFI_RESET_TIMEOUT);
+#endif
+	err = k_sem_take(&sem_if_enabled, timeout);
+	if (err) {
  		return err;
  	}
  #endif
@@ -1575,7 +1589,13 @@ static enum offloaded_net_if_types erpc_wifi_offload_get_type(void)
  		erpc_wifi_release_reset_pin();
 		erpc_wifi_reset();
  
-		data->state = WIFI_STATE_INACTIVE;
+		gpio_remove_callback(data->n_int_gpio->port, &data->n_int_cb);
+ 
+		if (!ret) {
+			data->state = WIFI_STATE_INACTIVE;
+		} else {
+			erpc_wifi_deinit_erpc(data);
+		}
  
  	} else {
  
@@ -2082,6 +2102,12 @@ static int erpc_wifi_init_erpc(struct erpc_wifi_data *data)
 #endif
 	int ret;
 
+	gpio_init_callback(&data->n_int_cb, n_int_iface_active_cb, BIT(data->n_int_gpio->pin));
+	ret = gpio_add_callback(data->n_int_gpio->port, &data->n_int_cb);
+	if (ret < 0) {
+		return -EIO;
+	}
+
 	LOG_INF("eRPC init_erpc: transport init start");
 	/* Initialize the eRPC client infrastructure */
 	transport = erpc_wifi_transport_init();
@@ -2203,6 +2229,7 @@ static int erpc_wifi_init(const struct device *dev)
 	g_ps.timeout_ms = ERPC_WIFI_PS_DEFAULT_TIMEOUT_MS;
 	g_ps.tmo_set = true;
 
+	k_sem_init(&sem_if_enabled, 0, 1);
 	k_sem_init(&data->sem_if_ready, 0, 1);
 	k_sem_init(&data->sem_cmd_process, 0, 1);
 
@@ -2240,6 +2267,7 @@ static int erpc_wifi_init(const struct device *dev)
 
 	data->net_iface = NET_IF_GET(Z_DEVICE_DT_DEV_ID(DT_DRV_INST(0)), 0);
 
+	data->n_int_gpio = &n_int_gpio;
 #if DT_INST_NODE_HAS_PROP(0, reset_gpios)
 	//int err = 0;
 	struct gpio_dt_spec wifi_reset = GPIO_DT_SPEC_GET(DT_DRV_INST(0), reset_gpios);

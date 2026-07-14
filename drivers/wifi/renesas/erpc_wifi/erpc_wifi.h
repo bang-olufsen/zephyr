@@ -63,6 +63,8 @@ struct erpc_wifi_data {
     struct k_sem sem_cmd_process;
 	struct k_sem sem_if_ready;
 
+	struct gpio_dt_spec *n_int_gpio;
+	struct gpio_callback n_int_cb;
 	char fw_version_driver[ERPC_WIFI_DRV_FW_VER_LEN_MAX];
 	
 	bool wifi_params_read;
