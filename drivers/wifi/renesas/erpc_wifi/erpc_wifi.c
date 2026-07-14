@@ -1434,15 +1434,48 @@ int erpc_wifi_mgmt_iface_status(const struct device *dev, struct wifi_iface_stat
 {
 	struct erpc_wifi_data *data = dev->data;
 
+	static WIFIConnectionInfo_t connection_info = { 0 };
+	int8_t rssi = -127;
+	int ret = 0;
+
 	status->state = data->state;
-	status->ssid_len = data->drv_nwk_params.ucSSIDLength;
-	memcpy(status->ssid, data->drv_nwk_params.ucSSID,
-	       MIN(sizeof(status->ssid), status->ssid_len));
+	
 	status->channel = data->drv_nwk_params.ucChannel;
-	status->security = drv_to_wifi_mgmt_sec(data->drv_nwk_params.xSecurity);
+	
 	status->band = wifi_chan_to_band(data->drv_nwk_params.ucChannel);
 
-	return 0;
+	switch  (status->state) {
+ 	case WIFI_STATE_DISCONNECTED:
+ 		data->wifi_params_read = false;
+ 		break;
+ 	case WIFI_STATE_COMPLETED:
+ 		if (!data->wifi_params_read) {
+ 
+ 			status->ssid_len = data->drv_nwk_params.ucSSIDLength;
+ 			memcpy(status->ssid, data->drv_nwk_params.ucSSID, status->ssid_len);
+ 			status->security = drv_to_wifi_mgmt_sec(data->drv_nwk_params.xSecurity);
+ 
+ 			memset(&connection_info, 0, sizeof(connection_info));
+ 			data->wifi_params_read = (eWiFiSuccess == WIFI_GetConnectionInfo(&connection_info));
+ 
+ 			memcpy(status->bssid, connection_info.ucBSSID, sizeof(connection_info.ucBSSID));
+ 		}
+ 
+ 		WIFI_GetRSSI(&rssi);
+ 
+ 		break;
+ 	case WIFI_STATE_AUTHENTICATING:
+ 		LOG_DBG("Device connect in progress...");
+ 		break;
+ 	default:
+ 		LOG_DBG("Device state: %d", status->state);
+ 		break;
+ 	}
+ 
+ 	status->rssi = (int) rssi;
+ 
+ 	return ret;
+
 }
 
 int erpc_wifi_mgmt_get_version(const struct device *dev, struct wifi_version *params)
