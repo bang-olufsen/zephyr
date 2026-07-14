@@ -486,6 +486,7 @@ static void ensure_poll_task_started(void)
 	k_thread_name_set(erpc_wifi_socket_poll_tid, "erpc_socket_poll");
 }
 static const struct socket_op_vtable erpc_wifi_socket_fd_op_vtable;
+static struct net_if *net_iface;
 
 static int erpc_wifi_socket_level_from_posix(int level, int *level_erpc_wifi)
 {
@@ -1361,6 +1362,22 @@ static struct erpc_wifi_socket *find_socket_by_fd(int zfd)
 	return NULL;
 }
 
+static int erpc_wifi_poll_hup_on_iface_down(struct zvfs_pollfd *fds, int nfds)
+{
+	int ret = 0;
+	if (net_if_is_up(net_iface)) {
+ 		return 0;
+ 	}
+
+	for (int i = 0; i < nfds; i++) {
+		if (find_socket_by_fd(fds[i].fd)) {
+			fds[i].revents = ZSOCK_POLLHUP;
+			ret++;
+		}
+	}
+	return ret;
+}
+ 
 static int erpc_wifi_socket_poll_offload(struct zvfs_pollfd *fds, int nfds, int timeout)
 {
 	struct k_poll_event events[ERPC_WIFI_MAX_SOCKETS];
@@ -1407,6 +1424,13 @@ static int erpc_wifi_socket_poll_offload(struct zvfs_pollfd *fds, int nfds, int 
 
 	if (tracked_count > 0) {
 		k_sem_give(&poll_task_sem);
+	}
+
+	/* Short-circuit poll with POLLHUP when interface is already down. */
+	int hup_count = erpc_wifi_poll_hup_on_iface_down(fds, nfds);
+	if (hup_count > 0) {
+		LOG_DBG("poll offload iface-down hup_count=%d", hup_count);
+		return hup_count;
 	}
 
 	if (ready_count > 0 || timeout == 0) {
@@ -1565,8 +1589,11 @@ static int erpc_wifi_socket_ioctl(void *obj, unsigned int request, va_list args)
 	case ZFD_IOCTL_SET_LOCK:
 		struct k_mutex *lock = va_arg(args, struct k_mutex *);
 		sock->lock = lock;
-		printk("SET_LOCK stored lock=%p zfd=%d remote=%d\n", (void *)lock, sock->zfd,
-		       sock->fd);
+		/* Keep old printk disabled to avoid direct console spam; use structured logging. */
+		// printk("SET_LOCK stored lock=%p zfd=%d remote=%d\n", (void *)lock, sock->zfd,
+		//        sock->fd);
+		LOG_DBG("SET_LOCK stored lock=%p zfd=%d remote=%d", (void *)lock, sock->zfd,
+			sock->fd);
 		return 0;
 #endif
 	default:
@@ -1712,6 +1739,9 @@ int erpc_wifi_socket_offload_init(struct net_if *iface)
 {
 	memset(sockets, 0, sizeof(sockets));
 	k_sem_init(&poll_task_sem, 0, 1);
+
+	/* Keep interface reference for iface-down POLLHUP checks. */
+	net_iface = iface;
 
 	net_if_socket_offload_set(iface, erpc_wifi_socket_create);
 
