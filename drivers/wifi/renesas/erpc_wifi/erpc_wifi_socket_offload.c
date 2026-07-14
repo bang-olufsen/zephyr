@@ -353,6 +353,8 @@ struct erpc_wifi_socket {
 	uint16_t bound_port;     // Local port from bind() (host order)
 	bool tcp_dpm_filter_set; // true if TCP DPM wake filter installed
 	uint32_t recv_timeout_ms;
+	struct sockaddr addr;
+	socklen_t addrlen;
 };
 
 static struct erpc_wifi_socket sockets[ERPC_WIFI_MAX_SOCKETS];
@@ -841,22 +843,25 @@ static int erpc_wifi_socket_connect(void *obj, const struct sockaddr *addr, sock
 	k_msleep(100);
 
 	if (ret == 0) {
-		/* Register TCP DPM wake filter BEFORE releasing the RAM/awake constraint.
-		 * If done after pmgr_ram_release + ps_notify_wakeup the module may have
-		 * started its sleep transition and the eRPC call gets a CRC error. */
-		if (sock->type == SOCK_STREAM && sock->bound_port != 0 &&
-		    !sock->tcp_dpm_filter_set) {
-			erpc_wifi_lock();
-			int32_t rc = ra6w1_wifi_dpm_tcp_port_filter_set(sock->bound_port);
-			erpc_wifi_unlock();
-			if (rc == 0) {
-				sock->tcp_dpm_filter_set = true;
-				LOG_INF("TCP DPM wake filter set for connected port %u",
-					sock->bound_port);
-			} else {
-				LOG_WRN("Failed to set TCP DPM wake filter for connected port %u (rc=%d)",
-					sock->bound_port, rc);
-			}
+		memcpy(&sock->addr, addr, sizeof(sock->addr));
+		sock->addrlen = addrlen;
+	}
+
+	/* Register TCP DPM wake filter BEFORE releasing the RAM/awake constraint.
+	 * If done after pmgr_ram_release + ps_notify_wakeup the module may have
+	 * started its sleep transition and the eRPC call gets a CRC error. */
+	if (ret == 0 && sock->type == SOCK_STREAM && sock->bound_port != 0 &&
+	    !sock->tcp_dpm_filter_set) {
+		erpc_wifi_lock();
+		int32_t rc = ra6w1_wifi_dpm_tcp_port_filter_set(sock->bound_port);
+		erpc_wifi_unlock();
+		if (rc == 0) {
+			sock->tcp_dpm_filter_set = true;
+			LOG_INF("TCP DPM wake filter set for connected port %u",
+				sock->bound_port);
+		} else {
+			LOG_WRN("Failed to set TCP DPM wake filter for connected port %u (rc=%d)",
+				sock->bound_port, rc);
 		}
 		erpc_wifi_ps_notify_socket_connected();
 	} else if (ret == -EINPROGRESS) {
@@ -1624,7 +1629,6 @@ static const struct socket_op_vtable erpc_wifi_socket_fd_op_vtable = {
 	.sendmsg = erpc_wifi_socket_sendmsg,
 	.getpeername = erpc_wifi_socket_getpeername,
 	.getsockname = erpc_wifi_socket_getsockname,
-
 };
 
 static int erpc_wifi_socket_create(int family, int type, int proto)
