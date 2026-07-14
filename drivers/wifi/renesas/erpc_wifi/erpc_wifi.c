@@ -1225,12 +1225,33 @@ int erpc_wifi_ping(uint32_t timeout_ms)
 
 	return -EIO;
 }
+
+static int erpc_wifi_mgmt_get_power_save_config(const struct device *dev, struct wifi_ps_config *config)
+{
+	LOG_INF("get power save config");
+  
+  	config->num_twt_flows = 0;
+  	memset(config->twt_flows, 0, sizeof(config->twt_flows));
+  
+  	config->ps_params.listen_interval = (unsigned short) g_ps.listen_interval;
+  	config->ps_params.wakeup_mode = (enum wifi_ps_wakeup_mode) g_ps.wakeup_mode;
+  	config->ps_params.timeout_ms = g_ps.timeout_ms;
+  	config->ps_params.exit_strategy = (enum wifi_ps_exit_strategy) g_ps.exit_strategy;
+  	config->ps_params.enabled = g_ps.enabled;
+  
+  	return 0;
+}
+  
 static int erpc_wifi_mgmt_set_power_save(struct net_if *iface, struct wifi_ps_params *params)
 {
 	ARG_UNUSED(iface);
-
+	struct erpc_wifi_data *data = &erpc_wifi_driver_data;
 	if (params == NULL) {
 		return -EINVAL;
+	}
+
+	if (data && data->state == WIFI_STATE_INTERFACE_DISABLED) {
+		return -EPERM;
 	}
 
 	LOG_INF("PS set: type=%u enabled=%u li=%u wm=%u exit=%u tmo=%u", params->type,
@@ -1306,6 +1327,8 @@ static int erpc_wifi_mgmt_set_power_save(struct net_if *iface, struct wifi_ps_pa
 	default:
 		return -ENOTSUP;
 	}
+	
+    return 0;
 }
 #if 0
 /* original version */
@@ -1902,6 +1925,7 @@ static const struct wifi_mgmt_ops erpc_wifi_mgmt_ops = {
 	.scan = erpc_wifi_mgmt_scan,
 	.connect = erpc_wifi_mgmt_connect,
 	.disconnect = erpc_wifi_mgmt_disconnect,
+	.get_power_save_config = erpc_wifi_mgmt_get_power_save_config,
 	.set_power_save = erpc_wifi_mgmt_set_power_save,
 	.iface_status = erpc_wifi_mgmt_iface_status,
 	.get_version = erpc_wifi_mgmt_get_version,
