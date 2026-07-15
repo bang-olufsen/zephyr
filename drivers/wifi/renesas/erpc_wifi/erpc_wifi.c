@@ -421,16 +421,31 @@ static int erpc_wifi_mgmt_scan(const struct device *dev, struct wifi_scan_params
 			       scan_result_cb_t cb)
 {
 	struct erpc_wifi_data *data = dev->data;
+	int ret = 0;
 
 	LOG_DBG("erpc_wifi_mgmt_scan");
 	LOG_DBG("type: %d cb: 0x%x", params->scan_type, (int)data->scan_cb);
 
 	if (data->scan_cb != NULL) {
-		return -EINPROGRESS;
+		ret = -EINPROGRESS;
+		goto error;
 	}
 
 	if (!net_if_is_carrier_ok(data->net_iface)) {
-		return -EIO;
+		ret = -EIO;
+		goto error;
+ 	}
+ 
+ 	switch (data->state) {
+ 	case WIFI_STATE_INACTIVE:
+ 	case WIFI_STATE_DISCONNECTED:
+ 		break;
+ 	case WIFI_STATE_COMPLETED:
+ 		ret = -EISCONN;
+ 		goto error;
+ 	default:
+ 		ret = -EACCES;
+ 		goto error;
 	}
 
 	data->scan_cb = cb;
@@ -439,7 +454,10 @@ static int erpc_wifi_mgmt_scan(const struct device *dev, struct wifi_scan_params
 
 	k_work_submit_to_queue(&data->workq, &data->scan_work);
 
-	return 0;
+error:
+	LOG_DBG("scan request ret: %d (%s)", ret, strerror(-ret));
+	return ret;
+
 }
 
 /*
@@ -528,19 +546,26 @@ static void erpc_wifi_mgmt_scan_work(struct k_work *work)
 				memcpy(entry.mac, results[i].ucBSSID, entry.mac_length);
 				entry.band = wifi_chan_to_band(entry.channel);
 
-				dev->scan_cb(dev->net_iface, 0, &entry);
+				//dev->scan_cb(dev->net_iface, 0, &entry);
+				net_mgmt_event_notify_with_info(NET_EVENT_WIFI_SCAN_RESULT,
+				dev->net_iface, &entry, sizeof(entry));
+
 				k_yield();
 			}
-		} else {
-			// TODO - pass back an enumerated error code?
-			dev->scan_cb(dev->net_iface, -1, NULL);
+		// } else {
+		// 	// TODO - pass back an enumerated error code?
+		// 	dev->scan_cb(dev->net_iface, -1, NULL);
 		}
+
 		free(results);
 	}
 
-	dev->scan_cb(dev->net_iface, 0, NULL);
+	//dev->scan_cb(dev->net_iface, 0, NULL);
 	dev->scan_cb = NULL;
+	net_mgmt_event_notify(NET_EVENT_WIFI_SCAN_DONE, dev->net_iface);
 	dev->state = WIFI_STATE_DISCONNECTED;
+	
+	LOG_DBG("Scan end. Device state: %d", dev->state);
 }
 
 /*
@@ -705,7 +730,7 @@ static int erpc_wifi_mgmt_connect(const struct device *dev, struct wifi_connect_
 		wifi_mgmt_raise_connect_result_event(data->net_iface, WIFI_STATUS_CONN_FAIL);
 		return ret;
 	}
-	
+
 	return 0;
 }
 
