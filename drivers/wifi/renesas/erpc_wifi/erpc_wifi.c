@@ -1620,18 +1620,81 @@ static void erpc_wifi_iface_init(struct net_if *iface)
 	net_if_dormant_on(iface);
 }
 
+ static char * erpc_wifi_func_id_to_str(uint32_t func_id)
+{
+ #ifdef ERPC_FUNC_ID_PARSING
+ 	switch (func_id) {
+ 	case kwifi_WIFI_Scan_id:
+ 		return "WIFI_Scan";
+ 	case kwifi_WIFI_ConnectAP_id:
+ 		return "WIFI_ConnectAP";
+ 	case kwifi_WIFI_GetRSSI_id:
+ 		return "WIFI_GetRSSI";
+ 	case kwifi_WIFI_Disconnect_id:
+ 		return "WIFI_Disconnect";
+ 	case kwifi_WIFI_GetConnectionInfo_id:
+ 		return "GetConnectionInfo";
+ 	case kwifi_WIFI_GetIPInfo_id:
+ 		return "WIFI_GetIPInfo";
+ 	case kwifi_ra6w1_bind_id:
+ 		return "bind";
+ 	case kwifi_ra6w1_listen_id:
+ 		return "listen";
+ 	case kwifi_ra6w1_connect_id:
+ 		return "connect";
+ 	case kwifi_ra6w1_accept_id:
+ 		return "accept";
+ 	case kwifi_ra6w1_send_id:
+ 		return "send";
+ 	case kwifi_ra6w1_recv_id:
+ 		return "recv";
+ 	case kwifi_ra6w1_recvfrom_id:
+ 		return "recvfrom";
+ 	case kwifi_ra6w1_socket_id:
+ 		return "socket";
+ 	case kwifi_ra6w1_close_id:
+ 		return "close";
+ 	case kwifi_get_socket_events_id:
+ 		return "get_socket_events";
+ 	case kwifi_erpc_get_server_event_id:
+ 		return "get_server_event";
+ 	case kwifi_ra6w1_wifi_ps_set_param_id:
+ 		return "ps_set_param";
+ 	case kwifi_ra6w1_wifi_ps_apply_id:
+ 		return "ps_apply";
+ 	case kwifi_ra6w1_pmgr_dpm_is_enabled_id:
+ 		return "pmgr_dpm_is_enabled";
+ 	case kwifi_ra6w1_pmgr_dpm_is_wakeup_id:
+ 		return "pmgr_dpm_is_wakeup";
+ 	case kwifi_ra6w1_pmgr_add_sleep_constraint_id:
+ 		return "pmgr_add_sleep_constraint";
+ 	case kwifi_ra6w1_pmgr_remove_sleep_constraint_id:
+ 		return "pmgr_remove_sleep_constrain";
+ 	case kwifi_ra6w1_pmgr_dpm_wakeup_done_id:
+ 		return "pmgr_dpm_wakeup_done";
+ 
+ 	default:
+ 		break;
+ 	}
+ #endif
+ 
+ 	return "unknown";
+}
+ 
 static void erpc_wifi_client_error_handler(erpc_status_t err, uint32_t func_id)
 {
 	if (err > 0) {
 		/* Downgrade transient CRC check failures (err: 8) during wakeup/retry phases
 		 * to prevent flooding the system log.
 		 */
+		char *func_id_str = erpc_wifi_func_id_to_str(func_id);
+
 		if (err == 8) {
 			LOG_DBG("eRPC client transient error - err: %d func_id: %d", err, func_id);
 			return;
 		}
 		/* See wifi_interface.hpp for list of function id's */
-		LOG_ERR("eRPC client error - err: %d func_id: %d", err, func_id);
+		LOG_ERR("eRPC client error - err: %d func_id: %d, kwifi_ra6w1_%s_id", err, func_id, func_id_str);
 	}
 }
 
