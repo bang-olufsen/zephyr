@@ -656,7 +656,23 @@ static int erpc_wifi_mgmt_connect(const struct device *dev, struct wifi_connect_
 {
 	struct erpc_wifi_data *data = dev->data;
 
-	LOG_DBG("erpc_wifi_mgmt_connect");
+	LOG_INF("erpc_wifi_mgmt_connect: state: %d", data->state);
+
+ 	switch (data->state) {
+ 	case WIFI_STATE_DISCONNECTED:
+ 	case WIFI_STATE_INACTIVE:
+ 		break;
+ 	case WIFI_STATE_COMPLETED:
+ 		wifi_mgmt_raise_connect_result_event(data->net_iface, WIFI_STATUS_CONN_SUCCESS);
+ 		return -EALREADY;
+ 	default:
+ 		return -EBUSY;
+ 	}
+ 
+ 	if (k_work_is_pending(&data->connect_work)) {
+ 		LOG_WRN("Connection worker is pending");
+ 		return -EBUSY;
+ 	}
 
 	memset(&data->drv_nwk_params, 0, sizeof(data->drv_nwk_params));
 
@@ -683,8 +699,13 @@ static int erpc_wifi_mgmt_connect(const struct device *dev, struct wifi_connect_
 
 	data->state = WIFI_STATE_ASSOCIATING;
 	data->wifi_params_read = false;
-	k_work_submit_to_queue(&data->workq, &data->connect_work);
-
+	int ret =k_work_submit_to_queue(&data->workq, &data->connect_work);
+	if (ret < 0) {
+		data->state = WIFI_STATE_DISCONNECTED;
+		wifi_mgmt_raise_connect_result_event(data->net_iface, WIFI_STATUS_CONN_FAIL);
+		return ret;
+	}
+	
 	return 0;
 }
 
