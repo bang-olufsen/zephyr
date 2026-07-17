@@ -966,7 +966,7 @@ static bool erpc_wifi_ps_ip_ready(void)
 #endif
 }
 
-static void erpc_wifi_ps_schedule_sleep(const char *reason)
+void erpc_wifi_ps_schedule_sleep(const char *reason)
 {
 	if (!g_ps.enabled || g_ps.allow_sleep_sent) {
 		return;
@@ -991,7 +991,7 @@ static void erpc_wifi_ps_schedule_sleep(const char *reason)
 	LOG_INF("PS sleep armed in %u ms (%s)", delay, reason);
 }
 
-static void erpc_wifi_ps_hold_awake(const char *reason)
+void erpc_wifi_ps_hold_awake(const char *reason)
 {
 	if (g_ps.sleep_constraint_held) {
 		return;
@@ -1003,7 +1003,7 @@ static void erpc_wifi_ps_hold_awake(const char *reason)
 	LOG_INF("PS hold awake (%s)", reason);
 }
 
-static void erpc_wifi_ps_release_awake(const char *reason)
+void erpc_wifi_ps_release_awake(const char *reason)
 {
 	if (!g_ps.sleep_constraint_held) {
 		return;
@@ -1013,6 +1013,13 @@ static void erpc_wifi_ps_release_awake(const char *reason)
 	erpc_wifi_unlock();
 	g_ps.sleep_constraint_held = false;
 	LOG_INF("PS release awake (%s)", reason);
+}
+
+void erpc_wifi_ps_cancel_sleep_work(void)
+{
+	if (g_ps.enabled) {
+		k_work_cancel_delayable(&g_ps_enable_work);
+	}
 }
 
 static void erpc_wifi_ps_set_state_internal(bool enabled, const char *source)
@@ -1124,10 +1131,6 @@ void erpc_wifi_ps_hold_during_recv(void)
 	k_work_cancel_delayable(&g_ps_enable_work);
 	g_ps.allow_sleep_sent = false;
 	g_ps.sleep_confirmed = false;
-	// erpc_wifi_lock();
-	// (void)ra6w1_pmgr_add_sleep_constraint(PMGR_CONSTRAINT_SLEEP_PROHIBITED);
-	// erpc_wifi_unlock();
-	erpc_wifi_ps_hold_awake("recv-blocking");
 }
 
 bool erpc_wifi_ps_is_enabled(void)
@@ -1195,7 +1198,21 @@ static bool erpc_wifi_ps_wait_until_awake(uint32_t timeout_ms, bool force_first_
 
 	while ((k_uptime_get() - start) < (int64_t)timeout_ms) {
 		if (erpc_wifi_transport_slave_ready()) {
-			LOG_INF("PS TRACE: module awake via slave-ready");
+			LOG_INF("PS TRACE: module awake via slave-ready, waiting 500ms for stabilization");
+			
+			int stable = 0;
+			for (int i = 0; i < 3; i++) {
+				if (erpc_wifi_transport_slave_ready() == 1) {
+					stable++;
+				}
+				k_msleep(3);
+			}
+
+			if (stable < 3) {
+				k_msleep(5);
+				continue;
+			}
+			k_msleep(500);
 			return true;
 		}
 
@@ -2024,12 +2041,35 @@ static void erpc_wifi_server_event_monitor_thread(void *arg1, void *arg2, void *
 			continue;
 		}
 
-		if (erpc_wifi_ps_is_enabled() && !erpc_wifi_transport_slave_ready()) {
-			k_msleep(500);
-			continue;
+		erpc_wifi_lock();
+		if (erpc_wifi_ps_is_enabled()) {
+			if (!erpc_wifi_transport_slave_ready()) {
+				erpc_wifi_unlock();
+				k_msleep(500);
+				continue;
+			}
+
+			if (erpc_wifi_ps_sleep_is_confirmed()) {
+				int stable = 0;
+
+				for (int i = 0; i < 3; i++) {
+					if (erpc_wifi_transport_slave_ready() == 1) {
+						stable++;
+					}
+					k_msleep(3);
+				}
+
+				if (stable < 3) {
+					erpc_wifi_unlock();
+					k_msleep(5);
+					continue;
+				}
+				k_msleep(500);
+
+				erpc_wifi_ps_notify_wakeup();
+			}
 		}
 
-		erpc_wifi_lock();
 		// LOG_DBG("Event monitor: calling erpc_get_server_event"); // noisy during normal no-event polling
 		erpc_get_server_event(&event);
 		erpc_wifi_unlock();
