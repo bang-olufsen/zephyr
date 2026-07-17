@@ -90,6 +90,10 @@ void erpc_wifi_pmgr_ram_release(uint32_t job_id);
 int erpc_wifi_otp_mac_read(uint8_t mac[WIFI_MAC_ADDR_LEN]);
 int erpc_wifi_otp_mac_write(const uint8_t mac[WIFI_MAC_ADDR_LEN]);
 int erpc_wifi_get_mac(uint8_t mac[WIFI_MAC_ADDR_LEN]);
+void erpc_wifi_ps_hold_awake(const char *reason);
+void erpc_wifi_ps_release_awake(const char *reason);
+void erpc_wifi_ps_cancel_sleep_work(void);
+void erpc_wifi_ps_schedule_sleep(const char *reason);
 
 #ifdef __cplusplus
 }
