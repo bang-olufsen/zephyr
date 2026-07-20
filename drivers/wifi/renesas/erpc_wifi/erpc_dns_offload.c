@@ -14,6 +14,8 @@ void erpc_wifi_unlock(void);
 
 /* * The Offload Function (Using Compact Struct)
  */
+static void offload_freeaddrinfo(struct zsock_addrinfo *res);
+
 static int offload_getaddrinfo(const char *node, const char *service,
 			       const struct zsock_addrinfo *hints, struct zsock_addrinfo **res)
 {

@@ -1116,6 +1116,40 @@ static int erpc_wifi_socket_accept(void *obj, struct sockaddr *addr, socklen_t *
 		return -1;
 	}
 
+	for (;;) {
+		k_spinlock_key_t key2 = k_spin_lock(&sock->state_lock);
+		if (sock->triggered_events & (SOCKET_EVENT_RX | SOCKET_EVENT_ERR | SOCKET_EVENT_CLOSE)) {
+			sock->triggered_events &= ~SOCKET_EVENT_RX;
+			k_spin_unlock(&sock->state_lock, key2);
+			break;
+		}
+		
+		if (sock->flags & O_NONBLOCK) {
+			k_spin_unlock(&sock->state_lock, key2);
+			errno = EAGAIN;
+			return -1;
+		}
+
+		sock->waiting = true;
+		sock->poll_events = ZVFS_POLLIN;
+		k_poll_signal_reset(&sock->poll_signal);
+		k_spin_unlock(&sock->state_lock, key2);
+		k_sem_give(&poll_task_sem);
+
+		struct k_poll_event event;
+		k_poll_event_init(&event, K_POLL_TYPE_SIGNAL, K_POLL_MODE_NOTIFY_ONLY, &sock->poll_signal);
+
+		int poll_rc = k_poll(&event, 1, K_FOREVER);
+		k_spinlock_key_t key3 = k_spin_lock(&sock->state_lock);
+		sock->waiting = false;
+		k_spin_unlock(&sock->state_lock, key3);
+
+		if (poll_rc < 0 && poll_rc != -EAGAIN) {
+			errno = -poll_rc;
+			return -1;
+		}
+	}
+
 	fd = zvfs_reserve_fd();
 	if (fd < 0) {
 		errno = ENFILE;
@@ -2368,6 +2402,8 @@ static void erpc_wifi_offload_srdy_callback(void)
 	extern struct k_sem poll_task_sem;
 	k_sem_give(&poll_task_sem);
 }
+
+extern void erpc_wifi_dns_offload_init(void);
 
 int erpc_wifi_socket_offload_init(struct net_if *iface)
 {
