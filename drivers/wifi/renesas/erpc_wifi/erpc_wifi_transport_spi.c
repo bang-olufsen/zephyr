@@ -65,9 +65,32 @@ int erpc_wifi_transport_slave_ready(void)
 	if (v < 0) {
 		return false;
 	}
-	if ((g_slave_ready_gpio->dt_flags & GPIO_ACTIVE_LOW) != 0U) {
-		return (v == 0);
-	}
 
 	return (v != 0);
+}
+
+static struct gpio_callback srdy_cb_data;
+static erpc_transport_srdy_cb_t g_srdy_cb = NULL;
+
+static void srdy_gpio_callback_handler(const struct device *port,
+				       struct gpio_callback *cb,
+				       gpio_port_pins_t pins)
+{
+	ARG_UNUSED(port);
+	ARG_UNUSED(cb);
+	ARG_UNUSED(pins);
+
+	if (g_srdy_cb) {
+		g_srdy_cb();
+	}
+}
+
+void erpc_transport_register_srdy_cb(erpc_transport_srdy_cb_t cb)
+{
+	g_srdy_cb = cb;
+
+	if (g_slave_ready_gpio && cb) {
+		gpio_init_callback(&srdy_cb_data, srdy_gpio_callback_handler, BIT(g_slave_ready_gpio->pin));
+		gpio_add_callback(g_slave_ready_gpio->port, &srdy_cb_data);
+	}
 }

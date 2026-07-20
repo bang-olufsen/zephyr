@@ -17,6 +17,9 @@ erpc_transport_t erpc_wifi_transport_init(void);
 
 void erpc_wifi_transport_deinit(erpc_transport_t transport);
 int erpc_wifi_transport_slave_ready(void);
+typedef void (*erpc_transport_srdy_cb_t)(void);
+void erpc_transport_register_srdy_cb(erpc_transport_srdy_cb_t cb);
+
 #ifdef __cplusplus
 }
 #endif

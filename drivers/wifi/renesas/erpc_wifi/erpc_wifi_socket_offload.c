@@ -8,6 +8,7 @@
 #include <zephyr/kernel.h>
 #include <zephyr/toolchain.h>
 #include "erpc_wifi.h"
+#include "erpc_wifi_transport.h"
 /* PMGR DPM job ids used by RA6W1 socket shim */
 #ifndef ERPC_PMGR_JOB_ID_SEND
 #define ERPC_PMGR_JOB_ID_SEND (1U)
@@ -56,59 +57,61 @@ static inline int pmgr_ram_hold(void);
  */
 static int erpc_wifi_ensure_awake_rx(uint32_t job_id)
 {
+	erpc_wifi_ps_wait_awake_rx();
+
 	if (!erpc_wifi_ps_is_enabled()) {
 		return 0;
 	}
 
-	int64_t start = k_uptime_get();
-	/* Use same timeout as TX path default */
-	int64_t tmo_ms = 5000;
+	int sr = erpc_wifi_transport_slave_ready();
 
-	for (;;) {
-		int sr = erpc_wifi_transport_slave_ready();
+	if (sr == 1) {
+		int stable = 0;
 
-		if (sr == 1) {
-			int stable = 0;
-
-			for (int i = 0; i < 3; i++) {
-				if (erpc_wifi_transport_slave_ready() == 1) {
-					stable++;
-				}
-				k_msleep(3);
+		for (int i = 0; i < 3; i++) {
+			if (erpc_wifi_transport_slave_ready() == 1) {
+				stable++;
 			}
-
-			if (stable < 3) {
-				k_msleep(5);
-				continue;
-			}
-			k_msleep(500);
-			if (pmgr_ram_hold() < 0) {
-				k_msleep(50);
-				continue;
-			}
-
-			erpc_wifi_lock();
-			int32_t rc = ra6w1_pmgr_dpm_rcv_ready_set(job_id);
-			erpc_wifi_unlock();
-			if (rc < 0) {
-				LOG_WRN("RX wake prep failed: rcv_ready_set rc=%d", rc);
-				k_msleep(50);
-				continue;
-			}
-			return 0;
+			k_msleep(3);
 		}
 
-		if ((k_uptime_get() - start) > tmo_ms) {
-			LOG_WRN("RX wait timeout: slave-ready not asserted after %lldms", tmo_ms);
+		if (stable < 3) {
+			k_msleep(5);
+			return -EAGAIN;
+		}
+		k_msleep(500);
+
+		/* Re-verify SRDY after 500ms: RA6W1 may have
+		 * gone back to DPM sleep during the wait. */
+		if (!erpc_wifi_transport_slave_ready()) {
+			k_msleep(50);
 			return -EAGAIN;
 		}
 
-		k_msleep(10);
+		if (pmgr_ram_hold() < 0) {
+			k_msleep(50);
+			return -EAGAIN;
+		}
+
+		erpc_wifi_lock();
+		int32_t rc = ra6w1_pmgr_dpm_rcv_ready_set(job_id);
+		erpc_wifi_unlock();
+		if (rc < 0) {
+			LOG_WRN("RX wake prep failed: rcv_ready_set rc=%d", rc);
+			erpc_wifi_pmgr_ram_release(0);
+			k_msleep(50);
+			return -EAGAIN;
+		}
+		return 0;
 	}
+
+	return -EAGAIN;
 }
 
 static int erpc_wifi_ensure_awake_tx(uint32_t job_id)
 {
+	erpc_wifi_ps_wait_awake_tx();
+
 	erpc_wifi_ps_cancel_sleep_work();
 
 	if (atomic_get(&g_erpc_tx_blocked) == 0) {
@@ -117,6 +120,7 @@ static int erpc_wifi_ensure_awake_tx(uint32_t job_id)
 				erpc_wifi_ps_hold_awake("tx-awake");
 			}
 			LOG_DBG("TX wake skipped (tx_blocked=0, job=%u)", job_id);
+			erpc_wifi_ps_reset_state_awake();
 			return 0;
 		}
 
@@ -151,6 +155,13 @@ static int erpc_wifi_ensure_awake_tx(uint32_t job_id)
 			}
 			k_msleep(500);
 
+			/* Re-verify SRDY after 500ms: RA6W1 may have
+			 * gone back to DPM sleep during the wait. */
+			if (!erpc_wifi_transport_slave_ready()) {
+				k_msleep(50);
+				continue;
+			}
+
 			if (pmgr_ram_hold() < 0) {
 				k_msleep(50);
 				continue;
@@ -169,6 +180,7 @@ static int erpc_wifi_ensure_awake_tx(uint32_t job_id)
 			}
 			// /* Re-arm sleep timer so module returns to DPM after this I/O. */
 			// erpc_wifi_ps_notify_wakeup();
+			erpc_wifi_ps_reset_state_awake();
 			return 0;
 		}
 
@@ -180,6 +192,7 @@ static int erpc_wifi_ensure_awake_tx(uint32_t job_id)
 
 		if (tmo > 0U && (k_uptime_get() - start) > (int64_t)tmo) {
 			LOG_WRN("TX wake timeout job=%u tmo=%u", job_id, tmo);
+			erpc_wifi_ps_reset_state_awake();
 			return -EAGAIN;
 		}
 
@@ -215,8 +228,12 @@ static inline int pmgr_ram_hold(void)
 {
 	if (pmgr_dpm_cached_enabled()) {
 		erpc_wifi_lock();
-	//	(void)ra6w1_pmgr_add_sleep_constraint(PMGR_CONSTRAINT_POWER_RAM);
-        int32_t rc = ra6w1_pmgr_add_sleep_constraint(PMGR_CONSTRAINT_POWER_RAM);
+		int32_t rc = ra6w1_pmgr_add_sleep_constraint(PMGR_CONSTRAINT_POWER_RAM);
+		if (rc < 0) {
+			/* Transient SPI CRC error (err 8) is common on the first frame after DPM wake due to
+			 * hardware synchronization. Retry immediately before giving up. */
+			rc = ra6w1_pmgr_add_sleep_constraint(PMGR_CONSTRAINT_POWER_RAM);
+		}
 		if (rc < 0) {
 			LOG_ERR("pmgr_ram_hold failed: %d", rc);
 			erpc_wifi_unlock();
@@ -395,7 +412,7 @@ static struct erpc_wifi_socket sockets[ERPC_WIFI_MAX_SOCKETS];
 K_THREAD_STACK_DEFINE(erpc_wifi_socket_poll_stack, 8192);
 static struct k_thread erpc_wifi_socket_poll_thread_data;
 static k_tid_t erpc_wifi_socket_poll_tid;
-static struct k_sem poll_task_sem;
+struct k_sem poll_task_sem;
 static void erpc_wifi_socket_poll_task(void *arg1, void *arg2, void *arg3)
 {
 	ARG_UNUSED(arg1);
@@ -420,8 +437,16 @@ static void erpc_wifi_socket_poll_task(void *arg1, void *arg2, void *arg3)
 		(void)k_sem_take(&poll_task_sem, wait_timeout);
 
 		bool activity = true;
+		/* NOTE: Do NOT block the poll task with wait_awake_rx() here.
+		 * The poll task is the primary detector of autonomous DPM wakeups
+		 * (UC packet).  It must keep polling SRDY to detect when RA6W1
+		 * wakes and call notify_wakeup().  The SRDY re-verification after
+		 * 500ms and the ensure_awake_rx guards are sufficient to prevent
+		 * premature eRPC calls. */
 		while (activity) {
 			activity = false;
+			bool any_polled = false;
+
 			for (int i = 0; i < ERPC_WIFI_MAX_SOCKETS; i++) {
 				struct erpc_wifi_socket *sock = &sockets[i];
 
@@ -460,6 +485,12 @@ static void erpc_wifi_socket_poll_task(void *arg1, void *arg2, void *arg3)
 							}
 							k_msleep(500);
 
+							/* Re-verify SRDY after 500ms: RA6W1 may have
+							 * gone back to DPM sleep during the wait. */
+							if (!erpc_wifi_transport_slave_ready()) {
+								continue;
+							}
+
 							erpc_wifi_ps_notify_wakeup();
 						} else {
 							/* Waiting for module to sleep. Don't add constraints. */
@@ -471,6 +502,8 @@ static void erpc_wifi_socket_poll_task(void *arg1, void *arg2, void *arg3)
 					if (__w != 0) {
 						continue;
 					}
+
+					any_polled = true;
 
 					erpc_wifi_lock();
 					uint32_t events = get_socket_events(sock->fd);
@@ -544,8 +577,11 @@ static void erpc_wifi_socket_poll_task(void *arg1, void *arg2, void *arg3)
 				}
 			}
 
-			if (activity) {
-				k_msleep(200);
+			if (!any_polled && activity) {
+				/* If we have waiting sockets but couldn't poll any of them
+				 * (because module is asleep), break the loop to prevent a 100% CPU
+				 * spin-loop. The SRDY interrupt or timeout will wake us later. */
+				activity = false;
 			}
 		}
 	}
@@ -823,6 +859,13 @@ static void erpc_wifi_socket_free(struct erpc_wifi_socket *sock)
 
 static int erpc_wifi_socket_bind(void *obj, const struct sockaddr *addr, socklen_t addrlen)
 {
+	int __w = erpc_wifi_ensure_awake_tx(ERPC_PMGR_JOB_ID_SEND);
+	if (__w != 0) {
+		LOG_INF("erpc_wifi_ensure_awake_tx failed: IN %s = %d", __func__, __w);
+		errno = -__w;
+		return -1;
+	}
+
 	int ret;
 	struct ra_erpc_sockaddr addr_erpc_wifi;
 	struct erpc_wifi_socket *sock = (struct erpc_wifi_socket *)obj;
@@ -846,6 +889,8 @@ static int erpc_wifi_socket_bind(void *obj, const struct sockaddr *addr, socklen
 
 	ret = erpc_wifi_socket_addr_from_posix(addr, &addr_erpc_wifi);
 	if (ret) {
+		erpc_wifi_pmgr_ram_release(ERPC_PMGR_JOB_ID_SEND);
+		erpc_wifi_ps_notify_wakeup();
 		errno = -ret;
 		return -1;
 	}
@@ -853,6 +898,9 @@ static int erpc_wifi_socket_bind(void *obj, const struct sockaddr *addr, socklen
 	erpc_wifi_lock();
 	ret = ra6w1_bind(sock->fd, &addr_erpc_wifi, addr_erpc_wifi.sa_len);
 	erpc_wifi_unlock();
+
+	erpc_wifi_pmgr_ram_release(ERPC_PMGR_JOB_ID_SEND);
+	erpc_wifi_ps_notify_wakeup();
 
 	LOG_DBG("ra6w1_bind: %d", ret);
 
@@ -1004,6 +1052,13 @@ static int erpc_wifi_socket_connect(void *obj, const struct sockaddr *addr, sock
 
 static int erpc_wifi_socket_listen(void *obj, int backlog)
 {
+	int __w = erpc_wifi_ensure_awake_tx(ERPC_PMGR_JOB_ID_SEND);
+	if (__w != 0) {
+		LOG_INF("erpc_wifi_ensure_awake_tx failed: IN %s = %d", __func__, __w);
+		errno = -__w;
+		return -1;
+	}
+
 	int ret;
 	struct erpc_wifi_socket *sock = (struct erpc_wifi_socket *)obj;
 
@@ -1029,6 +1084,9 @@ static int erpc_wifi_socket_listen(void *obj, int backlog)
 				sock->bound_port, rc);
 		}
 	}
+
+	erpc_wifi_pmgr_ram_release(ERPC_PMGR_JOB_ID_SEND);
+	erpc_wifi_ps_notify_wakeup();
 
 	if (ret < 0) {
 		errno = -ret;
@@ -1060,6 +1118,13 @@ static int erpc_wifi_socket_accept(void *obj, struct sockaddr *addr, socklen_t *
 		return -1;
 	}
 
+	int __w = erpc_wifi_ensure_awake_rx(ERPC_PMGR_JOB_ID_RECV);
+	if (__w != 0) {
+		zvfs_free_fd(fd);
+		errno = -__w;
+		return -1;
+	}
+
 	/* Accept returns file descriptor for new connected socket */
 	erpc_wifi_lock();
 	conn_fd = ra6w1_accept(sock->fd, &remote_addr, &remote_addrlen);
@@ -1067,6 +1132,8 @@ static int erpc_wifi_socket_accept(void *obj, struct sockaddr *addr, socklen_t *
 	LOG_DBG("ra6w1_accept: %d", conn_fd);
 
 	if (conn_fd < 0) {
+		erpc_wifi_pmgr_ram_release(ERPC_PMGR_JOB_ID_RECV);
+		erpc_wifi_ps_notify_wakeup();
 		zvfs_free_fd(fd);
 		errno = -conn_fd;
 		return -1;
@@ -1079,6 +1146,8 @@ static int erpc_wifi_socket_accept(void *obj, struct sockaddr *addr, socklen_t *
 			erpc_wifi_lock();
 			(void)ra6w1_close(conn_fd);
 			erpc_wifi_unlock();
+			erpc_wifi_pmgr_ram_release(ERPC_PMGR_JOB_ID_RECV);
+			erpc_wifi_ps_notify_wakeup();
 			zvfs_free_fd(fd);
 			errno = EINVAL;
 			return -1;
@@ -1088,6 +1157,8 @@ static int erpc_wifi_socket_accept(void *obj, struct sockaddr *addr, socklen_t *
 			erpc_wifi_lock();
 			(void)ra6w1_close(conn_fd);
 			erpc_wifi_unlock();
+			erpc_wifi_pmgr_ram_release(ERPC_PMGR_JOB_ID_RECV);
+			erpc_wifi_ps_notify_wakeup();
 			zvfs_free_fd(fd);
 			errno = EINVAL;
 			return -1;
@@ -1099,6 +1170,8 @@ static int erpc_wifi_socket_accept(void *obj, struct sockaddr *addr, socklen_t *
 			erpc_wifi_lock();
 			(void)ra6w1_close(conn_fd);
 			erpc_wifi_unlock();
+			erpc_wifi_pmgr_ram_release(ERPC_PMGR_JOB_ID_RECV);
+			erpc_wifi_ps_notify_wakeup();
 			zvfs_free_fd(fd);
 			LOG_DBG("erpc_wifi_socket_addr_to_posix error: %d", ret);
 			errno = -ret;
@@ -1117,10 +1190,15 @@ static int erpc_wifi_socket_accept(void *obj, struct sockaddr *addr, socklen_t *
 		erpc_wifi_lock();
 		(void)ra6w1_close(conn_fd);
 		erpc_wifi_unlock();
+		erpc_wifi_pmgr_ram_release(ERPC_PMGR_JOB_ID_RECV);
+		erpc_wifi_ps_notify_wakeup();
 		zvfs_free_fd(fd);
 		errno = ENFILE;
 		return -1;
 	}
+
+	erpc_wifi_pmgr_ram_release(ERPC_PMGR_JOB_ID_RECV);
+	erpc_wifi_ps_notify_wakeup();
 
 	socket->family = sock->family;
 	socket->type = sock->type;
@@ -1643,10 +1721,7 @@ static int erpc_wifi_socket_close(void *obj)
 	LOG_DBG("erpc_wifi_socket_close");
 
 	if (sock->type == SOCK_DGRAM) {
-		erpc_wifi_lock();
-		(void)ra6w1_pmgr_remove_sleep_constraint(1U << 0);
-		erpc_wifi_unlock();
-		LOG_INF("UDP socket closed: removed sleep constraint");
+		LOG_INF("UDP socket closed");
 	}
 
 	bool was_waiting = false;
@@ -1915,9 +1990,17 @@ static int erpc_wifi_socket_ioctl(void *obj, unsigned int request, va_list args)
 		
 		if ((new_flags ^ old_flags) & O_NONBLOCK) {
 			uint32_t val = (new_flags & O_NONBLOCK) ? 1U : 0U;
+			int __w = erpc_wifi_ensure_awake_tx(ERPC_PMGR_JOB_ID_SEND);
+			if (__w != 0) {
+				LOG_INF("erpc_wifi_ensure_awake_tx failed: IN %s = %d", __func__, __w);
+				errno = -__w;
+				return -1;
+			}
 			erpc_wifi_lock();
 			int rc = ra6w1_setsockopt(sock->fd, ERPC_WIFI_SOL_SOCKET, ERPC_WIFI_SO_NONBLOCK, &val, sizeof(val));
 			erpc_wifi_unlock();
+			erpc_wifi_pmgr_ram_release(ERPC_PMGR_JOB_ID_SEND);
+			erpc_wifi_ps_notify_wakeup();
 			if (rc < 0) {
 				errno = -rc;
 				return -1;
@@ -1936,7 +2019,7 @@ static int erpc_wifi_socket_ioctl(void *obj, unsigned int request, va_list args)
 		struct k_poll_event **pev = va_arg(args, struct k_poll_event **);
 		struct k_poll_event *pev_end = va_arg(args, struct k_poll_event *);
 
-		LOG_INF("POLL_PREPARE fd=%d events=0x%x", pfd->fd, pfd->events);
+		// LOG_INF("POLL_PREPARE fd=%d events=0x%x", pfd->fd, pfd->events);
 
 		if (*pev >= pev_end) {
 			return -ENOSPC;
@@ -2023,7 +2106,7 @@ static int erpc_wifi_socket_ioctl(void *obj, unsigned int request, va_list args)
 		struct k_poll_event **pev = va_arg(args, struct k_poll_event **);
 
 		int ret = erpc_wifi_socket_poll_update(sock, pfd, pev);
-		LOG_INF("POLL_UPDATE fd=%d events=0x%x revents=0x%x ret=%d", pfd->fd, pfd->events, pfd->revents, ret);
+		// LOG_INF("POLL_UPDATE fd=%d events=0x%x revents=0x%x ret=%d", pfd->fd, pfd->events, pfd->revents, ret);
 		return ret;
 	}
 #if 1
@@ -2247,10 +2330,7 @@ static int erpc_wifi_socket_create(int family, int type, int proto)
 	socket->protocol = proto;
 
 	if (type == SOCK_DGRAM) {
-		erpc_wifi_lock();
-		(void)ra6w1_pmgr_add_sleep_constraint(1U << 0);
-		erpc_wifi_unlock();
-		LOG_INF("UDP socket created: added sleep constraint");
+		LOG_INF("UDP socket created");
 	}
 
 	zvfs_finalize_typed_fd(fd, socket,
@@ -2277,10 +2357,19 @@ static bool erpc_wifi_socket_is_supported(int family, int type, int proto)
 	return true;
 }
 
+static void erpc_wifi_offload_srdy_callback(void)
+{
+	/* Wake up the poll task immediately on SRDY interrupt */
+	extern struct k_sem poll_task_sem;
+	k_sem_give(&poll_task_sem);
+}
+
 int erpc_wifi_socket_offload_init(struct net_if *iface)
 {
 	memset(sockets, 0, sizeof(sockets));
 	k_sem_init(&poll_task_sem, 0, 1);
+
+	erpc_transport_register_srdy_cb(erpc_wifi_offload_srdy_callback);
 
 	net_if_socket_offload_set(iface, erpc_wifi_socket_create);
 

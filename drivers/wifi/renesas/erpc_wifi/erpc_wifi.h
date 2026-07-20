@@ -94,6 +94,9 @@ void erpc_wifi_ps_hold_awake(const char *reason);
 void erpc_wifi_ps_release_awake(const char *reason);
 void erpc_wifi_ps_cancel_sleep_work(void);
 void erpc_wifi_ps_schedule_sleep(const char *reason);
+void erpc_wifi_ps_wait_awake_tx(void);
+void erpc_wifi_ps_wait_awake_rx(void);
+void erpc_wifi_ps_reset_state_awake(void);
 
 #ifdef __cplusplus
 }

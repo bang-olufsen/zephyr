@@ -110,7 +110,9 @@ static int offload_getaddrinfo(const char *node, const char *service,
 	return 0;
 
 cleanup:
-
+	if (head) {
+		offload_freeaddrinfo(head);
+	}
 	// Note: No need to free 'result' as it was dynamically allocated.
 	free(result);
 	return ret;
