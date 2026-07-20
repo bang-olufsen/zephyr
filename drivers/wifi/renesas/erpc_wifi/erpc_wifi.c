@@ -1067,7 +1067,8 @@ void erpc_wifi_ps_release_awake(const char *reason)
 void erpc_wifi_ps_cancel_sleep_work(void)
 {
 	if (g_ps.enabled) {
-		k_work_cancel_delayable(&g_ps_enable_work);
+		struct k_work_sync sync;
+		k_work_cancel_delayable_sync(&g_ps_enable_work, &sync);
 	}
 }
 
@@ -1184,7 +1185,8 @@ void erpc_wifi_ps_hold_during_recv(void)
 		return;
 	}
 
-	k_work_cancel_delayable(&g_ps_enable_work);
+	struct k_work_sync sync;
+	k_work_cancel_delayable_sync(&g_ps_enable_work, &sync);
 	g_ps.allow_sleep_sent = false;
 	g_ps.sleep_confirmed = false;
 }
