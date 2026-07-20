@@ -921,9 +921,58 @@ struct erpc_ps_cache {
 	bool sleep_confirmed;  /* whether the module actually fell asleep (SRDY dropped) */
 	bool socket_connect_pending;
 	bool sleep_constraint_held;
+	bool transitioning;
 };
 
 static struct erpc_ps_cache g_ps;
+
+typedef enum {
+	ERPC_WIFI_PS_STATE_AWAKE,
+	ERPC_WIFI_PS_STATE_GOING_TO_SLEEP,
+	ERPC_WIFI_PS_STATE_ASLEEP,
+	ERPC_WIFI_PS_STATE_WAKING_UP
+} erpc_wifi_ps_state_t;
+
+static erpc_wifi_ps_state_t g_ps_state = ERPC_WIFI_PS_STATE_AWAKE;
+static struct k_event erpc_ps_event;
+#define ERPC_PS_EVENT_AWAKE BIT(0)
+
+static void erpc_wifi_ps_set_state(erpc_wifi_ps_state_t new_state)
+{
+	g_ps_state = new_state;
+	if (new_state == ERPC_WIFI_PS_STATE_AWAKE) {
+		k_event_post(&erpc_ps_event, ERPC_PS_EVENT_AWAKE);
+	} else {
+		k_event_set(&erpc_ps_event, 0);
+	}
+}
+
+void erpc_wifi_ps_wait_awake_tx(void)
+{
+	if (g_ps.enabled) {
+		/* If the module is in transition (waking up or going to sleep), wait for transition to finish */
+		while (g_ps_state == ERPC_WIFI_PS_STATE_WAKING_UP || g_ps_state == ERPC_WIFI_PS_STATE_GOING_TO_SLEEP) {
+			k_msleep(10);
+		}
+		/* If the module is asleep, transition it to WAKING_UP to lock the bus */
+		if (g_ps_state == ERPC_WIFI_PS_STATE_ASLEEP) {
+			erpc_wifi_ps_set_state(ERPC_WIFI_PS_STATE_WAKING_UP);
+		}
+	}
+}
+
+void erpc_wifi_ps_wait_awake_rx(void)
+{
+	if (g_ps.enabled) {
+		/* If the module is not AWAKE, block until it is AWAKE */
+		(void)k_event_wait(&erpc_ps_event, ERPC_PS_EVENT_AWAKE, false, K_FOREVER);
+	}
+}
+
+void erpc_wifi_ps_reset_state_awake(void)
+{
+	erpc_wifi_ps_set_state(ERPC_WIFI_PS_STATE_AWAKE);
+}
 
 /* Delayable work: after TIMEOUT, allow RA6W1 to sleep */
 static struct k_work_delayable g_ps_enable_work;
@@ -1032,6 +1081,11 @@ static void erpc_wifi_ps_set_state_internal(bool enabled, const char *source)
 	g_ps.allow_sleep_sent = false;
 	g_ps.sleep_confirmed = false;
 	k_work_cancel_delayable(&g_ps_enable_work);
+	if (!enabled) {
+		erpc_wifi_ps_set_state(ERPC_WIFI_PS_STATE_AWAKE);
+		/* Tell RA6W1 to stay awake indefinitely now that PS is disabled */
+		erpc_wifi_ps_hold_awake("ps-disable");
+	}
 
 	// /* Keep module awake until PS params are applied and delay expires. */
 	// erpc_wifi_lock();
@@ -1041,9 +1095,6 @@ static void erpc_wifi_ps_set_state_internal(bool enabled, const char *source)
 	if (enabled) {
 		/* Keep module awake until PS params are applied and delay expires. */
 		erpc_wifi_ps_hold_awake("ps-enable");
-	} else {
-		/* Disabling PS must release any held sleep prohibition. */
-		erpc_wifi_ps_release_awake("ps-disable");
 	}
 	if (enabled) {
 		erpc_wifi_ps_schedule_sleep("state-enable");
@@ -1118,8 +1169,13 @@ void erpc_wifi_ps_notify_wakeup(void)
 	LOG_INF("PS TRACE: wakeup/io detected - re-arming sleep timer");
 	g_ps.allow_sleep_sent = false;
 	g_ps.sleep_confirmed = false;
+	erpc_wifi_ps_set_state(ERPC_WIFI_PS_STATE_AWAKE);
 	erpc_wifi_ps_hold_awake("wakeup-rearm");
 	erpc_wifi_ps_schedule_sleep("wakeup-rearm");
+
+	/* Wake up the offload socket poll task immediately to process any new RX events */
+	extern struct k_sem poll_task_sem;
+	k_sem_give(&poll_task_sem);
 }
 
 void erpc_wifi_ps_hold_during_recv(void)
@@ -1152,6 +1208,7 @@ void erpc_wifi_ps_confirm_sleep(void)
 {
 	if (g_ps.enabled && g_ps.allow_sleep_sent) {
 		g_ps.sleep_confirmed = true;
+		erpc_wifi_ps_set_state(ERPC_WIFI_PS_STATE_ASLEEP);
 	}
 }
 
@@ -1169,19 +1226,18 @@ static bool erpc_wifi_ps_should_wake_before_disable(void)
 		return false;
 	}
 
-	/* If sleep was already allowed once, do not trust a single slave-ready sample.
-	 * Force a wake sequence so PS disable reliably exits DPM. */
-	if (g_ps.allow_sleep_sent) {
-		LOG_INF("PS TRACE: sleep had been armed previously, force wake sequence before disable");
-		return true;
-	}
-
-	if (erpc_wifi_transport_slave_ready()) {
-		LOG_INF("PS TRACE: disable requested while module already awake (slave-ready=1), skip wake pulse");
-		return false;
-	}
-
-	LOG_INF("PS TRACE: module not ready (slave-ready=0), wake pulse required before PS disable");
+	/* Always force a wake sequence when PS is enabled.
+	 *
+	 * We cannot trust allow_sleep_sent or a single slave-ready sample:
+	 * - allow_sleep_sent is reset to false by erpc_wifi_ps_notify_wakeup()
+	 *   on autonomous DPM wakeups, even though the module has already been
+	 *   through a full DPM cycle and can go back to sleep at any moment.
+	 * - slave-ready=1 only means the module is awake RIGHT NOW; it may
+	 *   go back to sleep before the first SPI transaction after PS disable.
+	 *
+	 * The wake sequence (GPIO pulse + 500ms stabilization + SRDY re-verify)
+	 * costs ~500ms but eliminates the race condition completely. */
+	LOG_INF("PS TRACE: PS enabled, forcing wake sequence before disable");
 	return true;
 }
 
@@ -1190,6 +1246,12 @@ static bool erpc_wifi_ps_wait_until_awake(uint32_t timeout_ms, bool force_first_
 	int64_t start = k_uptime_get();
 	int64_t last_pulse = -((int64_t)ERPC_WIFI_PS_DISABLE_WAKE_REPULSE_MS);
 
+	g_ps.transitioning = true;
+	erpc_wifi_ps_set_state(ERPC_WIFI_PS_STATE_WAKING_UP);
+
+	/* Always send an initial wake pulse when force_first_pulse is requested,
+	 * even if SRDY is already high. The RA6W1 may go back to sleep at any
+	 * moment once allow_sleep was sent; pulsing resets its internal timer. */
 	if (force_first_pulse) {
 		LOG_INF("PS TRACE: forced initial wake pulse before awake check");
 		erpc_wifi_gpio_trigger_wakeup();
@@ -1213,6 +1275,16 @@ static bool erpc_wifi_ps_wait_until_awake(uint32_t timeout_ms, bool force_first_
 				continue;
 			}
 			k_msleep(500);
+
+			/* Re-verify SRDY after 500ms: RA6W1 may have
+			 * gone back to DPM sleep during the wait. */
+			if (!erpc_wifi_transport_slave_ready()) {
+				LOG_INF("PS TRACE: SRDY dropped during 500ms stabilization, retrying");
+				continue;
+			}
+
+			g_ps.transitioning = false;
+			erpc_wifi_ps_set_state(ERPC_WIFI_PS_STATE_AWAKE);
 			return true;
 		}
 
@@ -1226,11 +1298,16 @@ static bool erpc_wifi_ps_wait_until_awake(uint32_t timeout_ms, bool force_first_
 	}
 
 	LOG_WRN("PS TRACE: timeout waiting module awake before PS disable");
+	g_ps.transitioning = false;
+	erpc_wifi_ps_set_state(ERPC_WIFI_PS_STATE_AWAKE);
 	return false;
 }
 
 static void ps_send_param_to_ra(ra_wifi_ps_param_t p, uint32_t v)
 {
+	if (g_ps.transitioning || !g_ps.enabled) {
+		return;
+	}
 	erpc_wifi_lock();
 	(void)ra6w1_wifi_ps_set_param(p, v);
 	erpc_wifi_unlock();
@@ -1270,6 +1347,10 @@ static void ps_allow_sleep_work(struct k_work *work)
 	erpc_wifi_ps_push_defaults();
 
 	LOG_INF("PS allow sleep: applying PMGR config and releasing constraint");
+	if (g_ps.transitioning || !g_ps.enabled) {
+		LOG_WRN("PS allow sleep: aborted mid-execution (PS disable in progress)");
+		return;
+	}
 	erpc_wifi_lock();
 	int32_t rc = ra6w1_wifi_ps_apply();
 	erpc_wifi_unlock();
@@ -1279,13 +1360,21 @@ static void ps_allow_sleep_work(struct k_work *work)
 	}
 
 	/* Allow RA6W1 to enter DPM */
-	// erpc_wifi_lock();
-	// (void)ra6w1_pmgr_remove_sleep_constraint(PMGR_CONSTRAINT_SLEEP_PROHIBITED);
-	// erpc_wifi_unlock();
-		/* Allow RA6W1 to enter DPM */
 	erpc_wifi_ps_release_awake("allow-sleep-work");
 	g_ps.allow_sleep_sent = true;
-	g_ps.sleep_confirmed = false;
+	g_ps.sleep_confirmed = true;
+
+	/*
+	 * Transition directly to ASLEEP.  This clears the AWAKE event and
+	 * immediately blocks every background thread (event monitor, poll
+	 * task) inside wait_awake_rx/tx(), preventing them from issuing
+	 * eRPC calls while the RA6W1 is entering or already in DPM sleep.
+	 *
+	 * Previous code used GOING_TO_SLEEP, which left a window where
+	 * background threads could slip through and fire eRPC calls
+	 * before the poll task called confirm_sleep().
+	 */
+	erpc_wifi_ps_set_state(ERPC_WIFI_PS_STATE_ASLEEP);
 	uint32_t gate_ms = g_ps.tmo_set ? (g_ps.timeout_ms + 5000U) : 30000U;
 	erpc_wifi_socket_tx_block_set(true, gate_ms);
 
@@ -1439,9 +1528,8 @@ static int erpc_wifi_mgmt_set_power_save(struct net_if *iface, struct wifi_ps_pa
 		} else if (params->enabled == WIFI_PS_DISABLED) {
 
 			if (erpc_wifi_ps_should_wake_before_disable()) {
-				bool force_first_pulse = g_ps.allow_sleep_sent;
 				if (!erpc_wifi_ps_wait_until_awake(ERPC_WIFI_PS_DISABLE_WAKE_TIMEOUT_MS,
-							   force_first_pulse)) {
+							   true)) {
 					LOG_WRN("PS TRACE: continuing PS disable even though wake confirmation timed out");
 				}
 			}
@@ -2041,6 +2129,19 @@ static void erpc_wifi_server_event_monitor_thread(void *arg1, void *arg2, void *
 			continue;
 		}
 
+		/*
+		 * Block until the PS state machine reaches AWAKE.
+		 * With the ASLEEP state set directly by ps_allow_sleep_work,
+		 * this blocks the event monitor during all DPM sleep phases.
+		 */
+		erpc_wifi_ps_wait_awake_rx();
+
+		/* After waking, gate eRPC calls on SRDY to prevent CRC errors */
+		if (erpc_wifi_ps_is_enabled() && !erpc_wifi_transport_slave_ready()) {
+			k_msleep(500);
+			continue;
+		}
+
 		erpc_wifi_lock();
 		if (erpc_wifi_ps_is_enabled()) {
 			if (!erpc_wifi_transport_slave_ready()) {
@@ -2066,11 +2167,17 @@ static void erpc_wifi_server_event_monitor_thread(void *arg1, void *arg2, void *
 				}
 				k_msleep(500);
 
+				/* Re-verify SRDY after 500ms: RA6W1 may have
+				 * gone back to DPM sleep during the wait. */
+				if (!erpc_wifi_transport_slave_ready()) {
+					erpc_wifi_unlock();
+					continue;
+				}
+
 				erpc_wifi_ps_notify_wakeup();
 			}
 		}
 
-		// LOG_DBG("Event monitor: calling erpc_get_server_event"); // noisy during normal no-event polling
 		erpc_get_server_event(&event);
 		erpc_wifi_unlock();
 		// LOG_DBG("Event monitor: erpc_get_server_event returned, event_id=%d", event.event_id); // noisy during normal no-event polling
@@ -2377,6 +2484,10 @@ static int erpc_wifi_init(const struct device *dev)
 	g_ps.ex_set = true;
 	g_ps.timeout_ms = ERPC_WIFI_PS_DEFAULT_TIMEOUT_MS;
 	g_ps.tmo_set = true;
+
+	k_event_init(&erpc_ps_event);
+	k_event_post(&erpc_ps_event, ERPC_PS_EVENT_AWAKE);
+	g_ps_state = ERPC_WIFI_PS_STATE_AWAKE;
 
 	k_sem_init(&sem_if_enabled, 0, 1);
 	k_sem_init(&data->sem_if_ready, 0, 1);
