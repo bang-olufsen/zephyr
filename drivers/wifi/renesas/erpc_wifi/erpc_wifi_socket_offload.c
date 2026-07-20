@@ -79,9 +79,9 @@ static int erpc_wifi_ensure_awake_rx(uint32_t job_id)
 			k_msleep(5);
 			return -EAGAIN;
 		}
-		k_msleep(500);
+		k_msleep(10);
 
-		/* Re-verify SRDY after 500ms: RA6W1 may have
+		/* Re-verify SRDY after wait: RA6W1 may have
 		 * gone back to DPM sleep during the wait. */
 		if (!erpc_wifi_transport_slave_ready()) {
 			k_msleep(50);
@@ -102,6 +102,7 @@ static int erpc_wifi_ensure_awake_rx(uint32_t job_id)
 			k_msleep(50);
 			return -EAGAIN;
 		}
+		
 		return 0;
 	}
 
@@ -153,9 +154,9 @@ static int erpc_wifi_ensure_awake_tx(uint32_t job_id)
 				k_msleep(5);
 				continue;
 			}
-			k_msleep(500);
+			k_msleep(10);
 
-			/* Re-verify SRDY after 500ms: RA6W1 may have
+			/* Re-verify SRDY after wait: RA6W1 may have
 			 * gone back to DPM sleep during the wait. */
 			if (!erpc_wifi_transport_slave_ready()) {
 				k_msleep(50);
@@ -227,19 +228,22 @@ static int pmgr_dpm_cached_enabled(void)
 static inline int pmgr_ram_hold(void)
 {
 	if (pmgr_dpm_cached_enabled()) {
-		erpc_wifi_lock();
-		int32_t rc = ra6w1_pmgr_add_sleep_constraint(PMGR_CONSTRAINT_POWER_RAM);
-		if (rc < 0) {
-			/* Transient SPI CRC error (err 8) is common on the first frame after DPM wake due to
-			 * hardware synchronization. Retry immediately before giving up. */
+		int32_t rc = -1;
+		for (int i = 0; i < 5; i++) {
+			erpc_wifi_lock();
 			rc = ra6w1_pmgr_add_sleep_constraint(PMGR_CONSTRAINT_POWER_RAM);
+			erpc_wifi_unlock();
+			if (rc >= 0) {
+				break;
+			}
+			/* Transient SPI CRC error (err 8) is common on the first frame after DPM wake due to
+			 * hardware synchronization. Retry. */
+			k_msleep(10);
 		}
 		if (rc < 0) {
 			LOG_ERR("pmgr_ram_hold failed: %d", rc);
-			erpc_wifi_unlock();
 			return rc;
 		}
-		erpc_wifi_unlock();
 	}
 
 	return 0;
@@ -483,9 +487,9 @@ static void erpc_wifi_socket_poll_task(void *arg1, void *arg2, void *arg3)
 								k_msleep(5);
 								continue;
 							}
-							k_msleep(500);
+							k_msleep(10);
 
-							/* Re-verify SRDY after 500ms: RA6W1 may have
+							/* Re-verify SRDY after wait: RA6W1 may have
 							 * gone back to DPM sleep during the wait. */
 							if (!erpc_wifi_transport_slave_ready()) {
 								continue;
@@ -1118,6 +1122,7 @@ static int erpc_wifi_socket_accept(void *obj, struct sockaddr *addr, socklen_t *
 		return -1;
 	}
 
+	erpc_wifi_ps_hold_during_recv();
 	int __w = erpc_wifi_ensure_awake_rx(ERPC_PMGR_JOB_ID_RECV);
 	if (__w != 0) {
 		zvfs_free_fd(fd);
