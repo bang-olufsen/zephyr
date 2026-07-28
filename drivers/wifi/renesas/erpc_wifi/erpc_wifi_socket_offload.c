@@ -39,7 +39,7 @@ extern int32_t ra6w1_pmgr_dpm_is_wakeup(void);
 extern int32_t ra6w1_pmgr_dpm_is_enabled(void);
 extern int32_t ra6w1_pmgr_dpm_wakeup_done(uint32_t job_id);
 extern int32_t ra6w1_pmgr_dpm_rcv_ready_set(uint32_t job_id);
-//extern int32_t ra6w1_pmgr_dpm_job_name_set(uint32_t job_id, const char *job_name);
+extern int32_t ra6w1_pmgr_dpm_job_name_set(uint32_t job_id, const char *job_name);
 extern int32_t ra6w1_pmgr_add_sleep_constraint(uint32_t constraint);
 extern int32_t ra6w1_pmgr_remove_sleep_constraint(uint32_t constraint);
 extern int erpc_wifi_transport_slave_ready(void);
@@ -436,8 +436,9 @@ static void erpc_wifi_socket_poll_task(void *arg1, void *arg2, void *arg3)
 			}
 		}
 
-		/* Wait until signaled, or timeout if we need to poll DPM srdy */
-		k_timeout_t wait_timeout = dpm_polling_needed ? K_MSEC(200) : K_FOREVER;
+		/* Wait until signaled by SRDY/socket events, but keep fallback timeout
+		 * to recover from missed/coalesced edges while sockets are active. */
+		k_timeout_t wait_timeout = dpm_polling_needed ? K_MSEC(500) : K_FOREVER;
 		(void)k_sem_take(&poll_task_sem, wait_timeout);
 
 		bool activity = true;
@@ -472,8 +473,13 @@ static void erpc_wifi_socket_poll_task(void *arg1, void *arg2, void *arg3)
 						continue;
 					}
 					if (erpc_wifi_ps_sleep_is_sent()) {
-						if (erpc_wifi_ps_sleep_is_confirmed() && srdy) {
-							LOG_INF("Autonomous DPM wakeup detected (fd=%d), processing events", sock->fd);
+						/* SRDY=1 is the strongest wake evidence; sleep_confirmed may lag. */
+						if (srdy) {
+							if (!erpc_wifi_ps_sleep_is_confirmed()) {
+								LOG_INF("Autonomous DPM wakeup via SRDY high (fd=%d), sleep_confirmed pending", sock->fd);
+							} else {
+								LOG_INF("Autonomous DPM wakeup detected (fd=%d), processing events", sock->fd);
+							}
 							
 							int stable = 0;
 							for (int j = 0; j < 3; j++) {
@@ -1256,6 +1262,27 @@ static int erpc_wifi_socket_accept(void *obj, struct sockaddr *addr, socklen_t *
 	return fd;
 }
 
+static void erpc_wifi_sync_recv_job_for_socket(struct erpc_wifi_socket *sock, const char *path)
+{
+	if (!erpc_wifi_ps_is_enabled()) {
+		return;
+	}
+
+	if ((sock == NULL) || (sock->type != SOCK_STREAM) || (sock->bound_port == 0U)) {
+		return;
+	}
+
+	/* PMGR RECV mapping on RA6W1 is global; bind it to the active TCP socket before I/O. */
+	erpc_wifi_lock();
+	int32_t rc = ra6w1_pmgr_dpm_job_name_set((uint32_t)sock->bound_port, "ERPC_TCP_RECV");
+	erpc_wifi_unlock();
+
+	if (rc < 0) {
+		LOG_WRN("%s: failed to map ERPC_TCP_RECV to port %u (rc=%d)",
+			path ? path : "unknown", sock->bound_port, rc);
+	}
+}
+
 static ssize_t erpc_wifi_socket_sendto(void *obj, const void *buf, size_t len, int flags,
 				       const struct sockaddr *dest_addr, socklen_t addrlen)
 {
@@ -1297,6 +1324,8 @@ static ssize_t erpc_wifi_socket_sendto(void *obj, const void *buf, size_t len, i
 	int64_t start_time = k_uptime_get();
 
 	for (;;) {
+		erpc_wifi_sync_recv_job_for_socket(sock, "sendto");
+
 		if (dest_addr) {
 			erpc_wifi_lock();
 			ret = ra6w1_sendto(sock->fd, buf, len, ra_flags, &addr_erpc_wifi,
@@ -1438,6 +1467,10 @@ static ssize_t erpc_wifi_socket_recvfrom(void *obj, void *buf, size_t max_len, i
 	for (;;) {
 		erpc_wifi_ps_hold_during_recv();
 
+		/* Rebind global RECV mapping before wake/ready prep so ensure_awake_rx
+		 * and subsequent recv operate on the same TCP socket context. */
+		erpc_wifi_sync_recv_job_for_socket(sock, "recvfrom-prewake");
+
 		int __w = erpc_wifi_ensure_awake_rx(ERPC_PMGR_JOB_ID_RECV);
 		if (__w != 0) {
 			LOG_INF("erpc_wifi_ensure_awake_rx failed: IN %s = %d", __func__, __w);
@@ -1528,14 +1561,15 @@ static ssize_t erpc_wifi_socket_recvfrom(void *obj, void *buf, size_t max_len, i
 			k_spin_unlock(&sock->state_lock, key);
 			return ret;
 		}
-		k_spinlock_key_t key = k_spin_lock(&sock->state_lock);
-		sock->triggered_events &= ~SOCKET_EVENT_RX;
-		k_spin_unlock(&sock->state_lock, key);
-
 		/* If MSG_DONTWAIT was specified in this call, or O_NONBLOCK is configured on the socket,
 		 * return -EAGAIN immediately.
 		 */
 		if ((flags & ZSOCK_MSG_DONTWAIT) || (sock->flags & O_NONBLOCK)) {
+			/* Nonblocking consumer is exiting now; drop stale RX latch to avoid
+			 * immediate spin/rearm loops from old readiness state. */
+			k_spinlock_key_t key_nb = k_spin_lock(&sock->state_lock);
+			sock->triggered_events &= ~SOCKET_EVENT_RX;
+			k_spin_unlock(&sock->state_lock, key_nb);
 			errno = EAGAIN;
 			return -1;
 		}
