@@ -92,5 +92,10 @@ void erpc_transport_register_srdy_cb(erpc_transport_srdy_cb_t cb)
 	if (g_slave_ready_gpio && cb) {
 		gpio_init_callback(&srdy_cb_data, srdy_gpio_callback_handler, BIT(g_slave_ready_gpio->pin));
 		gpio_add_callback(g_slave_ready_gpio->port, &srdy_cb_data);
+
+		/* If SRDY is already high, there may be no new edge; kick callback once. */
+		if (gpio_pin_get_dt(g_slave_ready_gpio) > 0) {
+			cb();
+		}
 	}
 }
