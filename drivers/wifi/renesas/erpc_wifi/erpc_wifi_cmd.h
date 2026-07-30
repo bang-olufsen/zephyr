@@ -47,6 +47,8 @@ typedef enum {
 	ERPC_WIFI_DPM_UDP_PORT_FILTER_SET_CMD,
 	ERPC_WIFI_DPM_UDP_PORT_DELETE_CMD,
 
+	ERPC_WIFI_DNS_GETADDRINFO_CMD,
+
 	ERPC_WIFI_TEST_CMD,
 	ERPC_WIFI_LAST_CMD,
 } erpc_wifi_cmd_t;
@@ -182,6 +184,13 @@ typedef struct {
 typedef struct {
 	uint16_t port;
 } erpc_wifi_dpm_udp_port_delete_t;
+
+typedef struct {
+	const char *node;
+	WIFIIPAddress_t *result;
+	uint8_t max_count;
+	uint8_t *actual_count;
+} erpc_wifi_dns_getaddrinfo_t;
 
 /* Core message queue APIs */
 int erpc_wifi_cmd_init(void);

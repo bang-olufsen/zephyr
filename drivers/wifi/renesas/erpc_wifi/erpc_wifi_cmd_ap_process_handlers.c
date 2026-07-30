@@ -134,6 +134,16 @@ static int erpc_wifi_dpm_udp_port_delete_msg_process(void *data)
 	return -ENOTSUP;
 }
 
+static int erpc_wifi_dns_getaddrinfo_msg_process(void *data)
+{
+	erpc_wifi_dns_getaddrinfo_t *msg = (erpc_wifi_dns_getaddrinfo_t *)data;
+	if (!msg) return -EINVAL;
+
+	WIFIReturnCode_t ret = ra6w1_dns_getaddrinfo(msg->node, msg->result,
+											  msg->max_count, msg->actual_count);
+	return (int)ret;
+}
+
 /* Handler registration function */
 int erpc_wifi_cmd_ap_handlers_init(void)
 {
@@ -160,6 +170,9 @@ int erpc_wifi_cmd_ap_handlers_init(void)
 	erpc_wifi_register_cmd_handler(ERPC_WIFI_DPM_UDP_PORT_FILTER_SET_CMD, 
 								   erpc_wifi_dpm_udp_port_filter_set_msg_process);
 	erpc_wifi_register_cmd_handler(ERPC_WIFI_DPM_UDP_PORT_DELETE_CMD, erpc_wifi_dpm_udp_port_delete_msg_process);
+
+	erpc_wifi_register_cmd_handler(ERPC_WIFI_DNS_GETADDRINFO_CMD,
+							   erpc_wifi_dns_getaddrinfo_msg_process);
 
 	LOG_INF("AP/DPM/PS handlers initialized");
 

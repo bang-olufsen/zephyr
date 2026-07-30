@@ -8,9 +8,7 @@ LOG_MODULE_DECLARE(wifi_erpc_wifi, CONFIG_WIFI_LOG_LEVEL);
 #include "c_wifi_host_to_ra_client.h"
 #include "c_wifi_ra_to_host_client.h"
 #include <c_wifi_host_to_ra_client.h>
-
-void erpc_wifi_lock(void);
-void erpc_wifi_unlock(void);
+#include "erpc_wifi_cmd.h"
 
 /* * The Offload Function (Using Compact Struct)
  */
@@ -45,9 +43,16 @@ static int offload_getaddrinfo(const char *node, const char *service,
 	// 3. Call the eRPC generated client stub.
 	// The addresses buffer is filled by the eRPC framework.
 	
-	erpc_wifi_lock();
-    server_status = ra6w1_dns_getaddrinfo(node, result, DNS_MAX_ADDRESSES, &actual_count);
-    erpc_wifi_unlock();
+	{
+		erpc_wifi_dns_getaddrinfo_t dns_msg = {
+			.node        = node,
+			.result      = result,
+			.max_count   = DNS_MAX_ADDRESSES,
+			.actual_count = &actual_count,
+		};
+		server_status = (WIFIReturnCode_t)erpc_wifi_send_cmd(
+			ERPC_WIFI_DNS_GETADDRINFO_CMD, &dns_msg, sizeof(dns_msg), -1);
+	}
 	
 	// Release RAM constraint and mark DPM job as complete
 	erpc_wifi_pmgr_ram_release(ERPC_PMGR_JOB_ID_SEND);
