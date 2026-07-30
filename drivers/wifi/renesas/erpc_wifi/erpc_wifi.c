@@ -42,6 +42,8 @@ LOG_MODULE_REGISTER(wifi_erpc_wifi, CONFIG_WIFI_LOG_LEVEL);
 #include "erpc_wifi.h"
 #include "erpc_wifi_socket_offload.h"
 #include "erpc_wifi_transport.h"
+#include "erpc_wifi_cmd.h"
+#include "erpc_wifi_cmd_process_handlers.h"
 
 #define ERPC_WIFI_PS_DISABLE_WAKE_TIMEOUT_MS 1500U
 #define ERPC_WIFI_PS_DISABLE_WAKE_REPULSE_MS 250U
@@ -2425,6 +2427,26 @@ static int erpc_wifi_init_erpc(struct erpc_wifi_data *data)
 		return ret;
 	}
 #endif
+
+	/* Initialize message queue for FIFO command serialization */
+	ret = erpc_wifi_cmd_init();
+	if (ret < 0) {
+		LOG_ERR("Failed to initialize erpc_wifi command queue: %d", ret);
+		return ret;
+	}
+
+	/* Register all command handlers */
+	ret = erpc_wifi_cmd_socket_handlers_init();
+	if (ret < 0) {
+		LOG_ERR("Failed to initialize socket handlers: %d", ret);
+		return ret;
+	}
+
+	ret = erpc_wifi_cmd_ap_handlers_init();
+	if (ret < 0) {
+		LOG_ERR("Failed to initialize AP handlers: %d", ret);
+		return ret;
+	}
 
     data->driver_state = ERPC_WIFI_DRIVER_INITIALIZED;
 

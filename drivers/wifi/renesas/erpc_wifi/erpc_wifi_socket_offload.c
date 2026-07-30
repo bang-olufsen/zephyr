@@ -9,6 +9,8 @@
 #include <zephyr/toolchain.h>
 #include "erpc_wifi.h"
 #include "erpc_wifi_transport.h"
+#include "erpc_wifi_cmd.h"
+#include "erpc_wifi_cmd_process_handlers.h"
 /* PMGR DPM job ids used by RA6W1 socket shim */
 #ifndef ERPC_PMGR_JOB_ID_SEND
 #define ERPC_PMGR_JOB_ID_SEND (1U)
@@ -881,11 +883,10 @@ static int erpc_wifi_socket_bind(void *obj, const struct sockaddr *addr, socklen
 	struct erpc_wifi_socket *sock = (struct erpc_wifi_socket *)obj;
 
 	if (sock->tcp_dpm_filter_set && sock->bound_port != 0) {
-		erpc_wifi_lock();
-		(void)ra6w1_wifi_dpm_tcp_port_delete(sock->bound_port);
-		erpc_wifi_unlock();
+		erpc_wifi_dpm_tcp_port_delete_t dpm_msg = {.port = sock->bound_port};
+		(void)erpc_wifi_send_cmd(ERPC_WIFI_DPM_TCP_PORT_DELETE_CMD, &dpm_msg, sizeof(dpm_msg), -1);
 		sock->tcp_dpm_filter_set = false;
-		LOG_INF("TCP DPM wake filter removed for port %u", sock->bound_port);
+		LOG_INF("TCP DPM wake filter removed for port %u (via queue)", sock->bound_port);
 	}
 
 	sock->bound_port = 0;
@@ -905,9 +906,12 @@ static int erpc_wifi_socket_bind(void *obj, const struct sockaddr *addr, socklen
 		return -1;
 	}
 
-	erpc_wifi_lock();
-	ret = ra6w1_bind(sock->fd, &addr_erpc_wifi, addr_erpc_wifi.sa_len);
-	erpc_wifi_unlock();
+	/* Use message queue for FIFO-serialized socket operation */
+	erpc_wifi_msg_bind_t bind_msg = {
+		.fd = sock->fd,
+		.addr_erpc_wifi = addr_erpc_wifi
+	};
+	ret = erpc_wifi_send_cmd(ERPC_WIFI_BIND_CMD, &bind_msg, sizeof(bind_msg), -1);
 
 	erpc_wifi_pmgr_ram_release(ERPC_PMGR_JOB_ID_SEND);
 	erpc_wifi_ps_notify_wakeup();
@@ -1004,9 +1008,13 @@ static int erpc_wifi_socket_connect(void *obj, const struct sockaddr *addr, sock
 		erpc_wifi_ps_notify_socket_connect_failed();
 		return ret;
 	}
-	erpc_wifi_lock();
-	ret = ra6w1_connect(sock->fd, &addr_erpc_wifi, addr_erpc_wifi.sa_len);
-	erpc_wifi_unlock();
+
+	/* Use message queue for FIFO-serialized socket operation */
+	erpc_wifi_msg_connect_t connect_msg = {
+		.fd = sock->fd,
+		.addr_erpc_wifi = addr_erpc_wifi
+	};
+	ret = erpc_wifi_send_cmd(ERPC_WIFI_CONNECT_CMD, &connect_msg, sizeof(connect_msg), -1);
 	k_msleep(100);
 
 	k_spinlock_key_t key = k_spin_lock(&sock->state_lock);
@@ -1019,18 +1027,18 @@ static int erpc_wifi_socket_connect(void *obj, const struct sockaddr *addr, sock
 		k_spin_unlock(&sock->state_lock, key);
 		/* Register TCP DPM wake filter BEFORE releasing the RAM/awake constraint.
 		 * If done after pmgr_ram_release + ps_notify_wakeup the module may have
-		 * started its sleep transition and the eRPC call gets a CRC error. */
+		 * started its sleep transition and the eRPC call gets a CRC error.
+		 * Now uses queue-based command for thread-safe execution. */
 		if (sock->type == SOCK_STREAM && sock->bound_port != 0 &&
 		    !sock->tcp_dpm_filter_set) {
-			erpc_wifi_lock();
-			int32_t rc = ra6w1_wifi_dpm_tcp_port_filter_set(sock->bound_port);
-			erpc_wifi_unlock();
+			erpc_wifi_dpm_tcp_port_filter_set_t dpm_msg = {.port = sock->bound_port};
+			int32_t rc = erpc_wifi_send_cmd(ERPC_WIFI_DPM_TCP_PORT_FILTER_SET_CMD, &dpm_msg, sizeof(dpm_msg), -1);
 			if (rc == 0) {
 				sock->tcp_dpm_filter_set = true;
-				LOG_INF("TCP DPM wake filter set for connected port %u",
+				LOG_INF("TCP DPM wake filter set for connected port %u (via queue)",
 					sock->bound_port);
 			} else {
-				LOG_WRN("Failed to set TCP DPM wake filter for connected port %u (rc=%d)",
+				LOG_WRN("Failed to set TCP DPM wake filter for connected port %u (rc=%d, via queue)",
 					sock->bound_port, rc);
 			}
 		}
@@ -1075,22 +1083,25 @@ static int erpc_wifi_socket_listen(void *obj, int backlog)
 	LOG_DBG("fd: %d", sock->fd);
 	LOG_DBG("backlog: %d", backlog);
 
-	erpc_wifi_lock();
-	ret = ra6w1_listen(sock->fd, backlog);
-	erpc_wifi_unlock();
+	/* Use message queue for FIFO-serialized socket operation */
+	erpc_wifi_msg_listen_t listen_msg = {
+		.fd = sock->fd,
+		.backlog = backlog
+	};
+	ret = erpc_wifi_send_cmd(ERPC_WIFI_LISTEN_CMD, &listen_msg, sizeof(listen_msg), -1);
 
 	LOG_DBG("ra6w1_listen: %d", ret);
 
+	/* Register TCP DPM wake filter using queue-based command (thread-safe) */
 	if (ret == 0 && sock->type == SOCK_STREAM && sock->bound_port != 0 &&
 	    !sock->tcp_dpm_filter_set) {
-		erpc_wifi_lock();
-		int32_t rc = ra6w1_wifi_dpm_tcp_port_filter_set(sock->bound_port);
-		erpc_wifi_unlock();
+		erpc_wifi_dpm_tcp_port_filter_set_t dpm_msg = {.port = sock->bound_port};
+		int32_t rc = erpc_wifi_send_cmd(ERPC_WIFI_DPM_TCP_PORT_FILTER_SET_CMD, &dpm_msg, sizeof(dpm_msg), -1);
 		if (rc == 0) {
 			sock->tcp_dpm_filter_set = true;
-			LOG_INF("TCP DPM wake filter set for port %u", sock->bound_port);
+			LOG_INF("TCP DPM wake filter set for port %u (via queue)", sock->bound_port);
 		} else {
-			LOG_WRN("Failed to set TCP DPM wake filter for port %u (rc=%d)",
+			LOG_WRN("Failed to set TCP DPM wake filter for port %u (rc=%d, via queue)",
 				sock->bound_port, rc);
 		}
 	}
@@ -1826,16 +1837,14 @@ static int erpc_wifi_socket_close(void *obj)
 	}
 
 	if (sock->tcp_dpm_filter_set && sock->bound_port != 0) {
-		erpc_wifi_lock();
-		(void)ra6w1_wifi_dpm_tcp_port_delete(sock->bound_port);
-		erpc_wifi_unlock();
+		erpc_wifi_dpm_tcp_port_delete_t dpm_msg = {.port = sock->bound_port};
+		(void)erpc_wifi_send_cmd(ERPC_WIFI_DPM_TCP_PORT_DELETE_CMD, &dpm_msg, sizeof(dpm_msg), -1);
 		sock->tcp_dpm_filter_set = false;
-		LOG_INF("TCP DPM wake filter removed for port %u", sock->bound_port);
+		LOG_INF("TCP DPM wake filter removed for port %u (via queue)", sock->bound_port);
 	}
 
-	erpc_wifi_lock();
-	ret = ra6w1_close(sock->fd);
-	erpc_wifi_unlock();
+	/* Use message queue for FIFO-serialized socket close operation */
+	ret = erpc_wifi_send_cmd(ERPC_WIFI_SOCKET_CLOSE_CMD, &sock->fd, sizeof(sock->fd), -1);
 	erpc_wifi_pmgr_ram_release(ERPC_PMGR_JOB_ID_SEND);
 	erpc_wifi_ps_notify_wakeup();
 	LOG_DBG("ra6w1_close: %d", ret);
