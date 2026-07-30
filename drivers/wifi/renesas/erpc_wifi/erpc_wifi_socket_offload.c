@@ -1480,9 +1480,35 @@ static ssize_t erpc_wifi_socket_recvfrom(void *obj, void *buf, size_t max_len, i
 
 		int __w = erpc_wifi_ensure_awake_rx(ERPC_PMGR_JOB_ID_RECV);
 		if (__w != 0) {
-			LOG_INF("erpc_wifi_ensure_awake_rx failed: IN %s = %d", __func__, __w);
-			errno = (int)-__w;
-			return -1;
+			LOG_DBG("erpc_wifi_ensure_awake_rx not ready: %d", __w);
+			if (is_nonblock) {
+				errno = EAGAIN;
+				return -1;
+			}
+			/* Blocking socket: module asleep, wait for poll task to signal RX event */
+			{
+				int64_t el = k_uptime_get() - start_time;
+				if (timeout_ms != UINT32_MAX && el >= (int64_t)timeout_ms) {
+					errno = EAGAIN;
+					return -1;
+				}
+				k_timeout_t wt = (timeout_ms == UINT32_MAX) ? K_FOREVER : K_MSEC(timeout_ms - el);
+				k_spinlock_key_t kw = k_spin_lock(&sock->state_lock);
+				if (!(sock->triggered_events & (SOCKET_EVENT_RX | SOCKET_EVENT_ERR | SOCKET_EVENT_CLOSE))) {
+					sock->waiting = true;
+					sock->poll_events = ZVFS_POLLIN;
+					k_poll_signal_reset(&sock->poll_signal);
+					k_spin_unlock(&sock->state_lock, kw);
+					k_sem_give(&poll_task_sem);
+					struct k_poll_event pev;
+					k_poll_event_init(&pev, K_POLL_TYPE_SIGNAL, K_POLL_MODE_NOTIFY_ONLY, &sock->poll_signal);
+					(void)k_poll(&pev, 1, wt);
+					kw = k_spin_lock(&sock->state_lock);
+					sock->waiting = false;
+				}
+				k_spin_unlock(&sock->state_lock, kw);
+			}
+			continue; /* retry ensure_awake_rx */
 		}
 
 		erpc_wifi_ps_hold_awake("recv-blocking");
