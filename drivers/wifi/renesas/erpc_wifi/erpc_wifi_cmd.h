@@ -49,6 +49,19 @@ typedef enum {
 
 	ERPC_WIFI_DNS_GETADDRINFO_CMD,
 
+	ERPC_WIFI_OTP_MAC_READ_CMD,
+	ERPC_WIFI_OTP_MAC_WRITE_CMD,
+	ERPC_WIFI_GET_MAC_CMD,
+
+	ERPC_WIFI_PMGR_ADD_SLEEP_CONSTRAINT_CMD,
+	ERPC_WIFI_PMGR_REMOVE_SLEEP_CONSTRAINT_CMD,
+	ERPC_WIFI_PMGR_DPM_RCV_READY_SET_CMD,
+	ERPC_WIFI_PMGR_DPM_IS_ENABLED_CMD,
+	ERPC_WIFI_PMGR_DPM_WAKEUP_DONE_CMD,
+	ERPC_WIFI_PMGR_DPM_JOB_NAME_SET_CMD,
+
+	ERPC_WIFI_PS_APPLY_CMD,
+
 	ERPC_WIFI_TEST_CMD,
 	ERPC_WIFI_LAST_CMD,
 } erpc_wifi_cmd_t;
@@ -191,6 +204,23 @@ typedef struct {
 	uint8_t max_count;
 	uint8_t *actual_count;
 } erpc_wifi_dns_getaddrinfo_t;
+
+typedef struct {
+	uint8_t *mac;
+} erpc_wifi_mac_t;
+
+typedef struct {
+	uint32_t constraint;
+} erpc_wifi_pmgr_constraint_t;
+
+typedef struct {
+	uint32_t job_id;
+} erpc_wifi_pmgr_job_t;
+
+typedef struct {
+	uint32_t job_id;
+	const char *job_name;
+} erpc_wifi_pmgr_job_name_t;
 
 /* Core message queue APIs */
 int erpc_wifi_cmd_init(void);
