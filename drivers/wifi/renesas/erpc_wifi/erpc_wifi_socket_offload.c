@@ -433,11 +433,13 @@ static void erpc_wifi_socket_poll_task(void *arg1, void *arg2, void *arg3)
 	int64_t last_not_ready_log = 0;
 
 	while (1) {
-		/* Determine if we need to poll for autonomous DPM wakeups */
+		/* Only TCP sockets with a DPM wake filter need the 500ms autonomous wakeup fallback.
+		 * UDP/DNS sockets are driven purely by sock->waiting via k_sem_give. */
 		bool dpm_polling_needed = false;
 		if (erpc_wifi_ps_is_enabled()) {
 			for (int i = 0; i < ERPC_WIFI_MAX_SOCKETS; i++) {
-				if (sockets[i].in_use) {
+				if (sockets[i].in_use && sockets[i].type == SOCK_STREAM &&
+				    sockets[i].tcp_dpm_filter_set) {
 					dpm_polling_needed = true;
 					break;
 				}
@@ -463,7 +465,9 @@ static void erpc_wifi_socket_poll_task(void *arg1, void *arg2, void *arg3)
 			for (int i = 0; i < ERPC_WIFI_MAX_SOCKETS; i++) {
 				struct erpc_wifi_socket *sock = &sockets[i];
 
-				if (sock->in_use && (sock->waiting || erpc_wifi_ps_is_enabled())) {
+				if (sock->in_use && (sock->waiting ||
+				    (erpc_wifi_ps_is_enabled() && sock->type == SOCK_STREAM &&
+				     sock->tcp_dpm_filter_set))) {
 					if (sock->waiting) {
 						activity = true;
 					}

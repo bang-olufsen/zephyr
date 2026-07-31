@@ -97,6 +97,7 @@ int erpc_wifi_send_cmd(erpc_wifi_cmd_t cmd, void *data, size_t size, int tout)
 	}
 
 	if (k_msgq_put(&cmd_msg_queue, &msg, K_NO_WAIT) == 0) {
+		LOG_INF("CMD[%d] queued (queue depth=%d)", cmd, k_msgq_num_used_get(&cmd_msg_queue));
 
 		if (msg.sem && (ret = k_sem_take(msg.sem, timeout)) != 0) {
 			ret = -ETIMEDOUT;
@@ -109,6 +110,7 @@ int erpc_wifi_send_cmd(erpc_wifi_cmd_t cmd, void *data, size_t size, int tout)
 		if (msg.sem) {
 			k_free(msg.sem);
 		}
+		LOG_INF("CMD[%d] done ret=%d", cmd, ret);
 	} else {
 		free_cmd_msg_data(&msg);
 		LOG_ERR("Failed to enqueue command: %d (queue full)", cmd);
@@ -181,6 +183,14 @@ static void erpc_wifi_msg_handler_task(void *arg1, void *arg2, void *arg3)
 		/* Signal completion if semaphore present */
 		if (msg.sem) {
 			k_sem_give(msg.sem);
+		}
+
+		/* After removing the sleep constraint the PS state machine immediately
+		 * transitions to ASLEEP. The SPI completion leaves SRDY briefly high as
+		 * an artefact; this delay lets it deassert before the poll task runs,
+		 * preventing a spurious notify_wakeup() that would re-hold the module awake. */
+		if (msg.cmd == ERPC_WIFI_PMGR_REMOVE_SLEEP_CONSTRAINT_CMD) {
+			k_msleep(500);
 		}
 	}
 }

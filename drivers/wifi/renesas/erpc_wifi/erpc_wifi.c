@@ -255,7 +255,8 @@ static inline enum WIFISecurity_t wifi_mgmt_to_drv_sec(int wifi_mgmt_security_ty
 	case WIFI_SECURITY_TYPE_SAE:
 		return eWiFiSecurityWPA3;
 	case WIFI_SECURITY_TYPE_WPA_AUTO_PERSONAL:
-		return eWiFiSecurityWPA2_WPA3_ext;
+		/* eWiFiSecurityWPA2_WPA3_ext fails on WPA2-only APs; WPA2 is universally compatible */
+		return eWiFiSecurityWPA2;
 	default:
 		return eWiFiSecurityNotSupported;
 	}
@@ -706,7 +707,8 @@ static int erpc_wifi_mgmt_connect(const struct device *dev, struct wifi_connect_
 		       data->drv_nwk_params.xPassword.xWPA.ucLength);
 	}
 
-	data->drv_nwk_params.ucChannel = params->channel;
+	/* Channel 0 or 255 = Zephyr "any channel"; RA6W1 uses 0 for auto-select */
+	data->drv_nwk_params.ucChannel = (params->channel == 255) ? 0 : params->channel;
 
 	/* Copy BSSID if provided (non-zero) */
     static const uint8_t zero_bssid[WIFI_MAC_ADDR_LEN] = {0};
@@ -769,8 +771,15 @@ static void erpc_wifi_mgmt_connect_work(struct k_work *work)
 	}
 	//erpc_wifi_ps_push_defaults();
 	LOG_INF("WiFi connect API: calling WIFI_ConnectAP");
-	ret = (WIFIReturnCode_t)erpc_wifi_send_cmd(ERPC_WIFI_AP_CONNECT_CMD, NULL, 0, -1);
-	LOG_INF("WiFi connect API: WIFI_ConnectAP returned %d", ret);
+	ret = eWiFiFailure;
+	for (int attempt = 1; attempt <= 3 && ret != eWiFiSuccess; attempt++) {
+		ret = (WIFIReturnCode_t)erpc_wifi_send_cmd(ERPC_WIFI_AP_CONNECT_CMD, NULL, 0, -1);
+		LOG_INF("WiFi connect API: WIFI_ConnectAP attempt %d returned %d", attempt, ret);
+		if (ret != eWiFiSuccess && attempt < 3) {
+			erpc_wifi_gpio_trigger_wakeup();
+			k_msleep(200);
+		}
+	}
 
 	LOG_DBG("WIFI_ConnectAP: %d", ret);
 

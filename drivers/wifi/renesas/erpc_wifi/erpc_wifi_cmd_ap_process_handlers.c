@@ -21,8 +21,15 @@ extern struct erpc_wifi_data erpc_wifi_driver_data;
 static int erpc_wifi_ap_connect_msg_process(void *data)
 {
 	ARG_UNUSED(data);
-	/* Use global driver data which contains the configured network parameters */
-	return WIFI_ConnectAP(&erpc_wifi_driver_data.drv_nwk_params);
+	LOG_INF("ConnectAP: ssid='%.*s' security=%d channel=%d psk_len=%d",
+		erpc_wifi_driver_data.drv_nwk_params.ucSSIDLength,
+		erpc_wifi_driver_data.drv_nwk_params.ucSSID,
+		erpc_wifi_driver_data.drv_nwk_params.xSecurity,
+		erpc_wifi_driver_data.drv_nwk_params.ucChannel,
+		erpc_wifi_driver_data.drv_nwk_params.xPassword.xWPA.ucLength);
+	int ret = WIFI_ConnectAP(&erpc_wifi_driver_data.drv_nwk_params);
+	LOG_INF("ConnectAP result: %d (%s)", ret, ret == 0 ? "success" : "FAILED");
+	return ret;
 }
 
 static int erpc_wifi_ap_disconnect_msg_process(void *data)
