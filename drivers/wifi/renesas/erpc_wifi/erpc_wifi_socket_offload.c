@@ -45,6 +45,7 @@ extern int32_t ra6w1_pmgr_dpm_job_name_set(uint32_t job_id, const char *job_name
 extern int32_t ra6w1_pmgr_add_sleep_constraint(uint32_t constraint);
 extern int32_t ra6w1_pmgr_remove_sleep_constraint(uint32_t constraint);
 extern int erpc_wifi_transport_slave_ready(void);
+extern struct erpc_wifi_data erpc_wifi_driver_data;
 
 /* Forward declaration for pmgr_ram_hold used in erpc_wifi_ensure_awake_tx */
 static inline int pmgr_ram_hold(void);
@@ -67,46 +68,8 @@ static int erpc_wifi_ensure_awake_rx(uint32_t job_id)
 
 	int sr = erpc_wifi_transport_slave_ready();
 
+	LOG_INF("slave-ready=%d", sr);
 	if (sr == 1) {
-		int stable = 0;
-
-		for (int i = 0; i < 3; i++) {
-			if (erpc_wifi_transport_slave_ready() == 1) {
-				stable++;
-			}
-			k_msleep(3);
-		}
-
-		if (stable < 3) {
-			k_msleep(5);
-			return -EAGAIN;
-		}
-		k_msleep(10);
-
-		/* Re-verify SRDY after wait: RA6W1 may have
-		 * gone back to DPM sleep during the wait. */
-		if (!erpc_wifi_transport_slave_ready()) {
-			k_msleep(50);
-			return -EAGAIN;
-		}
-
-		if (pmgr_ram_hold() < 0) {
-			k_msleep(50);
-			return -EAGAIN;
-		}
-
-		{
-			erpc_wifi_pmgr_job_t job_msg = { .job_id = job_id };
-			int32_t rc = (int32_t)erpc_wifi_send_cmd(ERPC_WIFI_PMGR_DPM_RCV_READY_SET_CMD,
-												 &job_msg, sizeof(job_msg), -1);
-			if (rc < 0) {
-				LOG_WRN("RX wake prep failed: rcv_ready_set rc=%d", rc);
-				erpc_wifi_pmgr_ram_release(0);
-				k_msleep(50);
-				return -EAGAIN;
-			}
-		}
-		
 		return 0;
 	}
 
@@ -451,6 +414,12 @@ static void erpc_wifi_socket_poll_task(void *arg1, void *arg2, void *arg3)
 		k_timeout_t wait_timeout = dpm_polling_needed ? K_MSEC(500) : K_FOREVER;
 		(void)k_sem_take(&poll_task_sem, wait_timeout);
 
+		/* Skip polling if WiFi interface is not connected */
+		if (erpc_wifi_driver_data.state != WIFI_STATE_COMPLETED) {
+			k_msleep(100);
+			continue;
+		}
+
 		bool activity = true;
 		/* NOTE: Do NOT block the poll task with wait_awake_rx() here.
 		 * The poll task is the primary detector of autonomous DPM wakeups
@@ -472,7 +441,7 @@ static void erpc_wifi_socket_poll_task(void *arg1, void *arg2, void *arg3)
 						activity = true;
 					}
 					int srdy = erpc_wifi_transport_slave_ready();
-
+					LOG_INF("poll_task: fd=%d srdy=%d waiting=%d", sock->fd, srdy, sock->waiting);
 					if (erpc_wifi_ps_is_enabled() && !srdy) {
 						if (erpc_wifi_ps_sleep_is_sent()) {
 							erpc_wifi_ps_confirm_sleep();
@@ -492,26 +461,7 @@ static void erpc_wifi_socket_poll_task(void *arg1, void *arg2, void *arg3)
 							} else {
 								LOG_INF("Autonomous DPM wakeup detected (fd=%d), processing events", sock->fd);
 							}
-							
-							int stable = 0;
-							for (int j = 0; j < 3; j++) {
-								if (erpc_wifi_transport_slave_ready() == 1) {
-									stable++;
-								}
-								k_msleep(3);
-							}
 
-							if (stable < 3) {
-								k_msleep(5);
-								continue;
-							}
-							k_msleep(10);
-
-							/* Re-verify SRDY after wait: RA6W1 may have
-							 * gone back to DPM sleep during the wait. */
-							if (!erpc_wifi_transport_slave_ready()) {
-								continue;
-							}
 
 							erpc_wifi_ps_notify_wakeup();
 						} else {
@@ -522,6 +472,7 @@ static void erpc_wifi_socket_poll_task(void *arg1, void *arg2, void *arg3)
 
 					int __w = erpc_wifi_ensure_awake_rx(ERPC_PMGR_JOB_ID_RECV);
 					if (__w != 0) {
+						LOG_WRN("poll wait: fd=%d ensure_awake_rx failed %d; deferring", sock->fd, __w);
 						continue;
 					}
 
@@ -1457,6 +1408,7 @@ static ssize_t erpc_wifi_socket_recvfrom(void *obj, void *buf, size_t max_len, i
 
 	bool is_nonblock = (sock->flags & O_NONBLOCK) || (flags & ZSOCK_MSG_DONTWAIT);
 	if (is_nonblock) {
+		LOG_INF("Non-blocking recvfrom requested (fd=%d)", sock->fd);
 		k_spinlock_key_t key = k_spin_lock(&sock->state_lock);
 		bool no_data = !(sock->triggered_events & (SOCKET_EVENT_RX | SOCKET_EVENT_ERR | SOCKET_EVENT_CLOSE));
 		k_spin_unlock(&sock->state_lock, key);
