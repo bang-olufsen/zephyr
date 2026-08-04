@@ -79,16 +79,16 @@ struct erpc_wifi_data erpc_wifi_driver_data;
 
 void erpc_wifi_lock(void)
 {
-	k_mutex_lock(&g_erpc_wifi_mutex, K_FOREVER);
+	//k_mutex_lock(&g_erpc_wifi_mutex, K_FOREVER);
 }
 
 void erpc_wifi_unlock(void)
 {
-	k_mutex_unlock(&g_erpc_wifi_mutex);
+	//k_mutex_unlock(&g_erpc_wifi_mutex);
 	/* Enforce a brief inter-transaction delay to allow the co-processor SPI slave
 	 * DMA and task scheduler to settle between back-to-back eRPC calls.
 	 */
-	k_msleep(5);
+	//k_msleep(5);
 }
 
 #if DT_NODE_HAS_STATUS(DT_ALIAS(wakeup_gpio), okay)
@@ -140,6 +140,8 @@ void erpc_wifi_gpio_trigger_wakeup(void)
 	gpio_pin_set(g_gpio_wakeup_dev, GPIO_WAKEUP_PIN, 0);
 
 	LOG_INF("Wakeup pulse completed");
+	/* Allow server time to complete DPM wake-up sequence before first eRPC call */
+	k_msleep(300);
 #else
 	LOG_WRN("wakeup_gpio alias is not enabled in devicetree; wakeup pulse skipped");
 #endif
