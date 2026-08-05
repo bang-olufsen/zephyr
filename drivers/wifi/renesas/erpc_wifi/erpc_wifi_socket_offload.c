@@ -60,22 +60,20 @@ static inline int pmgr_ram_hold(void);
  */
 static int erpc_wifi_ensure_awake_rx(uint32_t job_id)
 {
+	/* SRDY is an edge signal: after get_socket_events consumes the last SRDY
+	 * pulse it goes LOW even though the module is still awake. Use the PS
+	 * state machine as the awake gate, then pulse WAKEUP if SRDY=LOW so
+	 * RA6W1 reasserts SRDY for the upcoming host-initiated SPI recv. */
 	erpc_wifi_ps_wait_awake_rx();
 
 	if (!erpc_wifi_ps_is_enabled()) {
-		LOG_INF("poll wait: fd=%d PS disabled, skipping ensure_awake_rx", job_id);
 		return 0;
 	}
 
-	int sr = erpc_wifi_transport_slave_ready();
-
-	LOG_INF("ensure slave-ready=%d", sr);
-	if (sr == 1) {
-		return 0;
+	if (!erpc_wifi_transport_slave_ready()) {
+		erpc_wifi_gpio_trigger_wakeup();
 	}
-
-	LOG_INF("Slave not ready");
-	return -EAGAIN;
+	return 0;
 }
 
 static int erpc_wifi_ensure_awake_tx(uint32_t job_id)
