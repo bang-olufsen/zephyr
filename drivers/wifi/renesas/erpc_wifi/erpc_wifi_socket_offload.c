@@ -60,9 +60,19 @@ static inline int pmgr_ram_hold(void);
  */
 static int erpc_wifi_ensure_awake_rx(uint32_t job_id)
 {
-	/* SRDY is an edge signal (SPI transaction active), not a persistent awake
-	 * indicator. Use the PS state machine as the authoritative awake gate. */
+	/* SRDY is an edge signal: after get_socket_events consumes the last SRDY
+	 * pulse, it goes LOW even though the module is still awake.
+	 * Use the PS state machine as the authoritative awake gate, then pulse
+	 * WAKEUP if SRDY=LOW so RA6W1 reasserts it for the upcoming SPI recv. */
 	erpc_wifi_ps_wait_awake_rx();
+
+	if (!erpc_wifi_ps_is_enabled()) {
+		return 0;
+	}
+
+	if (!erpc_wifi_transport_slave_ready()) {
+		erpc_wifi_gpio_trigger_wakeup();
+	}
 	return 0;
 }
 
