@@ -71,8 +71,7 @@ static int erpc_wifi_ensure_awake_rx(uint32_t job_id)
 	}
 
 	if (!erpc_wifi_transport_slave_ready()) {
-		/* Module is awake; just re-pulse SRDY (no DPM boot wait needed) */
-		erpc_wifi_gpio_wakeup_pulse_fast();
+		erpc_wifi_gpio_trigger_wakeup();
 	}
 	return 0;
 }
@@ -95,6 +94,14 @@ static int erpc_wifi_ensure_awake_tx(uint32_t job_id)
 
 		LOG_INF("TX wake override (job=%u): tx_blocked=0 but slave-ready=0 while PS enabled",
 			job_id);
+
+		/* Module is awake-idle (SRDY consumed by last SPI) - skip DPM cold-wake overhead */
+		if (erpc_wifi_ps_is_module_awake()) {
+			erpc_wifi_gpio_trigger_wakeup();
+			erpc_wifi_ps_hold_awake("tx-awake");
+			erpc_wifi_ps_reset_state_awake();
+			return 0;
+		}
 	}
 
 	int64_t start = k_uptime_get();
@@ -490,8 +497,6 @@ static void erpc_wifi_socket_poll_task(void *arg1, void *arg2, void *arg3)
 					if (events != 0 && events != UINT32_MAX) {
 						//LOG_WRN("poll_task: fd=%d events=0x%x", sock->fd, events);
 					}
-
-					erpc_wifi_pmgr_ram_release(0);
 
 					if (events == UINT32_MAX) {
 						LOG_DBG("poll get_socket_events failed fd=%d; deferring", sock->fd);
