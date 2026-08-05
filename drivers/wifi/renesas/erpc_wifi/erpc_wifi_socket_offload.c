@@ -71,7 +71,8 @@ static int erpc_wifi_ensure_awake_rx(uint32_t job_id)
 	}
 
 	if (!erpc_wifi_transport_slave_ready()) {
-		erpc_wifi_gpio_trigger_wakeup();
+		/* Module is awake; just re-pulse SRDY (no DPM boot wait needed) */
+		erpc_wifi_gpio_wakeup_pulse_fast();
 	}
 	return 0;
 }
@@ -441,7 +442,7 @@ static void erpc_wifi_socket_poll_task(void *arg1, void *arg2, void *arg3)
 						activity = true;
 					}
 					int srdy = erpc_wifi_transport_slave_ready();
-					LOG_INF("poll_task: fd=%d srdy=%d waiting=%d", sock->fd, srdy, sock->waiting);
+					LOG_DBG("poll_task: fd=%d srdy=%d waiting=%d", sock->fd, srdy, sock->waiting);
 					if (erpc_wifi_ps_is_enabled() && !srdy) {
 						if (erpc_wifi_ps_sleep_is_sent()) {
 							erpc_wifi_ps_confirm_sleep();
@@ -461,15 +462,15 @@ static void erpc_wifi_socket_poll_task(void *arg1, void *arg2, void *arg3)
 						/* SRDY=1 is the strongest wake evidence; sleep_confirmed may lag. */
 						if (srdy) {
 							if (!erpc_wifi_ps_sleep_is_confirmed()) {
-								LOG_INF("Autonomous DPM wakeup via SRDY high (fd=%d), sleep_confirmed pending", sock->fd);
+								LOG_DBG("Autonomous DPM wakeup via SRDY high (fd=%d), sleep_confirmed pending", sock->fd);
 							} else {
-								LOG_INF("Autonomous DPM wakeup detected (fd=%d), processing events", sock->fd);
+								LOG_DBG("Autonomous DPM wakeup detected (fd=%d), processing events", sock->fd);
 							}
 
 
 							erpc_wifi_ps_notify_wakeup();
 						} else {
-							LOG_INF("poll wait: fd=%d srdy=0 sleep_sent=1, waiting for module to wake", sock->fd);
+							LOG_DBG("poll wait: fd=%d srdy=0 sleep_sent=1, waiting for module to wake", sock->fd);
 							/* Waiting for module to sleep. Don't add constraints. */
 							continue;
 						}
@@ -477,7 +478,7 @@ static void erpc_wifi_socket_poll_task(void *arg1, void *arg2, void *arg3)
 
 					int __w = erpc_wifi_ensure_awake_rx(ERPC_PMGR_JOB_ID_RECV);
 					if (__w != 0) {
-						LOG_INF("poll wait: fd=%d ensure_awake_rx failed %d; deferring", sock->fd, __w);
+						LOG_WRN("poll wait: fd=%d ensure_awake_rx failed %d; deferring", sock->fd, __w);
 						continue;
 					}
 
@@ -493,7 +494,7 @@ static void erpc_wifi_socket_poll_task(void *arg1, void *arg2, void *arg3)
 					erpc_wifi_pmgr_ram_release(0);
 
 					if (events == UINT32_MAX) {
-						LOG_INF("poll get_socket_events failed fd=%d; deferring", sock->fd);
+						LOG_DBG("poll get_socket_events failed fd=%d; deferring", sock->fd);
 						continue;
 					}
 

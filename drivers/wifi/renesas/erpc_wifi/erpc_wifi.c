@@ -147,6 +147,21 @@ void erpc_wifi_gpio_trigger_wakeup(void)
 #endif
 }
 
+/* Short pulse for re-asserting SRDY when module is already awake (no DPM boot wait) */
+void erpc_wifi_gpio_wakeup_pulse_fast(void)
+{
+#if DT_NODE_HAS_STATUS(DT_ALIAS(wakeup_gpio), okay)
+	if (g_gpio_wakeup_dev == NULL) {
+		return;
+	}
+	gpio_pin_set(g_gpio_wakeup_dev, GPIO_WAKEUP_PIN, 0);
+	k_msleep(WAKEUP_PULSE_DURATION_MS);
+	gpio_pin_set(g_gpio_wakeup_dev, GPIO_WAKEUP_PIN, 1);
+	k_msleep(WAKEUP_PULSE_DURATION_MS);
+	gpio_pin_set(g_gpio_wakeup_dev, GPIO_WAKEUP_PIN, 0);
+#endif
+}
+
 #ifndef ERPC_WIFI_TIMER_NAME_MAX
 #define ERPC_WIFI_TIMER_NAME_MAX 64
 #endif
