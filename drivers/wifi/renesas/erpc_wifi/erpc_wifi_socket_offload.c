@@ -71,7 +71,8 @@ static int erpc_wifi_ensure_awake_rx(uint32_t job_id)
 	}
 
 	if (!erpc_wifi_transport_slave_ready()) {
-		erpc_wifi_gpio_trigger_wakeup();
+		/* Module is awake-idle; fast pulse only — no DPM settle wait needed */
+		erpc_wifi_gpio_wakeup_pulse_fast();
 	}
 	return 0;
 }

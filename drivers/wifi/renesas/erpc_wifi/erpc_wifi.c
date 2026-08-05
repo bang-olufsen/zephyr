@@ -141,7 +141,7 @@ void erpc_wifi_gpio_trigger_wakeup(void)
 
 	LOG_DBG("Wakeup pulse completed");
 	/* Allow server time to complete DPM wake-up sequence before first eRPC call */
-	//k_msleep(300);
+	k_msleep(300);
 #else
 	LOG_WRN("wakeup_gpio alias is not enabled in devicetree; wakeup pulse skipped");
 #endif
