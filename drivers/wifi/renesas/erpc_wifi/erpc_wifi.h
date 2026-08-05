@@ -74,6 +74,7 @@ struct erpc_wifi_data {
 #endif
 };
 
+bool erpc_wifi_ps_is_module_awake(void);
 void erpc_wifi_ps_notify_socket_connected(void);
 void erpc_wifi_ps_notify_socket_connect_complete(void);
 void erpc_wifi_ps_notify_socket_connect_failed(void);

@@ -60,22 +60,10 @@ static inline int pmgr_ram_hold(void);
  */
 static int erpc_wifi_ensure_awake_rx(uint32_t job_id)
 {
+	/* SRDY is an edge signal (SPI transaction active), not a persistent awake
+	 * indicator. Use the PS state machine as the authoritative awake gate. */
 	erpc_wifi_ps_wait_awake_rx();
-
-	if (!erpc_wifi_ps_is_enabled()) {
-		LOG_INF("poll wait: fd=%d PS disabled, skipping ensure_awake_rx", job_id);
-		return 0;
-	}
-
-	int sr = erpc_wifi_transport_slave_ready();
-
-	LOG_INF("ensure slave-ready=%d", sr);
-	if (sr == 1) {
-		return 0;
-	}
-
-	LOG_INF("Slave not ready");
-	return -EAGAIN;
+	return 0;
 }
 
 static int erpc_wifi_ensure_awake_tx(uint32_t job_id)
@@ -1416,7 +1404,9 @@ static ssize_t erpc_wifi_socket_recvfrom(void *obj, void *buf, size_t max_len, i
 		bool no_data = !(sock->triggered_events & (SOCKET_EVENT_RX | SOCKET_EVENT_ERR | SOCKET_EVENT_CLOSE));
 		k_spin_unlock(&sock->state_lock, key);
 
-		if (erpc_wifi_ps_is_enabled() && erpc_wifi_transport_slave_ready() == 0 && no_data) {
+		/* Return EAGAIN early if PS is enabled, module is in DPM sleep, and no
+		 * events have been confirmed by the poll task yet. */
+		if (erpc_wifi_ps_is_enabled() && !erpc_wifi_ps_is_module_awake() && no_data) {
 			errno = EAGAIN;
 			return -1;
 		}
@@ -1441,18 +1431,6 @@ static ssize_t erpc_wifi_socket_recvfrom(void *obj, void *buf, size_t max_len, i
 		if (__w != 0) {
 			LOG_DBG("erpc_wifi_ensure_awake_rx not ready: %d", __w);
 			if (is_nonblock) {
-				/* If poll_task already confirmed RX data (triggered_events has RX),
-				 * the module went back to sleep with data pending in its buffer.
-				 * Trigger a wakeup to retrieve it instead of returning EAGAIN. */
-				k_spinlock_key_t kcheck = k_spin_lock(&sock->state_lock);
-				bool rx_pending = (sock->triggered_events & SOCKET_EVENT_RX) != 0;
-				k_spin_unlock(&sock->state_lock, kcheck);
-
-				if (rx_pending) {
-					LOG_INF("rx_pending: fd=%d module asleep with data, triggering wakeup", sock->fd);
-					erpc_wifi_gpio_trigger_wakeup();
-					continue; /* retry ensure_awake_rx */
-				}
 				errno = EAGAIN;
 				return -1;
 			}

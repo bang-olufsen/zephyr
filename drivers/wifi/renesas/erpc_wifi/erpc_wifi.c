@@ -1197,6 +1197,11 @@ bool erpc_wifi_ps_is_enabled(void)
 	return g_ps.enabled;
 }
 
+bool erpc_wifi_ps_is_module_awake(void)
+{
+	return g_ps_state == ERPC_WIFI_PS_STATE_AWAKE;
+}
+
 bool erpc_wifi_ps_socket_connect_pending(void)
 {
 	return g_ps.socket_connect_pending;
