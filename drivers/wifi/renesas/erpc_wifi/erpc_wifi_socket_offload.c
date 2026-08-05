@@ -60,20 +60,22 @@ static inline int pmgr_ram_hold(void);
  */
 static int erpc_wifi_ensure_awake_rx(uint32_t job_id)
 {
-	/* SRDY is an edge signal: after get_socket_events consumes the last SRDY
-	 * pulse, it goes LOW even though the module is still awake.
-	 * Use the PS state machine as the authoritative awake gate, then pulse
-	 * WAKEUP if SRDY=LOW so RA6W1 reasserts it for the upcoming SPI recv. */
 	erpc_wifi_ps_wait_awake_rx();
 
 	if (!erpc_wifi_ps_is_enabled()) {
+		LOG_INF("poll wait: fd=%d PS disabled, skipping ensure_awake_rx", job_id);
 		return 0;
 	}
 
-	if (!erpc_wifi_transport_slave_ready()) {
-		erpc_wifi_gpio_trigger_wakeup();
+	int sr = erpc_wifi_transport_slave_ready();
+
+	LOG_INF("ensure slave-ready=%d", sr);
+	if (sr == 1) {
+		return 0;
 	}
-	return 0;
+
+	LOG_INF("Slave not ready");
+	return -EAGAIN;
 }
 
 static int erpc_wifi_ensure_awake_tx(uint32_t job_id)
@@ -446,12 +448,16 @@ static void erpc_wifi_socket_poll_task(void *arg1, void *arg2, void *arg3)
 						if (erpc_wifi_ps_sleep_is_sent()) {
 							erpc_wifi_ps_confirm_sleep();
 						}
-						int64_t now = k_uptime_get();
-						if ((now - last_not_ready_log) > 1000) {
-							LOG_INF("poll wait: fd=%d srdy=0 waiting for module ready", sock->fd);
-							last_not_ready_log = now;
+						/* Skip only if module is genuinely in DPM sleep.
+						 * SRDY=0 while awake just means last SPI transaction done. */
+						if (!erpc_wifi_ps_is_module_awake()) {
+							int64_t now = k_uptime_get();
+							if ((now - last_not_ready_log) > 1000) {
+								LOG_INF("poll wait: fd=%d srdy=0 waiting for module ready", sock->fd);
+								last_not_ready_log = now;
+							}
+							continue;
 						}
-						continue;
 					}
 					if (erpc_wifi_ps_sleep_is_sent()) {
 						/* SRDY=1 is the strongest wake evidence; sleep_confirmed may lag. */
