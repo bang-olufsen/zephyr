@@ -63,16 +63,18 @@ static int erpc_wifi_ensure_awake_rx(uint32_t job_id)
 	erpc_wifi_ps_wait_awake_rx();
 
 	if (!erpc_wifi_ps_is_enabled()) {
+		LOG_INF("poll wait: fd=%d PS disabled, skipping ensure_awake_rx", job_id);
 		return 0;
 	}
 
 	int sr = erpc_wifi_transport_slave_ready();
 
-	LOG_INF("slave-ready=%d", sr);
+	LOG_INF("ensure slave-ready=%d", sr);
 	if (sr == 1) {
 		return 0;
 	}
 
+	LOG_INF("Slave not ready");
 	return -EAGAIN;
 }
 
@@ -465,6 +467,7 @@ static void erpc_wifi_socket_poll_task(void *arg1, void *arg2, void *arg3)
 
 							erpc_wifi_ps_notify_wakeup();
 						} else {
+							LOG_INF("poll wait: fd=%d srdy=0 sleep_sent=1, waiting for module to wake", sock->fd);
 							/* Waiting for module to sleep. Don't add constraints. */
 							continue;
 						}
@@ -472,7 +475,7 @@ static void erpc_wifi_socket_poll_task(void *arg1, void *arg2, void *arg3)
 
 					int __w = erpc_wifi_ensure_awake_rx(ERPC_PMGR_JOB_ID_RECV);
 					if (__w != 0) {
-						LOG_WRN("poll wait: fd=%d ensure_awake_rx failed %d; deferring", sock->fd, __w);
+						LOG_INF("poll wait: fd=%d ensure_awake_rx failed %d; deferring", sock->fd, __w);
 						continue;
 					}
 
@@ -488,7 +491,7 @@ static void erpc_wifi_socket_poll_task(void *arg1, void *arg2, void *arg3)
 					erpc_wifi_pmgr_ram_release(0);
 
 					if (events == UINT32_MAX) {
-						LOG_WRN("poll get_socket_events failed fd=%d; deferring", sock->fd);
+						LOG_INF("poll get_socket_events failed fd=%d; deferring", sock->fd);
 						continue;
 					}
 
@@ -1438,6 +1441,18 @@ static ssize_t erpc_wifi_socket_recvfrom(void *obj, void *buf, size_t max_len, i
 		if (__w != 0) {
 			LOG_DBG("erpc_wifi_ensure_awake_rx not ready: %d", __w);
 			if (is_nonblock) {
+				/* If poll_task already confirmed RX data (triggered_events has RX),
+				 * the module went back to sleep with data pending in its buffer.
+				 * Trigger a wakeup to retrieve it instead of returning EAGAIN. */
+				k_spinlock_key_t kcheck = k_spin_lock(&sock->state_lock);
+				bool rx_pending = (sock->triggered_events & SOCKET_EVENT_RX) != 0;
+				k_spin_unlock(&sock->state_lock, kcheck);
+
+				if (rx_pending) {
+					LOG_INF("rx_pending: fd=%d module asleep with data, triggering wakeup", sock->fd);
+					erpc_wifi_gpio_trigger_wakeup();
+					continue; /* retry ensure_awake_rx */
+				}
 				errno = EAGAIN;
 				return -1;
 			}
