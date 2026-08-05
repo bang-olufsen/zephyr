@@ -53,12 +53,17 @@ void erpc_wifi_transport_deinit(erpc_transport_t transport)
 int erpc_wifi_transport_slave_ready(void)
 {
 	if (g_slave_ready_gpio == NULL) {
-		return 0;
+		return true;
+	}
+	if (!device_is_ready(g_slave_ready_gpio->port)) {
+		//printf("Slave-ready GPIO not ready at runtime: %s",
+		//	g_slave_ready_gpio->port->name);
+		return false;
 	}
 
 	int v = gpio_pin_get_dt(g_slave_ready_gpio);
 	if (v < 0) {
-		return 0;
+		return false;
 	}
 
 	return (v != 0);
@@ -85,7 +90,12 @@ void erpc_transport_register_srdy_cb(erpc_transport_srdy_cb_t cb)
 	g_srdy_cb = cb;
 
 	if (g_slave_ready_gpio && cb) {
-		gpio_remove_callback(g_slave_ready_gpio->port, &srdy_cb_data);
+		/* Configure SRDY GPIO for edge-triggered interrupts (rising edge to ACTIVE_HIGH) */
+		int ret = gpio_pin_configure_dt(g_slave_ready_gpio, GPIO_INPUT | GPIO_INT_EDGE_TO_ACTIVE);
+		if (ret < 0) {
+			return;  /* Failed to configure GPIO interrupts */
+		}
+
 		gpio_init_callback(&srdy_cb_data, srdy_gpio_callback_handler, BIT(g_slave_ready_gpio->pin));
 		gpio_add_callback(g_slave_ready_gpio->port, &srdy_cb_data);
 

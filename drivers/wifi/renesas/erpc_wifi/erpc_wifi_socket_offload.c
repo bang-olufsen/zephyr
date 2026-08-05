@@ -94,14 +94,6 @@ static int erpc_wifi_ensure_awake_tx(uint32_t job_id)
 
 		LOG_INF("TX wake override (job=%u): tx_blocked=0 but slave-ready=0 while PS enabled",
 			job_id);
-
-		/* Module is awake-idle (SRDY consumed by last SPI) - skip DPM cold-wake overhead */
-		if (erpc_wifi_ps_is_module_awake()) {
-			erpc_wifi_gpio_trigger_wakeup();
-			erpc_wifi_ps_hold_awake("tx-awake");
-			erpc_wifi_ps_reset_state_awake();
-			return 0;
-		}
 	}
 
 	int64_t start = k_uptime_get();
@@ -459,7 +451,7 @@ static void erpc_wifi_socket_poll_task(void *arg1, void *arg2, void *arg3)
 						if (!erpc_wifi_ps_is_module_awake()) {
 							int64_t now = k_uptime_get();
 							if ((now - last_not_ready_log) > 1000) {
-								LOG_INF("poll wait: fd=%d srdy=0 waiting for module ready", sock->fd);
+								LOG_DBG("poll wait: fd=%d srdy=0 waiting for module ready", sock->fd);
 								last_not_ready_log = now;
 							}
 							continue;
@@ -548,7 +540,7 @@ static void erpc_wifi_socket_poll_task(void *arg1, void *arg2, void *arg3)
 
 					if (notify_connected) {
 						erpc_wifi_ps_notify_socket_connected();
-						LOG_INF("Non-blocking connect completed for fd %d", log_connected_fd);
+						LOG_DBG("Non-blocking connect completed for fd %d", log_connected_fd);
 					}
 					if (notify_failed) {
 						erpc_wifi_ps_notify_socket_connect_failed();
@@ -1260,7 +1252,7 @@ static void erpc_wifi_sync_recv_job_for_socket(struct erpc_wifi_socket *sock, co
 static ssize_t erpc_wifi_socket_sendto(void *obj, const void *buf, size_t len, int flags,
 				       const struct sockaddr *dest_addr, socklen_t addrlen)
 {
-	LOG_INF("TX wake request (len=%u)", (unsigned int)len);
+	LOG_DBG("TX wake request (len=%u)", (unsigned int)len);
 
 	int __w = erpc_wifi_ensure_awake_tx(ERPC_PMGR_JOB_ID_SEND);
 	if (__w != 0) { 
@@ -1419,7 +1411,7 @@ static ssize_t erpc_wifi_socket_recvfrom(void *obj, void *buf, size_t max_len, i
 
 	bool is_nonblock = (sock->flags & O_NONBLOCK) || (flags & ZSOCK_MSG_DONTWAIT);
 	if (is_nonblock) {
-		LOG_INF("Non-blocking recvfrom requested (fd=%d)", sock->fd);
+		LOG_DBG("Non-blocking recvfrom requested (fd=%d)", sock->fd);
 		k_spinlock_key_t key = k_spin_lock(&sock->state_lock);
 		bool no_data = !(sock->triggered_events & (SOCKET_EVENT_RX | SOCKET_EVENT_ERR | SOCKET_EVENT_CLOSE));
 		k_spin_unlock(&sock->state_lock, key);
@@ -2068,7 +2060,7 @@ static int erpc_wifi_socket_ioctl(void *obj, unsigned int request, va_list args)
 			uint32_t val = (new_flags & O_NONBLOCK) ? 1U : 0U;
 			int __w = erpc_wifi_ensure_awake_tx(ERPC_PMGR_JOB_ID_SEND);
 			if (__w != 0) {
-				LOG_INF("erpc_wifi_ensure_awake_tx failed: IN %s = %d", __func__, __w);
+				LOG_DBG("erpc_wifi_ensure_awake_tx failed: IN %s = %d", __func__, __w);
 				errno = -__w;
 				return -1;
 			}
@@ -2083,13 +2075,13 @@ static int erpc_wifi_socket_ioctl(void *obj, unsigned int request, va_list args)
 				errno = -rc;
 				return -1;
 			}
-			LOG_INF("Forwarded O_NONBLOCK to server for fd %d: val=%u", sock->fd, val);
+			LOG_DBG("Forwarded O_NONBLOCK to server for fd %d: val=%u", sock->fd, val);
 		}
 		sock->flags = new_flags;
 		return 0;
 	}
 	case F_GETFL:
-		LOG_INF("Socket flags request: %d: 0x%x", request, sock->flags);
+		LOG_DBG("Socket flags request: %d: 0x%x", request, sock->flags);
 		return sock->flags;
 
 	case ZFD_IOCTL_POLL_PREPARE: {

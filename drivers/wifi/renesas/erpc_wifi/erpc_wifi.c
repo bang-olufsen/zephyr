@@ -129,7 +129,7 @@ void erpc_wifi_gpio_trigger_wakeup(void)
 		return;
 	}
 
-	LOG_INF("Triggering wakeup pulse on GPIO pin %d (active high for %dms)",
+	LOG_DBG("Triggering wakeup pulse on GPIO pin %d (active high for %dms)",
 		GPIO_WAKEUP_PIN, WAKEUP_PULSE_DURATION_MS);
 
 	gpio_pin_set(g_gpio_wakeup_dev, GPIO_WAKEUP_PIN, 0);
@@ -139,9 +139,9 @@ void erpc_wifi_gpio_trigger_wakeup(void)
 	k_msleep(WAKEUP_PULSE_DURATION_MS);
 	gpio_pin_set(g_gpio_wakeup_dev, GPIO_WAKEUP_PIN, 0);
 
-	LOG_INF("Wakeup pulse completed");
+	LOG_DBG("Wakeup pulse completed");
 	/* Allow server time to complete DPM wake-up sequence before first eRPC call */
-	k_msleep(300);
+	//k_msleep(300);
 #else
 	LOG_WRN("wakeup_gpio alias is not enabled in devicetree; wakeup pulse skipped");
 #endif
@@ -1051,7 +1051,7 @@ void erpc_wifi_ps_schedule_sleep(const char *reason)
 	k_work_reschedule(&g_ps_enable_work, K_MSEC(delay));
 	erpc_wifi_socket_tx_block_set(false, 0U);
 
-	LOG_INF("PS sleep armed in %u ms (%s)", delay, reason);
+	LOG_DBG("PS sleep armed in %u ms (%s)", delay, reason);
 }
 
 void erpc_wifi_ps_hold_awake(const char *reason)
@@ -1064,7 +1064,7 @@ void erpc_wifi_ps_hold_awake(const char *reason)
 		(void)erpc_wifi_send_cmd(ERPC_WIFI_PMGR_ADD_SLEEP_CONSTRAINT_CMD, &cstr, sizeof(cstr), -1);
 	}
 	g_ps.sleep_constraint_held = true;
-	LOG_INF("PS hold awake (%s)", reason);
+	LOG_DBG("PS hold awake (%s)", reason);
 }
 
 void erpc_wifi_ps_release_awake(const char *reason)
@@ -1077,7 +1077,7 @@ void erpc_wifi_ps_release_awake(const char *reason)
 		(void)erpc_wifi_send_cmd(ERPC_WIFI_PMGR_REMOVE_SLEEP_CONSTRAINT_CMD, &cstr, sizeof(cstr), -1);
 	}
 	g_ps.sleep_constraint_held = false;
-	LOG_INF("PS release awake (%s)", reason);
+	LOG_DBG("PS release awake (%s)", reason);
 }
 
 void erpc_wifi_ps_cancel_sleep_work(void)
@@ -1183,7 +1183,7 @@ void erpc_wifi_ps_notify_wakeup(void)
 	 * Reset allow_sleep_sent so erpc_wifi_ps_schedule_sleep() will
 	 * re-arm the sleep timer once the I/O is done.
 	 */
-	LOG_INF("PS TRACE: wakeup/io detected - re-arming sleep timer");
+	LOG_DBG("PS TRACE: wakeup/io detected - re-arming sleep timer");
 	g_ps.allow_sleep_sent = false;
 	g_ps.sleep_confirmed = false;
 	erpc_wifi_ps_set_state(ERPC_WIFI_PS_STATE_AWAKE);
@@ -1362,15 +1362,15 @@ static void ps_allow_sleep_work(struct k_work *work)
 	ARG_UNUSED(work);
 
 	if (!g_ps.enabled) {
-		LOG_INF("PS allow sleep: ignored (PS disabled)");
+		LOG_DBG("PS allow sleep: ignored (PS disabled)");
 		return;
 	}
 	/* Re-push all cached PS params before apply: after DPM wake the RA6W1 server
 	 * reinitialises its config struct to zero, so we must restore every param. */
-	LOG_INF("PS allow sleep: pushing cached PS params to RA");
+	LOG_DBG("PS allow sleep: pushing cached PS params to RA");
 	erpc_wifi_ps_push_defaults();
 
-	LOG_INF("PS allow sleep: applying PMGR config and releasing constraint");
+	LOG_DBG("PS allow sleep: applying PMGR config and releasing constraint");
 	if (g_ps.transitioning || !g_ps.enabled) {
 		LOG_WRN("PS allow sleep: aborted mid-execution (PS disable in progress)");
 		return;
@@ -1381,7 +1381,7 @@ static void ps_allow_sleep_work(struct k_work *work)
 		return;
 	}
 
-	/* Allow RA6W1 to enter DPM */
+	LOG_DBG("Allow RA6W1 to enter DPM");
 	erpc_wifi_ps_release_awake("allow-sleep-work");
 	g_ps.allow_sleep_sent = true;
 	g_ps.sleep_confirmed = true;
@@ -1400,7 +1400,7 @@ static void ps_allow_sleep_work(struct k_work *work)
 	uint32_t gate_ms = g_ps.tmo_set ? (g_ps.timeout_ms + 5000U) : 30000U;
 	erpc_wifi_socket_tx_block_set(true, gate_ms);
 
-	LOG_INF("PS enabled: sleep allowed");
+	LOG_DBG("PS enabled: sleep allowed");
 }
 #if 0
 static void ps_allow_sleep_work(struct k_work *work)
@@ -1493,7 +1493,7 @@ static int erpc_wifi_mgmt_set_power_save(struct net_if *iface, struct wifi_ps_pa
 		return -EPERM;
 	}
 
-	LOG_INF("PS set: type=%u enabled=%u li=%u wm=%u exit=%u tmo=%u", params->type,
+	LOG_DBG("PS set: type=%u enabled=%u li=%u wm=%u exit=%u tmo=%u", params->type,
 		params->enabled, params->listen_interval, params->wakeup_mode,
 		params->exit_strategy, params->timeout_ms);
 
@@ -1511,7 +1511,7 @@ static int erpc_wifi_mgmt_set_power_save(struct net_if *iface, struct wifi_ps_pa
 			g_ps.wakeup_mode = (uint32_t)RA_WIFI_PS_WAKEUP_MODE_DTIM;
 		}
 		g_ps.wm_set = true;
-		LOG_INF("PS set: WAKEUP_MODE zephyr=%u ra=%u (cached)", params->wakeup_mode,
+		LOG_DBG("PS set: WAKEUP_MODE zephyr=%u ra=%u (cached)", params->wakeup_mode,
 			g_ps.wakeup_mode);
 		return 0;
 
@@ -1523,7 +1523,7 @@ static int erpc_wifi_mgmt_set_power_save(struct net_if *iface, struct wifi_ps_pa
 		g_ps.exit_strategy = (uint32_t)params->exit_strategy;
 		g_ps.ex_set = true;
 
-		LOG_INF("PS set: EXIT_STRATEGY zephyr=%u (cached)", params->exit_strategy);
+		LOG_DBG("PS set: EXIT_STRATEGY zephyr=%u (cached)", params->exit_strategy);
 		return 0;
 	}
 
@@ -1531,7 +1531,7 @@ static int erpc_wifi_mgmt_set_power_save(struct net_if *iface, struct wifi_ps_pa
 		g_ps.timeout_ms = (uint32_t)params->timeout_ms;
 		g_ps.tmo_set = true;
 
-		LOG_INF("PS set: TIMEOUT_MS=%u (cached)", g_ps.timeout_ms);
+		LOG_DBG("PS set: TIMEOUT_MS=%u (cached)", g_ps.timeout_ms);
 		if (g_ps.enabled && !g_ps.allow_sleep_sent) {
 			erpc_wifi_ps_schedule_sleep("timeout-update");
 		}
@@ -1541,7 +1541,7 @@ static int erpc_wifi_mgmt_set_power_save(struct net_if *iface, struct wifi_ps_pa
 	case WIFI_PS_PARAM_STATE:
 		if (params->enabled == WIFI_PS_ENABLED) {
 
-			LOG_INF("PS TRACE: WIFI_PS_PARAM_STATE ENABLE via erpc_wifi_mgmt_set_power_save");
+			LOG_DBG("PS TRACE: WIFI_PS_PARAM_STATE ENABLE via erpc_wifi_mgmt_set_power_save");
 			erpc_wifi_ps_set_state_internal(true,
 					       "erpc_wifi_mgmt_set_power_save:WIFI_PS_PARAM_STATE:enable");
 
@@ -1555,7 +1555,7 @@ static int erpc_wifi_mgmt_set_power_save(struct net_if *iface, struct wifi_ps_pa
 					LOG_WRN("PS TRACE: continuing PS disable even though wake confirmation timed out");
 				}
 			}
-			LOG_INF("PS TRACE: WIFI_PS_PARAM_STATE DISABLE via erpc_wifi_mgmt_set_power_save");
+			LOG_DBG("PS TRACE: WIFI_PS_PARAM_STATE DISABLE via erpc_wifi_mgmt_set_power_save");
 			erpc_wifi_ps_set_state_internal(false,
 					       "erpc_wifi_mgmt_set_power_save:WIFI_PS_PARAM_STATE:disable");
 			return 0;
