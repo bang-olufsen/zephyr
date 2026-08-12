@@ -1,6 +1,7 @@
 #include "erpc_wifi_cmd.h"
 
 #include "erpc_wifi.h"
+#include "erpc_wifi_socket_offload.h"
 #include <c_wifi_host_to_ra_client.h>
 #include <zephyr/net/socket.h>
 
@@ -70,6 +71,11 @@ int erpc_wifi_send_cmd(erpc_wifi_cmd_t cmd, void *data, size_t size, int tout)
 	int cmd_ret = 0;
 	k_timeout_t timeout = K_NO_WAIT;
 	erpc_wifi_msg_data_t msg = { .cmd = cmd, .sem = NULL, .cmd_ret = &cmd_ret };
+
+	if (tout != -1) {
+		LOG_ERR("Only K_FOREVER command mode supported");
+		return -EINVAL;
+	}
 
 	if (cmd >= ERPC_WIFI_LAST_CMD) {
 		return -ERANGE;
@@ -159,9 +165,34 @@ static void erpc_wifi_msg_handler_task(void *arg1, void *arg2, void *arg3)
 		}
 
 		/* Dispatch to registered handler */
-		if (msg.cmd < ERPC_WIFI_LAST_CMD && erpc_wifi_socket_handlers[msg.cmd].h) {
-			int ret = erpc_wifi_socket_handlers[msg.cmd].h(msg.data);
-			
+		if (msg.cmd < ERPC_WIFI_LAST_CMD &&
+		    erpc_wifi_socket_handlers[msg.cmd].h) {
+
+			bool server_evt_query =
+				(msg.cmd == EPRC_WIFI_GET_SERVER_EVT_CMD);
+
+			if (server_evt_query) {
+				erpc_wifi_offload_server_evt_query_begin();
+			}
+
+			/*
+			 * Every handler below represents a host-initiated eRPC
+			 * transaction.
+			 *
+			 * Any SRDY edge generated while it executes belongs to
+			 * that transaction and must not become a DPM wake event.
+			 */
+			erpc_wifi_offload_host_erpc_begin();
+
+			int ret =
+				erpc_wifi_socket_handlers[msg.cmd].h(msg.data);
+
+			erpc_wifi_offload_host_erpc_end();
+
+			if (server_evt_query) {
+				erpc_wifi_offload_server_evt_query_end();
+			}
+
 			/* Store result for caller */
 			if (msg.cmd_ret) {
 				*msg.cmd_ret = ret;
@@ -180,14 +211,6 @@ static void erpc_wifi_msg_handler_task(void *arg1, void *arg2, void *arg3)
 		/* Signal completion if semaphore present */
 		if (msg.sem) {
 			k_sem_give(msg.sem);
-		}
-
-		/* After removing the sleep constraint the PS state machine immediately
-		 * transitions to ASLEEP. The SPI completion leaves SRDY briefly high as
-		 * an artefact; this delay lets it deassert before the poll task runs,
-		 * preventing a spurious notify_wakeup() that would re-hold the module awake. */
-		if (msg.cmd == ERPC_WIFI_PMGR_REMOVE_SLEEP_CONSTRAINT_CMD) {
-			k_msleep(500);
 		}
 	}
 }

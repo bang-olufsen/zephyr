@@ -76,4 +76,11 @@ config WIFI_ERPC_WIFI_RESET_TIMEOUT
 	help
 	  TODO - add description.
 
+config WIFI_ERPC_WAKE_TIMEOUT_MS
+	int "RA6W1 DPM wake timeout"
+	default 1500
+	range 100 10000
+	help
+	  Timeout in milliseconds for the host-to-module DPM wake handshake.
+
 endif # WIFI_ERPC_WIFI
