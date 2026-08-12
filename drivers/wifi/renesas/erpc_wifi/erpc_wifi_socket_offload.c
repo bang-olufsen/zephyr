@@ -128,29 +128,6 @@ static int erpc_wifi_ensure_awake_tx(uint32_t job_id, bool *ram_held)
 	__ASSERT(!*ram_held, "ensure_awake_tx called while POWER_RAM already held");
 	*ram_held = false;
 
-	/*
-	 * If SLEEP_PROHIBITED REMOVE has already been sent, RA6W1 may be
-	 * physically progressing into DPM even though the host is about to
-	 * start a new TX.  Do not pulse WAKE during this short quiet window:
-	 * RA reports "Give up - In progressing DPM sleep" and the pulse can be
-	 * lost.  Wait for the existing 250-ms sleep-entry guard to finish, then
-	 * perform a normal wake from the settled ASLEEP state.
-	 */
-	if (erpc_wifi_ps_is_enabled()) {
-		int64_t guard_start = k_uptime_get();
-		uint32_t guard_tmo = CONFIG_WIFI_ERPC_WAKE_TIMEOUT_MS;
-
-		while (erpc_wifi_ps_wait_for_srdy_low_get()) {
-			if (guard_tmo > 0U &&
-			    (k_uptime_get() - guard_start) >= (int64_t)guard_tmo) {
-				LOG_WRN("TX sleep-entry guard timeout job=%u tmo=%u",
-					job_id, guard_tmo);
-				return -EAGAIN;
-			}
-			k_msleep(5);
-		}
-	}
-
 	erpc_wifi_ps_wait_awake_tx();
 
 	erpc_wifi_ps_cancel_sleep_work();
@@ -364,29 +341,6 @@ int erpc_wifi_wake_for_tx(void)
 	return ret;
 }
 
-/*
- * Ownership-safe variant for non-socket users (DNS, iface-status, etc.).
- * On success, *ram_held tells the caller whether this operation owns a
- * POWER_RAM reference that must be released exactly once after its eRPC
- * sequence completes.
- */
-int erpc_wifi_wake_for_tx_acquire(bool *ram_held)
-{
-	if (ram_held == NULL) {
-		return -EINVAL;
-	}
-
-	*ram_held = false;
-	int ret = erpc_wifi_ensure_awake_tx(ERPC_PMGR_JOB_ID_SEND, ram_held);
-
-	if (ret < 0 && *ram_held) {
-		(void)erpc_wifi_pmgr_ram_release(ERPC_PMGR_JOB_ID_SEND);
-		*ram_held = false;
-	}
-
-	return ret;
-}
-
 #include <zephyr/sys/atomic.h>
 #include <zephyr/device.h>
 #include <string.h>
@@ -535,16 +489,6 @@ static atomic_t g_socket_evt_query_inflight;
 static atomic_t g_server_evt_query_inflight;
 static atomic_t g_host_erpc_inflight;
 static atomic_t g_srdy_deferred;
-
-/*
- * One-shot recovery for a genuine autonomous SRDY whose rising edge was
- * missed/coalesced by the host GPIO IRQ.
- *
- * This is reset at the start of every new DPM sleep epoch by
- * erpc_wifi_offload_clear_srdy_pending().
- */
-static atomic_t g_srdy_level_recovery_used;
-
 static struct k_work_delayable g_srdy_deferred_work;
 
 static void erpc_wifi_srdy_deferred_work(struct k_work *work)
@@ -630,8 +574,7 @@ static void erpc_wifi_socket_poll_task(void *arg1, void *arg2, void *arg3)
 		/* Wait until signaled by SRDY/socket events, but keep fallback timeout
 		 * to recover from missed/coalesced edges while sockets are active. */
 		k_timeout_t wait_timeout = dpm_polling_needed ? K_MSEC(500) : K_FOREVER;
-		int wait_rc = k_sem_take(&poll_task_sem, wait_timeout);
-		bool fallback_tick = (wait_rc != 0);
+		(void)k_sem_take(&poll_task_sem, wait_timeout);
 
 		bool srdy_irq = atomic_cas(&g_srdy_irq_pending, 1, 0);
 
@@ -662,54 +605,16 @@ static void erpc_wifi_socket_poll_task(void *arg1, void *arg2, void *arg3)
 		}
 
 		/*
-		 * Normal autonomous-wake qualification is still EDGE based.
+		 * Autonomous DPM wake qualification must be EDGE based.
 		 *
-		 * TLS testing exposed one additional failure mode: RA6W1 can wake for
-		 * real unicast traffic (TIM : UC) and hold SRDY high, while the nRF host
-		 * occasionally misses/coalesces the GPIO rising edge completely.
-		 *
-		 * Keep the real IRQ as the preferred path, and use the existing 500-ms
-		 * poll timeout only as a ONE-SHOT recovery for a stable HIGH SRDY while
-		 * the host believes RA is ASLEEP.  This avoids bringing back the old
-		 * static-HIGH false-wake storm.
+		 * The deferred-SRDY path preserves a genuine edge that overlaps a
+		 * host eRPC transaction, so a static HIGH level is not a valid reason
+		 * to manufacture another autonomous wake on every 500-ms fallback.
 		 */
-		bool module_asleep =
-			erpc_wifi_ps_is_enabled() &&
-			erpc_wifi_ps_is_module_asleep();
-
-		bool level_recovery = false;
-
-		if (module_asleep && srdy_irq) {
-			/*
-			 * A genuine edge has already qualified this sleep epoch.  Prevent
-			 * the timeout fallback from classifying the same asserted SRDY again.
-			 */
-			atomic_set(&g_srdy_level_recovery_used, 1);
-		}
-
-		if (module_asleep &&
-		    !srdy_irq &&
-		    fallback_tick &&
-		    atomic_get(&g_host_erpc_inflight) == 0 &&
-		    erpc_wifi_transport_slave_ready()) {
-
-			/*
-			 * Require SRDY to remain asserted briefly.  Sleep-entry response
-			 * edges are already filtered by wait_for_srdy_low above; this extra
-			 * stability check rejects a short/transient level as well.
-			 */
-			k_msleep(10);
-
-			if (erpc_wifi_transport_slave_ready() &&
-			    atomic_cas(&g_srdy_level_recovery_used, 0, 1)) {
-				LOG_DBG("Recovering missed autonomous SRDY edge");
-				level_recovery = true;
-			}
-		}
-
 		bool autonomous_pass =
-			module_asleep &&
-			(srdy_irq || level_recovery);
+			erpc_wifi_ps_is_enabled() &&
+			erpc_wifi_ps_is_module_asleep() &&
+			srdy_irq;
 
 		bool autonomous_started = false;
 
@@ -2202,39 +2107,6 @@ static ssize_t erpc_wifi_socket_recvfrom(void *obj, void *buf, size_t max_len, i
 static int erpc_wifi_socket_getsockopt(void *obj, int level, int optname, void *optval,
 				       socklen_t *optlen)
 {
-	struct erpc_wifi_socket *sock = (struct erpc_wifi_socket *)obj;
-
-	/*
-	 * For an already-established healthy socket, SO_ERROR is fully tracked
-	 * by the host's socket-event state.  Do not wake a sleeping RA6W1 merely
-	 * to read a known-zero SO_ERROR; this was the only observed getsockopt
-	 * TX-wake timeout in the latest soak.
-	 */
-	if (level == SOL_SOCKET && optname == SO_ERROR) {
-		if (optval == NULL || optlen == NULL || *optlen < sizeof(int)) {
-			errno = EINVAL;
-			return -1;
-		}
-
-		bool use_cached = false;
-		int cached_error = 0;
-
-		k_spinlock_key_t cache_key = k_spin_lock(&sock->state_lock);
-		if (sock->connected &&
-		    !sock->connect_pending &&
-		    !(sock->triggered_events & (SOCKET_EVENT_ERR | SOCKET_EVENT_CLOSE))) {
-			cached_error = sock->socket_error;
-			use_cached = true;
-		}
-		k_spin_unlock(&sock->state_lock, cache_key);
-
-		if (use_cached) {
-			*(int *)optval = cached_error;
-			*optlen = sizeof(int);
-			return 0;
-		}
-	}
-
 	bool ram_held = false;
 	int __w = erpc_wifi_ensure_awake_tx(ERPC_PMGR_JOB_ID_SEND, &ram_held);
 	if (__w != 0) { 
@@ -2245,6 +2117,8 @@ static int erpc_wifi_socket_getsockopt(void *obj, int level, int optname, void *
 		errno = -__w;
 		return -1;
 	}
+
+	struct erpc_wifi_socket *sock = (struct erpc_wifi_socket *)obj;
 
 	if (level == SOL_SOCKET && optname == SO_ERROR) {
 		int remote_error = 0;
@@ -3152,12 +3026,6 @@ void erpc_wifi_offload_clear_srdy_pending(void)
 {
 	atomic_set(&g_srdy_irq_pending, 0);
 	atomic_set(&g_srdy_deferred, 0);
-
-	/*
-	 * New DPM sleep epoch: allow exactly one level-based recovery if the
-	 * next genuine autonomous SRDY edge is missed by the host GPIO IRQ.
-	 */
-	atomic_set(&g_srdy_level_recovery_used, 0);
 }
 
 extern void erpc_wifi_dns_offload_init(void);

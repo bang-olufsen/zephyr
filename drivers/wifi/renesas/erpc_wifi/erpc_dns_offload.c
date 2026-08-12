@@ -10,8 +10,6 @@ LOG_MODULE_DECLARE(wifi_erpc_wifi, CONFIG_WIFI_LOG_LEVEL);
 #include <c_wifi_host_to_ra_client.h>
 #include "erpc_wifi_cmd.h"
 
-extern int erpc_wifi_wake_for_tx_acquire(bool *ram_held);
-
 /* * The Offload Function (Using Compact Struct)
  */
 static void offload_freeaddrinfo(struct zsock_addrinfo *res);
@@ -35,8 +33,7 @@ static int offload_getaddrinfo(const char *node, const char *service,
 	}
 
 	// 2. Wake RA6W1 if in DPM sleep before issuing the blocking eRPC DNS call.
-	bool ram_held = false;
-	int wake_ret = erpc_wifi_wake_for_tx_acquire(&ram_held);
+	int wake_ret = erpc_wifi_wake_for_tx();
 	if (wake_ret != 0) {
 		LOG_WRN("DNS: wake-for-tx failed (%d), aborting getaddrinfo", wake_ret);
 		free(result);
@@ -57,14 +54,11 @@ static int offload_getaddrinfo(const char *node, const char *service,
 			ERPC_WIFI_DNS_GETADDRINFO_CMD, &dns_msg, sizeof(dns_msg), -1);
 	}
 	
-	// Release exactly the POWER_RAM reference owned by this DNS operation.
-	if (ram_held) {
-		(void)erpc_wifi_pmgr_ram_release(ERPC_PMGR_JOB_ID_SEND);
-		ram_held = false;
-	}
+	// Release RAM constraint and mark DPM job as complete
+	(void)erpc_wifi_pmgr_ram_release(ERPC_PMGR_JOB_ID_SEND);
 
 	// Re-arm the PS sleep timer now that the DNS eRPC round-trip is done.
-	(void)erpc_wifi_ps_notify_wakeup();
+	erpc_wifi_ps_notify_wakeup();
 
 	/* Map known server/LwIP status first, then fallback. */
 	if (server_status < 0) {
