@@ -54,7 +54,7 @@ static int offload_getaddrinfo(const char *node, const char *service,
 			.actual_count = &actual_count,
 		};
 		server_status = (WIFIReturnCode_t)erpc_wifi_send_cmd(
-			ERPC_WIFI_DNS_GETADDRINFO_CMD, &dns_msg, sizeof(dns_msg), -1);
+			ERPC_WIFI_DNS_GETADDRINFO_CMD, &dns_msg, sizeof(dns_msg), 10000);
 	}
 	
 	// Release exactly the POWER_RAM reference owned by this DNS operation.

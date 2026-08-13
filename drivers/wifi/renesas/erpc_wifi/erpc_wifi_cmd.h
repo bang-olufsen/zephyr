@@ -66,11 +66,17 @@ typedef enum {
 	ERPC_WIFI_LAST_CMD,
 } erpc_wifi_cmd_t;
 
+typedef struct erpc_wifi_cmd_ctx {
+	atomic_t ref_count;
+	struct k_sem sem;
+	int cmd_ret;
+	atomic_t timed_out;
+} erpc_wifi_cmd_ctx_t;
+
 typedef struct {
 	erpc_wifi_cmd_t cmd;
-	struct k_sem *sem;
+	erpc_wifi_cmd_ctx_t *ctx;
 	void *data;
-	int *cmd_ret;
 	erpc_wifi_msg_cb_t cb;
 } erpc_wifi_msg_data_t;
 

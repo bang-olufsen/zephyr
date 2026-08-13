@@ -545,7 +545,7 @@ static void erpc_wifi_mgmt_scan_work(struct k_work *work)
 		memset(results, 0, dev->scan_max_bss_cnt * sizeof(WIFIScanResult_t));
 
 		erpc_wifi_scan_t scan_msg = { .scan_results = results, .max_bss_cnt = (uint8_t)dev->scan_max_bss_cnt };
-		ret = (WIFIReturnCode_t)erpc_wifi_send_cmd(ERPC_WIFI_AP_SCAN_CMD, &scan_msg, sizeof(scan_msg), -1);
+		ret = (WIFIReturnCode_t)erpc_wifi_send_cmd(ERPC_WIFI_AP_SCAN_CMD, &scan_msg, sizeof(scan_msg), 10000);
 
 		LOG_DBG("WIFI_Scan: %d", ret);
 
@@ -804,7 +804,7 @@ static void erpc_wifi_mgmt_connect_work(struct k_work *work)
 	LOG_INF("WiFi connect API: calling WIFI_ConnectAP");
 	ret = eWiFiFailure;
 	for (int attempt = 1; attempt <= 3 && ret != eWiFiSuccess; attempt++) {
-		ret = (WIFIReturnCode_t)erpc_wifi_send_cmd(ERPC_WIFI_AP_CONNECT_CMD, NULL, 0, -1);
+		ret = (WIFIReturnCode_t)erpc_wifi_send_cmd(ERPC_WIFI_AP_CONNECT_CMD, NULL, 0, 20000);
 		LOG_INF("WiFi connect API: WIFI_ConnectAP attempt %d returned %d", attempt, ret);
 		if (ret != eWiFiSuccess && attempt < 3) {
 			erpc_wifi_gpio_trigger_wakeup();
@@ -871,7 +871,7 @@ static void erpc_wifi_mgmt_disconnect_work(struct k_work *work)
 
 	dev = CONTAINER_OF(work, struct erpc_wifi_data, disconnect_work);
 
-	ret = (WIFIReturnCode_t)erpc_wifi_send_cmd(ERPC_WIFI_AP_DISCONNECT_CMD, NULL, 0, -1);
+	ret = (WIFIReturnCode_t)erpc_wifi_send_cmd(ERPC_WIFI_AP_DISCONNECT_CMD, NULL, 0, 5000);
 
 	LOG_DBG("WIFI_Disconnect: %d", ret);
 
@@ -1217,7 +1217,7 @@ int erpc_wifi_ps_hold_awake(const char *reason)
 	k_mutex_unlock(&g_ps_mutex);
 
 	erpc_wifi_pmgr_constraint_t cstr = { .constraint = PMGR_CONSTRAINT_SLEEP_PROHIBITED };
-	int32_t rc = (int32_t)erpc_wifi_send_cmd(ERPC_WIFI_PMGR_ADD_SLEEP_CONSTRAINT_CMD, &cstr, sizeof(cstr), -1);
+	int32_t rc = (int32_t)erpc_wifi_send_cmd(ERPC_WIFI_PMGR_ADD_SLEEP_CONSTRAINT_CMD, &cstr, sizeof(cstr), 500);
 
 	k_mutex_lock(&g_ps_mutex, K_FOREVER);
 	g_ps.constraint_transition = false;
@@ -1249,7 +1249,7 @@ int erpc_wifi_ps_release_awake(const char *reason)
 	k_mutex_unlock(&g_ps_mutex);
 
 	erpc_wifi_pmgr_constraint_t cstr = { .constraint = PMGR_CONSTRAINT_SLEEP_PROHIBITED };
-	int32_t rc = (int32_t)erpc_wifi_send_cmd(ERPC_WIFI_PMGR_REMOVE_SLEEP_CONSTRAINT_CMD, &cstr, sizeof(cstr), -1);
+	int32_t rc = (int32_t)erpc_wifi_send_cmd(ERPC_WIFI_PMGR_REMOVE_SLEEP_CONSTRAINT_CMD, &cstr, sizeof(cstr), 500);
 
 	k_mutex_lock(&g_ps_mutex, K_FOREVER);
 	g_ps.constraint_transition = false;
@@ -1630,7 +1630,7 @@ static void ps_send_param_to_ra(ra_wifi_ps_param_t p, uint32_t v)
 	}
 	{
 		erpc_wifi_ps_t ps_msg = { .param = p, .value = v };
-		(void)erpc_wifi_send_cmd(ERPC_WIFI_PS_SET_PARAM_CMD, &ps_msg, sizeof(ps_msg), -1);
+		(void)erpc_wifi_send_cmd(ERPC_WIFI_PS_SET_PARAM_CMD, &ps_msg, sizeof(ps_msg), 500);
 	}
 }
 
@@ -1693,7 +1693,7 @@ static void ps_allow_sleep_work(struct k_work *work)
 	int32_t rc =
 		(int32_t)erpc_wifi_send_cmd(
 			ERPC_WIFI_PS_APPLY_CMD,
-			NULL, 0, -1);
+			NULL, 0, 1000);
 
 	if (rc != 0) {
 		LOG_ERR("wifi_ps_apply failed rc=%d", rc);
@@ -1815,7 +1815,7 @@ int erpc_wifi_ping(uint32_t timeout_ms)
 	int64_t const deadline = k_uptime_get() + (int64_t)timeout_ms;
 
 	while (k_uptime_get() < deadline) {
-		int32_t rc = (int32_t)erpc_wifi_send_cmd(ERPC_WIFI_PS_APPLY_CMD, NULL, 0, -1);
+		int32_t rc = (int32_t)erpc_wifi_send_cmd(ERPC_WIFI_PS_APPLY_CMD, NULL, 0, 1000);
 		// int32_t rc= ra6w1_pmgr_dpm_is_enabled();
 		if (rc == 0) {
 			return 0;
@@ -2081,7 +2081,7 @@ int erpc_wifi_mgmt_iface_status(const struct device *dev, struct wifi_iface_stat
 
 				int ci_rc = erpc_wifi_send_cmd(
 					ERPC_WIFI_AP_GET_CONNECTION_INFO_CMD,
-					&ci_msg, sizeof(ci_msg), -1);
+					&ci_msg, sizeof(ci_msg), 5000);
 
 				if (ci_rc == 0) {
 					data->wifi_params_read = true;
@@ -2092,7 +2092,7 @@ int erpc_wifi_mgmt_iface_status(const struct device *dev, struct wifi_iface_stat
 			erpc_wifi_get_rssi_t rssi_msg = { .rssi = &live_rssi };
 			int rssi_rc = erpc_wifi_send_cmd(
 				ERPC_WIFI_AP_GET_RSSI_CMD,
-				&rssi_msg, sizeof(rssi_msg), -1);
+				&rssi_msg, sizeof(rssi_msg), 5000);
 
 			if (rssi_rc == 0) {
 				g_cached_iface_rssi = live_rssi;
@@ -2614,7 +2614,7 @@ static void erpc_wifi_server_event_monitor_thread(void *arg1, void *arg2, void *
 		{
 			erpc_wifi_server_evt_t evt_msg = { .event = &event };
 			(void)erpc_wifi_send_cmd(EPRC_WIFI_GET_SERVER_EVT_CMD,
-									 &evt_msg, sizeof(evt_msg), -1);
+									 &evt_msg, sizeof(evt_msg), 5000);
 		}
 		// LOG_DBG("Event monitor: erpc_get_server_event returned, event_id=%d", event.event_id); // noisy during normal no-event polling
 

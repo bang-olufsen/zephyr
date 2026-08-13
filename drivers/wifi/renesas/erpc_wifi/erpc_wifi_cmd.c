@@ -7,7 +7,7 @@
 
 LOG_MODULE_REGISTER(erpc_wifi_cmd, CONFIG_WIFI_LOG_LEVEL);
 
-#define ERPC_WIFI_MSG_MAX 12
+#define ERPC_WIFI_MSG_MAX 64
 #define MSG_TASK_STACK_SIZE 3200
 
 K_THREAD_STACK_DEFINE(msg_task_stack, MSG_TASK_STACK_SIZE);
@@ -48,7 +48,8 @@ static int alloc_cmd_msg_data(erpc_wifi_msg_data_t *msg, void *data, size_t size
 
 	msg->data = k_calloc(1, size);
 	if (!msg->data) {
-		LOG_ERR("Failed to allocate cmd: %d msg data", msg->cmd);
+		LOG_ERR("CMD ENOMEM: data allocation failed cmd=%d size=%u",
+			msg->cmd, (unsigned int)size);
 		return -ENOMEM;
 	}
 
@@ -68,14 +69,9 @@ static void free_cmd_msg_data(erpc_wifi_msg_data_t *msg)
 int erpc_wifi_send_cmd(erpc_wifi_cmd_t cmd, void *data, size_t size, int tout)
 {
 	int ret = 0;
-	int cmd_ret = 0;
 	k_timeout_t timeout = K_NO_WAIT;
-	erpc_wifi_msg_data_t msg = { .cmd = cmd, .sem = NULL, .cmd_ret = &cmd_ret };
-
-	if (tout != -1) {
-		LOG_ERR("Only K_FOREVER command mode supported");
-		return -EINVAL;
-	}
+	erpc_wifi_cmd_ctx_t *ctx = NULL;
+	erpc_wifi_msg_data_t msg = { .cmd = cmd, .ctx = NULL };
 
 	if (cmd >= ERPC_WIFI_LAST_CMD) {
 		return -ERANGE;
@@ -94,30 +90,43 @@ int erpc_wifi_send_cmd(erpc_wifi_cmd_t cmd, void *data, size_t size, int tout)
 	if (tout != 0) {
 		timeout = (tout == -1) ? K_FOREVER : K_MSEC(tout);
 
-		if ((msg.sem = k_malloc(sizeof(*msg.sem))) == NULL) {
+		ctx = k_malloc(sizeof(erpc_wifi_cmd_ctx_t));
+		if (!ctx) {
+			LOG_ERR("CMD ENOMEM: context allocation failed cmd=%d timeout=%d", cmd, tout);
 			free_cmd_msg_data(&msg);
 			return -ENOMEM;
 		}
 
-		k_sem_init(msg.sem, 0, 1);
+		atomic_set(&ctx->ref_count, 2);
+		k_sem_init(&ctx->sem, 0, 1);
+		ctx->cmd_ret = 0;
+		atomic_set(&ctx->timed_out, 0);
+
+		msg.ctx = ctx;
 	}
 
 	if (k_msgq_put(&cmd_msg_queue, &msg, K_NO_WAIT) == 0) {
+		if (ctx) {
+			if (k_sem_take(&ctx->sem, timeout) != 0) {
+				atomic_set(&ctx->timed_out, 1);
+				LOG_ERR("CMD timeout: cmd=%d timeout_ms=%d", cmd, tout);
+				ret = -ETIMEDOUT;
+			} else {
+				ret = ctx->cmd_ret;
+			}
 
-		if (msg.sem && (ret = k_sem_take(msg.sem, timeout)) != 0) {
-			ret = -ETIMEDOUT;
-		} else {
-			if (msg.cmd_ret) {
-				ret = *msg.cmd_ret;
+			if (atomic_dec(&ctx->ref_count) == 1) {
+				k_free(ctx);
 			}
 		}
-
-		if (msg.sem) {
-			k_free(msg.sem);
-		}
 	} else {
+		uint32_t used = k_msgq_num_used_get(&cmd_msg_queue);
 		free_cmd_msg_data(&msg);
-		LOG_ERR("Failed to enqueue command: %d (queue full)", cmd);
+		if (ctx) {
+			k_free(ctx);
+		}
+		LOG_ERR("CMD queue full: cmd=%d used=%u max=%u",
+			cmd, (unsigned int)used, (unsigned int)ERPC_WIFI_MSG_MAX);
 		return -EAGAIN;
 	}
 
@@ -164,53 +173,55 @@ static void erpc_wifi_msg_handler_task(void *arg1, void *arg2, void *arg3)
 			continue;
 		}
 
-		/* Dispatch to registered handler */
-		if (msg.cmd < ERPC_WIFI_LAST_CMD &&
-		    erpc_wifi_socket_handlers[msg.cmd].h) {
-
-			bool server_evt_query =
-				(msg.cmd == EPRC_WIFI_GET_SERVER_EVT_CMD);
-
-			if (server_evt_query) {
-				erpc_wifi_offload_server_evt_query_begin();
-			}
-
-			/*
-			 * Every handler below represents a host-initiated eRPC
-			 * transaction.
-			 *
-			 * Any SRDY edge generated while it executes belongs to
-			 * that transaction and must not become a DPM wake event.
-			 */
-			erpc_wifi_offload_host_erpc_begin();
-
-			int ret =
-				erpc_wifi_socket_handlers[msg.cmd].h(msg.data);
-
-			erpc_wifi_offload_host_erpc_end();
-
-			if (server_evt_query) {
-				erpc_wifi_offload_server_evt_query_end();
-			}
-
-			/* Store result for caller */
-			if (msg.cmd_ret) {
-				*msg.cmd_ret = ret;
-			}
-
-		} else {
-			LOG_ERR("No handler registered for command %d", msg.cmd);
-			if (msg.cmd_ret) {
-				*msg.cmd_ret = -ENOENT;
-			}
+		bool timed_out = false;
+		if (msg.ctx && atomic_get(&msg.ctx->timed_out) != 0) {
+			timed_out = true;
 		}
 
-		/* Free allocated message data */
+		if (!timed_out) {
+			if (msg.cmd < ERPC_WIFI_LAST_CMD && erpc_wifi_socket_handlers[msg.cmd].h) {
+				bool server_evt_query =
+					(msg.cmd == EPRC_WIFI_GET_SERVER_EVT_CMD);
+
+				if (server_evt_query) {
+					erpc_wifi_offload_server_evt_query_begin();
+				}
+
+				/*
+				 * Preserve the low-latency SRDY ownership rule: every handler is a
+				 * host-initiated eRPC transaction, so response SRDY must not be
+				 * classified as an autonomous DPM wake.
+				 */
+				erpc_wifi_offload_host_erpc_begin();
+				int ret = erpc_wifi_socket_handlers[msg.cmd].h(msg.data);
+				erpc_wifi_offload_host_erpc_end();
+
+				if (server_evt_query) {
+					erpc_wifi_offload_server_evt_query_end();
+				}
+
+				if (msg.ctx) {
+					msg.ctx->cmd_ret = ret;
+				}
+			} else {
+				LOG_ERR("No handler registered for command %d", msg.cmd);
+				if (msg.ctx) {
+					msg.ctx->cmd_ret = -ENOENT;
+				}
+			}
+		} else {
+			LOG_WRN("Command %d timed out by caller; skipping execution", msg.cmd);
+		}
+
 		free_cmd_msg_data(&msg);
 
-		/* Signal completion if semaphore present */
-		if (msg.sem) {
-			k_sem_give(msg.sem);
+		if (msg.ctx) {
+			if (!timed_out) {
+				k_sem_give(&msg.ctx->sem);
+			}
+			if (atomic_dec(&msg.ctx->ref_count) == 1) {
+				k_free(msg.ctx);
+			}
 		}
 	}
 }
