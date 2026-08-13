@@ -73,6 +73,18 @@ static bool event_monitor_running = false;
 // TODO can this be static?
 struct erpc_wifi_data erpc_wifi_driver_data;
 
+/*
+ * wifi_iface_status() may be called concurrently by diagnostics and
+ * application telemetry.  Keep a cached status and serialize the query.
+ *
+ * IMPORTANT: status/telemetry must not wake RA6W1 just to read RSSI.
+ * When DPM is enabled and the module is asleep, return the last valid
+ * values instead of injecting another PMGR/eRPC wake sequence.
+ */
+static K_MUTEX_DEFINE(g_iface_status_mutex);
+static int8_t g_cached_iface_rssi = -127;
+static WIFIConnectionInfo_t g_cached_connection_info;
+
 /* RA6W1 PMGR constraint bit masks (rm_pmgr_w_api.h) */
 #ifndef PMGR_CONSTRAINT_SLEEP_PROHIBITED
 #define PMGR_CONSTRAINT_SLEEP_PROHIBITED (1U << 0)
@@ -973,25 +985,51 @@ void erpc_wifi_ps_wait_awake_tx(void)
 	bool enabled = g_ps.enabled;
 	k_mutex_unlock(&g_ps_mutex);
 
-	if (enabled) {
-		/* If the module is in transition (waking up or going to sleep), wait for transition to finish */
-		while (1) {
-			k_mutex_lock(&g_ps_mutex, K_FOREVER);
-			bool transitioning = (g_ps_state == ERPC_WIFI_PS_STATE_WAKING_UP || g_ps_state == ERPC_WIFI_PS_STATE_GOING_TO_SLEEP);
-			k_mutex_unlock(&g_ps_mutex);
-			if (!transitioning) {
-				break;
-			}
-			k_msleep(10);
-		}
-		
-		k_mutex_lock(&g_ps_mutex, K_FOREVER);
-		/* If the module is asleep, transition it to WAKING_UP to lock the bus */
-		if (g_ps_state == ERPC_WIFI_PS_STATE_ASLEEP) {
-			erpc_wifi_ps_set_state(ERPC_WIFI_PS_STATE_WAKING_UP);
-		}
-		k_mutex_unlock(&g_ps_mutex);
+	if (!enabled) {
+		return;
 	}
+
+	/*
+	 * Do not let one application thread (MQTT publish/DNS/etc.) block
+	 * forever if the host-side PS state is temporarily left in WAKING_UP
+	 * or GOING_TO_SLEEP.
+	 *
+	 * This is deliberately NOT a forced state recovery: after the bounded
+	 * wait, erpc_wifi_ensure_awake_tx() re-checks physical SRDY and performs
+	 * the normal wake/hold sequence.  That keeps the known-good DPM state
+	 * machine intact while preventing a permanently stuck publisher thread.
+	 */
+	int64_t start = k_uptime_get();
+
+	while (1) {
+		k_mutex_lock(&g_ps_mutex, K_FOREVER);
+		bool transitioning =
+			(g_ps_state == ERPC_WIFI_PS_STATE_WAKING_UP ||
+			 g_ps_state == ERPC_WIFI_PS_STATE_GOING_TO_SLEEP);
+		k_mutex_unlock(&g_ps_mutex);
+
+		if (!transitioning) {
+			break;
+		}
+
+		if ((k_uptime_get() - start) >=
+		    (int64_t)ERPC_WIFI_PS_DISABLE_WAKE_TIMEOUT_MS) {
+			LOG_WRN("PS TX transition wait exceeded %u ms; re-checking via normal TX wake path",
+				ERPC_WIFI_PS_DISABLE_WAKE_TIMEOUT_MS);
+			break;
+		}
+
+		k_msleep(10);
+	}
+
+	k_mutex_lock(&g_ps_mutex, K_FOREVER);
+
+	/* If settled ASLEEP, reserve the host state for this TX wake. */
+	if (g_ps_state == ERPC_WIFI_PS_STATE_ASLEEP) {
+		erpc_wifi_ps_set_state(ERPC_WIFI_PS_STATE_WAKING_UP);
+	}
+
+	k_mutex_unlock(&g_ps_mutex);
 }
 
 void erpc_wifi_ps_wait_awake_rx(void)
@@ -1034,10 +1072,13 @@ static void ps_entry_guard_work(struct k_work *work)
 {
 	ARG_UNUSED(work);
 
+	/*
+	 * wait_for_srdy_low is only a short sleep-entry quiet-window latch.
+	 * A concurrent valid wake can change allow_sleep_sent before this work
+	 * runs, so the latch must not depend on allow_sleep_sent still being true.
+	 */
 	k_mutex_lock(&g_ps_mutex, K_FOREVER);
-	if (g_ps.enabled && g_ps.allow_sleep_sent) {
-		g_ps.wait_for_srdy_low = false;
-	}
+	g_ps.wait_for_srdy_low = false;
 	k_mutex_unlock(&g_ps_mutex);
 }
 
@@ -1991,56 +2032,90 @@ static int erpc_wifi_mgmt_set_power_save(struct net_if *iface,
 int erpc_wifi_mgmt_iface_status(const struct device *dev, struct wifi_iface_status *status)
 {
 	struct erpc_wifi_data *data = dev->data;
-
-	static WIFIConnectionInfo_t connection_info = { 0 };
-	int8_t rssi = -127;
 	int ret = 0;
 
+	k_mutex_lock(&g_iface_status_mutex, K_FOREVER);
+
 	status->state = data->state;
-	
 	status->channel = data->drv_nwk_params.ucChannel;
-	
 	status->band = wifi_chan_to_band(data->drv_nwk_params.ucChannel);
+	status->rssi = (int)g_cached_iface_rssi;
 
-	switch  (status->state) {
- 	case WIFI_STATE_DISCONNECTED:
- 		data->wifi_params_read = false;
- 		break;
- 	case WIFI_STATE_COMPLETED:
- 		if (!data->wifi_params_read) {
- 
- 			status->ssid_len = data->drv_nwk_params.ucSSIDLength;
- 			memcpy(status->ssid, data->drv_nwk_params.ucSSID, status->ssid_len);
- 			status->security = drv_to_wifi_mgmt_sec(data->drv_nwk_params.xSecurity);
- 
- 			{
- 				erpc_wifi_get_connection_info_t ci_msg = { .connection_info = &connection_info };
- 				memset(&connection_info, 0, sizeof(connection_info));
- 				data->wifi_params_read = (erpc_wifi_send_cmd(ERPC_WIFI_AP_GET_CONNECTION_INFO_CMD,
- 														 &ci_msg, sizeof(ci_msg), -1) == 0);
- 			}
- 
- 			memcpy(status->bssid, connection_info.ucBSSID, sizeof(connection_info.ucBSSID));
- 		}
- 
- 		{
- 			erpc_wifi_get_rssi_t rssi_msg = { .rssi = &rssi };
- 			(void)erpc_wifi_send_cmd(ERPC_WIFI_AP_GET_RSSI_CMD, &rssi_msg, sizeof(rssi_msg), -1);
- 		}
- 
- 		break;
- 	case WIFI_STATE_AUTHENTICATING:
- 		LOG_DBG("Device connect in progress...");
- 		break;
- 	default:
- 		LOG_DBG("Device state: %d", status->state);
- 		break;
- 	}
- 
- 	status->rssi = (int) rssi;
- 
- 	return ret;
+	switch (status->state) {
+	case WIFI_STATE_DISCONNECTED:
+		data->wifi_params_read = false;
+		g_cached_iface_rssi = -127;
+		memset(&g_cached_connection_info, 0, sizeof(g_cached_connection_info));
+		break;
 
+	case WIFI_STATE_COMPLETED: {
+		status->ssid_len = data->drv_nwk_params.ucSSIDLength;
+		memcpy(status->ssid, data->drv_nwk_params.ucSSID, status->ssid_len);
+		status->security = drv_to_wifi_mgmt_sec(data->drv_nwk_params.xSecurity);
+
+		/*
+		 * Telemetry/status is not data-plane traffic.  Do not wake RA6W1
+		 * solely to refresh RSSI/BSSID while it is in DPM sleep.
+		 *
+		 * Query live values only when eRPC is already safe to use:
+		 *  - PS disabled, or
+		 *  - host state is AWAKE and physical SRDY is asserted.
+		 *
+		 * Otherwise return the last valid cached values.  This prevents
+		 * HOST DIAG / publish telemetry from generating eRPC failures or
+		 * perturbing the DPM state machine.
+		 */
+		bool live_query_ok =
+			!erpc_wifi_ps_is_enabled() ||
+			(erpc_wifi_ps_is_module_awake() &&
+			 erpc_wifi_transport_slave_ready());
+
+		if (live_query_ok) {
+			if (!data->wifi_params_read) {
+				erpc_wifi_get_connection_info_t ci_msg = {
+					.connection_info = &g_cached_connection_info
+				};
+
+				memset(&g_cached_connection_info, 0,
+				       sizeof(g_cached_connection_info));
+
+				int ci_rc = erpc_wifi_send_cmd(
+					ERPC_WIFI_AP_GET_CONNECTION_INFO_CMD,
+					&ci_msg, sizeof(ci_msg), -1);
+
+				if (ci_rc == 0) {
+					data->wifi_params_read = true;
+				}
+			}
+
+			int8_t live_rssi = g_cached_iface_rssi;
+			erpc_wifi_get_rssi_t rssi_msg = { .rssi = &live_rssi };
+			int rssi_rc = erpc_wifi_send_cmd(
+				ERPC_WIFI_AP_GET_RSSI_CMD,
+				&rssi_msg, sizeof(rssi_msg), -1);
+
+			if (rssi_rc == 0) {
+				g_cached_iface_rssi = live_rssi;
+			}
+		}
+
+		memcpy(status->bssid, g_cached_connection_info.ucBSSID,
+		       sizeof(g_cached_connection_info.ucBSSID));
+		status->rssi = (int)g_cached_iface_rssi;
+		break;
+	}
+
+	case WIFI_STATE_AUTHENTICATING:
+		LOG_DBG("Device connect in progress...");
+		break;
+
+	default:
+		LOG_DBG("Device state: %d", status->state);
+		break;
+	}
+
+	k_mutex_unlock(&g_iface_status_mutex);
+	return ret;
 }
 
 int erpc_wifi_mgmt_get_version(const struct device *dev, struct wifi_version *params)

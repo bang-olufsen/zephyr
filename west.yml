@@ -157,7 +157,7 @@ manifest:
 
     - name: erpc
       url: https://github.com/Renesas-US-Connectivity/erpc.git
-      revision: ebc3ef82ff4938eaa4938c295e1e41e05d22052f
+      revision: 00693d70dd4d382820a5c978399576e16a77c7b6
       path: modules/lib/erpc
 
     - name: erpc_wifi_service
