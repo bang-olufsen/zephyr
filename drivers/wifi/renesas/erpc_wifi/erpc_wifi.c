@@ -1039,8 +1039,11 @@ void erpc_wifi_ps_wait_awake_rx(void)
 	k_mutex_unlock(&g_ps_mutex);
 
 	if (enabled) {
-		/* If the module is not AWAKE, block until it is AWAKE */
-		(void)k_event_wait(&erpc_ps_event, ERPC_PS_EVENT_AWAKE, false, K_FOREVER);
+		/* If the module is not AWAKE, wait up to 500ms bounded timeout */
+		uint32_t events = k_event_wait(&erpc_ps_event, ERPC_PS_EVENT_AWAKE, false, K_MSEC(500));
+		if (events == 0) {
+			LOG_WRN("PS wait_awake_rx: 500ms timeout expired waiting for AWAKE");
+		}
 	}
 }
 

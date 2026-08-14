@@ -601,6 +601,7 @@ static void erpc_wifi_srdy_deferred_work(struct k_work *work)
 	/*
 	 * Do one socket-event recovery pass for the deferred SRDY event.
 	 */
+	LOG_INF("SRDY deferred work: executing poll task recovery kick");
 	k_sem_give(&poll_task_sem);
 }
 
@@ -926,6 +927,11 @@ static void erpc_wifi_socket_poll_task(void *arg1, void *arg2, void *arg3)
 			uint32_t all_events = events & (SOCKET_EVENT_RX | SOCKET_EVENT_TX | SOCKET_EVENT_ERR | SOCKET_EVENT_CLOSE);
 			sock->triggered_events |= (short)all_events;
 
+			if (events != 0 && events != UINT32_MAX) {
+				LOG_INF("poll_task: fd=%d events=0x%04x (all_events=0x%04x, waiting=%d)",
+					sock->fd, events, all_events, sock->waiting);
+			}
+
 			if (sock->connect_pending) {
 				if (events & SOCKET_EVENT_TX) {
 					sock->connect_pending = false;
@@ -942,16 +948,7 @@ static void erpc_wifi_socket_poll_task(void *arg1, void *arg2, void *arg3)
 				}
 			}
 
-			uint32_t requested_mask = 0;
-			if (sock->poll_events & ZVFS_POLLIN) {
-				requested_mask |= SOCKET_EVENT_RX;
-			}
-			if (sock->poll_events & ZVFS_POLLOUT) {
-				requested_mask |= SOCKET_EVENT_TX;
-			}
-			requested_mask |= SOCKET_EVENT_ERR | SOCKET_EVENT_CLOSE;
-
-			uint32_t ready = sock->triggered_events & requested_mask;
+			uint32_t ready = sock->triggered_events & (SOCKET_EVENT_RX | SOCKET_EVENT_TX | SOCKET_EVENT_ERR | SOCKET_EVENT_CLOSE);
 			bool do_signal = false;
 
 			if (sock->waiting && ready != 0) {
@@ -962,7 +959,7 @@ static void erpc_wifi_socket_poll_task(void *arg1, void *arg2, void *arg3)
 
 			if (notify_connected) {
 				erpc_wifi_ps_notify_socket_connected();
-				LOG_DBG("Non-blocking connect completed for fd %d", log_connected_fd);
+				LOG_INF("Non-blocking connect completed for fd %d", log_connected_fd);
 			}
 			if (notify_failed) {
 				erpc_wifi_ps_notify_socket_connect_failed();
@@ -970,6 +967,7 @@ static void erpc_wifi_socket_poll_task(void *arg1, void *arg2, void *arg3)
 			}
 
 			if (do_signal) {
+				LOG_INF("poll_task: raising poll_signal for fd=%d (ready=0x%04x)", sock->fd, ready);
 				k_poll_signal_raise(&sock->poll_signal, (int)ready);
 			}
 		}
