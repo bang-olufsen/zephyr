@@ -596,15 +596,15 @@ static void erpc_wifi_srdy_deferred_work(struct k_work *work)
 		return;
 	}
 
-	/*
-	 * The host eRPC has completed.
-	 * If SRDY is still asserted, RA still has genuine
-	 * asynchronous work pending.
-	 */
 	if (erpc_wifi_transport_slave_ready()) {
 		atomic_set(&g_srdy_irq_pending, 1);
-		k_sem_give(&poll_task_sem);
 	}
+
+	/*
+	 * Even if SRDY already fell, do one socket-event recovery pass.
+	 * This is NOT treated as autonomous wake unless SRDY is actually high.
+	 */
+	k_sem_give(&poll_task_sem);
 }
 
 void erpc_wifi_offload_server_evt_query_begin(void)
@@ -655,7 +655,7 @@ static void erpc_wifi_socket_poll_task(void *arg1, void *arg2, void *arg3)
 				continue;
 			}
 
-			if (sockets[i].waiting) {
+			if (sockets[i].waiting || sockets[i].connect_pending) {
 				waiter_polling_needed = true;
 			}
 
@@ -775,7 +775,7 @@ static void erpc_wifi_socket_poll_task(void *arg1, void *arg2, void *arg3)
 				continue;
 			}
 
-			bool waiter_probe = sock->waiting;
+			bool waiter_probe = sock->waiting || sock->connect_pending;
 
 			/*
 			 * One real autonomous wake may belong to ANY filtered
@@ -784,7 +784,7 @@ static void erpc_wifi_socket_poll_task(void *arg1, void *arg2, void *arg3)
 			bool dpm_event_probe =
 				autonomous_pass &&
 				sock->type == SOCK_STREAM &&
-				sock->tcp_dpm_filter_set;
+				(sock->tcp_dpm_filter_set || sock->connect_pending);
 
 			/*
 			 * Restore the customer-stable missed-edge fallback: on the 500 ms
@@ -794,7 +794,7 @@ static void erpc_wifi_socket_poll_task(void *arg1, void *arg2, void *arg3)
 			 */
 			bool filtered_tcp =
 				sock->type == SOCK_STREAM &&
-				sock->tcp_dpm_filter_set;
+				(sock->tcp_dpm_filter_set || sock->connect_pending);
 
 			/*
 			 * Match the customer-stable scanner more closely:
@@ -837,7 +837,7 @@ static void erpc_wifi_socket_poll_task(void *arg1, void *arg2, void *arg3)
 			if (!srdy && !dpm_event_probe) {
 				bool pollout_probe =
 					waiter_probe &&
-					(sock->poll_events & ZVFS_POLLOUT);
+					((sock->poll_events & ZVFS_POLLOUT) || sock->connect_pending);
 
 				bool irq_wait_probe =
 					waiter_probe && srdy_irq;
@@ -1460,6 +1460,97 @@ static int erpc_wifi_socket_connect(void *obj, const struct sockaddr *addr, sock
 		sock->socket_error = 0;
 		k_spin_unlock(&sock->state_lock, key);
 		LOG_INF("Non-blocking connect in progress for fd %d", sock->fd);
+
+		if ((sock->flags & O_NONBLOCK) == 0) {
+			/* Blocking connect mode: wait for connect_pending to be cleared by poll_task or SO_ERROR fallback */
+			int32_t timeout_ms = sock->send_timeout_ms == 0 ? 10000 : sock->send_timeout_ms;
+			int64_t start_ms = k_uptime_get();
+
+			while (1) {
+				k_spinlock_key_t s_key = k_spin_lock(&sock->state_lock);
+				if (!sock->connect_pending) {
+					if (sock->connected) {
+						ret = 0;
+					} else {
+						ret = sock->socket_error != 0 ? -sock->socket_error : -ECONNREFUSED;
+					}
+					k_spin_unlock(&sock->state_lock, s_key);
+					break;
+				}
+
+				sock->waiting = true;
+				sock->poll_events = ZVFS_POLLOUT;
+				k_poll_signal_reset(&sock->poll_signal);
+				k_spin_unlock(&sock->state_lock, s_key);
+
+				k_sem_give(&poll_task_sem);
+
+				int32_t elapsed_ms = (int32_t)(k_uptime_get() - start_ms);
+				if (timeout_ms > 0 && elapsed_ms >= timeout_ms) {
+					s_key = k_spin_lock(&sock->state_lock);
+					sock->connect_pending = false;
+					sock->connected = false;
+					sock->socket_error = ETIMEDOUT;
+					k_spin_unlock(&sock->state_lock, s_key);
+
+					LOG_WRN("connect wait timeout: fd=%d elapsed=%dms", sock->fd, elapsed_ms);
+
+					ret = -ETIMEDOUT;
+					erpc_wifi_ps_notify_socket_connect_failed();
+					break;
+				}
+
+				int32_t wait_ms = timeout_ms > 0 ? (timeout_ms - elapsed_ms) : 500;
+				if (wait_ms > 500) {
+					wait_ms = 500;
+				}
+
+				struct k_poll_event event;
+				k_poll_event_init(&event, K_POLL_TYPE_SIGNAL, K_POLL_MODE_NOTIFY_ONLY, &sock->poll_signal);
+				int poll_ret = k_poll(&event, 1, K_MSEC(wait_ms));
+
+				s_key = k_spin_lock(&sock->state_lock);
+				sock->waiting = false;
+				k_spin_unlock(&sock->state_lock, s_key);
+
+				/* Reconcile state via SO_ERROR fallback if poll timed out or completed */
+				if (poll_ret == -EAGAIN || poll_ret == 0) {
+					int remote_error = 0;
+					socklen_t remote_len = sizeof(remote_error);
+					erpc_wifi_msg_sockgetopt_t go_msg = {
+						.fd = sock->fd,
+						.level = ERPC_WIFI_SOL_SOCKET,
+						.optname = ERPC_WIFI_SO_ERROR,
+						.optval = (uint32_t *)&remote_error,
+						.optlen = &remote_len,
+					};
+					int so_rc = erpc_wifi_send_cmd(ERPC_WIFI_SOCKET_GETOPT_CMD,
+									      &go_msg,
+									      sizeof(go_msg),
+									      -1);
+
+					if (so_rc == 0) {
+						s_key = k_spin_lock(&sock->state_lock);
+						if (remote_error == 0) {
+							sock->connect_pending = false;
+							sock->connected = true;
+							sock->socket_error = 0;
+						} else if (remote_error != EINPROGRESS && remote_error != EALREADY) {
+							sock->connect_pending = false;
+							sock->connected = false;
+							sock->socket_error = remote_error;
+						}
+						k_spin_unlock(&sock->state_lock, s_key);
+
+						if (remote_error == 0) {
+							LOG_INF("connect fallback: fd=%d completed via SO_ERROR", sock->fd);
+						} else if (remote_error != EINPROGRESS && remote_error != EALREADY) {
+							LOG_WRN("connect fallback: fd=%d failed via SO_ERROR=%d", sock->fd, remote_error);
+						}
+					}
+				}
+			}
+		}
 	} else {
 		sock->connected = false;
 		sock->connect_pending = false;
@@ -2489,18 +2580,20 @@ static int erpc_wifi_socket_close(void *obj)
 	bool ram_held = false;
 	int __w = erpc_wifi_ensure_awake_tx(ERPC_PMGR_JOB_ID_SEND, &ram_held);
 	if (__w != 0) {
-		LOG_INF("erpc_wifi_ensure_awake_tx failed: IN %s = %d", __func__, __w);
+		LOG_WRN("erpc_wifi_ensure_awake_tx warning in %s: %d (proceeding with best-effort close)", __func__, __w);
+	}
+
+	int ret = 0;
+	struct erpc_wifi_socket *sock = (struct erpc_wifi_socket *)obj;
+
+	if (!sock) {
 		if (ram_held) {
 			(void)erpc_wifi_pmgr_ram_release(ERPC_PMGR_JOB_ID_SEND);
 		}
-		errno = -__w;
-		return -1;
+		return 0;
 	}
 
-	int ret;
-	struct erpc_wifi_socket *sock = (struct erpc_wifi_socket *)obj;
-
-	LOG_DBG("erpc_wifi_socket_close");
+	LOG_DBG("erpc_wifi_socket_close fd=%d zfd=%d", sock->fd, sock->zfd);
 
 	if (sock->type == SOCK_DGRAM) {
 		LOG_INF("UDP socket closed");
@@ -2541,10 +2634,12 @@ static int erpc_wifi_socket_close(void *obj)
 		LOG_INF("TCP DPM wake filter removed for port %u (via queue)", sock->bound_port);
 	}
 
-	/* Use message queue for FIFO-serialized socket close operation */
-	int remote_fd = sock->fd;
-	ret = erpc_wifi_send_cmd(ERPC_WIFI_SOCKET_CLOSE_CMD, &sock->fd, sizeof(sock->fd), -1);
-	LOG_INF("Remote socket close fd=%d rc=%d", remote_fd, ret);
+	/* Always attempt to close remote FD on RA6W1 to prevent socket leak */
+	if (sock->fd >= 0) {
+		int remote_fd = sock->fd;
+		ret = erpc_wifi_send_cmd(ERPC_WIFI_SOCKET_CLOSE_CMD, &sock->fd, sizeof(sock->fd), -1);
+		LOG_INF("Remote socket close fd=%d rc=%d", remote_fd, ret);
+	}
 
 	/* Invalidate active TCP job cache unconditionally for closing TCP socket with valid bound port */
 	if (sock->type == SOCK_STREAM && sock->bound_port != 0) {
@@ -2561,12 +2656,8 @@ static int erpc_wifi_socket_close(void *obj)
 		k_mutex_unlock(sock->lock);
 	}
 
+	/* Unconditionally free driver socket state so slot is reusable */
 	erpc_wifi_socket_free(sock);
-
-	if (ret < 0) {
-		errno = -ret;
-		return -1;
-	}
 
 	return 0;
 }
@@ -3192,22 +3283,27 @@ static bool erpc_wifi_socket_is_supported(int family, int type, int proto)
 void erpc_wifi_offload_srdy_callback(void)
 {
 	/*
-	 * During host eRPC this may be the normal response SRDY,
-	 * but it may also overlap a real incoming socket event.
-	 * Defer classification instead of dropping the edge.
-	 */
-	if (atomic_get(&g_host_erpc_inflight) != 0) {
-		atomic_set(&g_srdy_deferred, 1);
-		return;
-	}
-
-	/*
 	 * If the host explicitly pulsed WAKE for a TX operation, this rising
 	 * edge belongs to that host wake handshake (RA reports TIM:FAST).
 	 * erpc_wifi_ensure_awake_tx() is polling the physical level directly,
 	 * so the autonomous socket poll task must not consume this edge.
 	 */
 	if (atomic_get(&g_host_wake_inflight) != 0) {
+		return;
+	}
+
+	/*
+	 * During host eRPC this may be the normal response SRDY,
+	 * but it may also overlap a real incoming socket event.
+	 * Defer classification instead of dropping the edge.
+	 * Do not defer responses generated by GET_SOCKET_EVT or GET_SERVER_EVT itself,
+	 * otherwise the poll task can self-trigger forever.
+	 */
+	if (atomic_get(&g_host_erpc_inflight) != 0) {
+		if (atomic_get(&g_socket_evt_query_inflight) == 0 &&
+		    atomic_get(&g_server_evt_query_inflight) == 0) {
+			atomic_set(&g_srdy_deferred, 1);
+		}
 		return;
 	}
 
