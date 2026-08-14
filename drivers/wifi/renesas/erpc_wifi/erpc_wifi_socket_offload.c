@@ -596,13 +596,10 @@ static void erpc_wifi_srdy_deferred_work(struct k_work *work)
 		return;
 	}
 
-	if (erpc_wifi_transport_slave_ready()) {
-		atomic_set(&g_srdy_irq_pending, 1);
-	}
+	atomic_set(&g_srdy_irq_pending, 1);
 
 	/*
-	 * Even if SRDY already fell, do one socket-event recovery pass.
-	 * This is NOT treated as autonomous wake unless SRDY is actually high.
+	 * Do one socket-event recovery pass for the deferred SRDY event.
 	 */
 	k_sem_give(&poll_task_sem);
 }
@@ -806,10 +803,9 @@ static void erpc_wifi_socket_poll_task(void *arg1, void *arg2, void *arg3)
 			 *   happens to have an active waiter.
 			 */
 			bool awake_irq_probe =
-				ps_enabled &&
 				srdy_irq &&
 				!module_asleep &&
-				filtered_tcp;
+				(sock->type == SOCK_STREAM);
 
 			bool awake_fallback_probe =
 				ps_enabled &&
