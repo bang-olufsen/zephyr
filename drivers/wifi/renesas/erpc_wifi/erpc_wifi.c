@@ -1082,7 +1082,7 @@ static void ps_entry_guard_work(struct k_work *work)
 	k_mutex_unlock(&g_ps_mutex);
 }
 
-#define ERPC_WIFI_PS_DEFAULT_TIMEOUT_MS 5000U
+#define ERPC_WIFI_PS_DEFAULT_TIMEOUT_MS 3000U
 #define ERPC_WIFI_PS_DEFAULT_LISTEN_INTERVAL 10U
 
 static bool erpc_wifi_ps_ip_ready(void)
@@ -2614,7 +2614,7 @@ static void erpc_wifi_server_event_monitor_thread(void *arg1, void *arg2, void *
 		{
 			erpc_wifi_server_evt_t evt_msg = { .event = &event };
 			(void)erpc_wifi_send_cmd(EPRC_WIFI_GET_SERVER_EVT_CMD,
-									 &evt_msg, sizeof(evt_msg), 5000);
+									 &evt_msg, sizeof(evt_msg), -1);
 		}
 		// LOG_DBG("Event monitor: erpc_get_server_event returned, event_id=%d", event.event_id); // noisy during normal no-event polling
 
