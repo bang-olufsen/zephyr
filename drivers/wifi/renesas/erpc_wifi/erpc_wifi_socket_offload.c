@@ -2384,12 +2384,24 @@ static int erpc_wifi_socket_getsockopt(void *obj, int level, int optname, void *
 {
 	struct erpc_wifi_socket *sock = (struct erpc_wifi_socket *)obj;
 
+	if (!sock) {
+		errno = EINVAL;
+		return -1;
+	}
+
 	bool ram_held = false;
 	int __w = erpc_wifi_ensure_awake_tx(ERPC_PMGR_JOB_ID_SEND, &ram_held);
 	if (__w != 0) {
-		LOG_INF("erpc_wifi_ensure_awake_tx failed: IN %s = %d", __func__,__w);
+		LOG_WRN("erpc_wifi_ensure_awake_tx warning in %s: %d", __func__, __w);
 		if (ram_held) {
 			(void)erpc_wifi_pmgr_ram_release(0);
+		}
+		if (level == SOL_SOCKET && optname == SO_ERROR) {
+			if (optval != NULL && optlen != NULL && *optlen >= sizeof(int)) {
+				*(int *)optval = sock->socket_error;
+				*optlen = sizeof(int);
+				return 0;
+			}
 		}
 		errno = -__w;
 		return -1;
