@@ -482,6 +482,16 @@ static int erpc_wifi_poll_hup_on_iface_down(struct zvfs_pollfd *fds, int nfds)
 #define SOCKET_EVENT_ERR   0x04 // POLLERR - Error condition
 #define SOCKET_EVENT_CLOSE 0x08 // POLLHUP - Connection closed
 
+/*
+ * Short request/response grace after a successful TCP write.
+ *
+ * This replaces the rejected unlimited 50 ms blocking-recv polling.
+ * The customer's 200 ms HTTP workaround proved that only a short gap
+ * needs to be bridged.  500 ms gives margin without allowing an idle
+ * MQTT/DPM receive to continuously drive eRPC traffic.
+ */
+#define ERPC_WIFI_TCP_RESPONSE_GRACE_MS 500U
+
 #if 0
 struct erpc_wifi_socket {
     int fd;          // remote FD
@@ -538,6 +548,8 @@ struct erpc_wifi_socket {
 	uint32_t flags;          /* O_NONBLOCK etc */
 	uint16_t bound_port;     // Local port from bind() (host order)
 	bool tcp_dpm_filter_set; // true if TCP DPM wake filter installed
+	/* End of short response-progress window after a successful TCP write. */
+	int64_t tcp_response_grace_until_ms;
 	uint32_t recv_timeout_ms;
 	uint32_t send_timeout_ms;
 	bool closing;            // true if close() is in progress
@@ -948,7 +960,58 @@ static void erpc_wifi_socket_poll_task(void *arg1, void *arg2, void *arg3)
 				}
 			}
 
-			uint32_t ready = sock->triggered_events & (SOCKET_EVENT_RX | SOCKET_EVENT_TX | SOCKET_EVENT_ERR | SOCKET_EVENT_CLOSE);
+			/*
+			 * Event policy is intentionally split:
+			 *   - UDP/DNS always honors the requested poll mask.
+			 *   - TCP before PS (and while connect is pending) preserves the
+			 *     customer-working legacy TX/RX progress-kick behavior.
+			 *   - Established TCP in PS/DPM honors the requested mask so a stale
+			 *     TX-only indication cannot repeatedly wake a POLLIN receive waiter.
+			 */
+			uint32_t ready;
+			if (sock->type == SOCK_DGRAM) {
+				/*
+				 * UDP / Zephyr DNS: strict requested-event semantics.
+				 * A POLLIN-only DNS waiter must never be released by TX-only.
+				 */
+				uint32_t requested_mask = SOCKET_EVENT_ERR | SOCKET_EVENT_CLOSE;
+				if (sock->poll_events & ZVFS_POLLIN) {
+					requested_mask |= SOCKET_EVENT_RX;
+				}
+				if (sock->poll_events & ZVFS_POLLOUT) {
+					requested_mask |= SOCKET_EVENT_TX;
+				}
+				ready = sock->triggered_events & requested_mask;
+			} else if (sock->type == SOCK_STREAM &&
+				   erpc_wifi_ps_is_enabled() &&
+				   sock->connected && !sock->connect_pending &&
+				   k_uptime_get() >= sock->tcp_response_grace_until_ms) {
+				/*
+				 * Established TCP while PS/DPM is enabled:
+				 * honor the events the waiter actually requested.  In particular,
+				 * do not release an MQTT POLLIN waiter for a persistent TX-only
+				 * indication; doing so makes recv() enter wait_awake_rx() while the
+				 * RA6W1 is sleeping and produces repeated 500 ms timeout churn.
+				 * ERR/CLOSE are always delivered.
+				 */
+				uint32_t requested_mask = SOCKET_EVENT_ERR | SOCKET_EVENT_CLOSE;
+				if (sock->poll_events & ZVFS_POLLIN) {
+					requested_mask |= SOCKET_EVENT_RX;
+				}
+				if (sock->poll_events & ZVFS_POLLOUT) {
+					requested_mask |= SOCKET_EVENT_TX;
+				}
+				ready = sock->triggered_events & requested_mask;
+			} else {
+				/*
+				 * PS disabled, or TCP connect still in progress:
+				 * preserve the exact customer-working low-latency TCP semantics.
+				 * TX can act as the existing connection/progress recovery kick.
+				 */
+				ready = sock->triggered_events &
+					(SOCKET_EVENT_RX | SOCKET_EVENT_TX |
+					 SOCKET_EVENT_ERR | SOCKET_EVENT_CLOSE);
+			}
 			bool do_signal = false;
 
 			if (sock->waiting && ready != 0) {
@@ -2000,6 +2063,13 @@ static ssize_t erpc_wifi_socket_sendto(void *obj, const void *buf, size_t len, i
 		return -1;
 	}
 
+	if (sock->type == SOCK_STREAM && ret > 0) {
+		k_spinlock_key_t tx_key = k_spin_lock(&sock->state_lock);
+		sock->tcp_response_grace_until_ms =
+			k_uptime_get() + (int64_t)ERPC_WIFI_TCP_RESPONSE_GRACE_MS;
+		k_spin_unlock(&sock->state_lock, tx_key);
+	}
+
 	if (ram_held) {
 		(void)erpc_wifi_pmgr_ram_release(ERPC_PMGR_JOB_ID_SEND);
 	}
@@ -2047,6 +2117,13 @@ ssize_t erpc_wifi_socket_sendmsg(void *obj, const struct msghdr *msg, int flags)
 			if (ret < msg->msg_iov[i].iov_len) {
 				break;
 			}
+		}
+
+		if (sock->type == SOCK_STREAM && len > 0) {
+			k_spinlock_key_t tx_key = k_spin_lock(&sock->state_lock);
+			sock->tcp_response_grace_until_ms =
+				k_uptime_get() + (int64_t)ERPC_WIFI_TCP_RESPONSE_GRACE_MS;
+			k_spin_unlock(&sock->state_lock, tx_key);
 		}
 
 		if (ram_held) {
@@ -2100,7 +2177,86 @@ static ssize_t erpc_wifi_socket_recvfrom(void *obj, void *buf, size_t max_len, i
 	bool recv_ps_hold_started = false;
 	bool recv_wait_sleep_armed = false;
 
+	/*
+	 * Short receive polling is only a recovery for a stale TCP RX indication:
+	 * Zephyr observed POLLIN, but RA6W1 had not exposed payload bytes yet.
+	 * Do not enable it merely because a TCP socket is blocking; that preserves
+	 * the proven MQTT TX/progress-kick behavior of the customer working driver.
+	 */
+	bool tcp_rx_gap_recovery = false;
+
 	for (;;) {
+		/*
+		 * Established TCP + DPM idle receive gate.
+		 *
+		 * When RA6W1 is in a confirmed DPM sleep and there is no real
+		 * RX/ERR/CLOSE indication, do not enter ensure_awake_rx().  An idle
+		 * blocking MQTT recv must wait for the RA-originated autonomous socket
+		 * event instead of repeatedly waiting 500 ms for AWAKE and then trying
+		 * again.
+		 *
+		 * Keep this deliberately narrow:
+		 *   - STREAM only: UDP/DNS behavior is untouched.
+		 *   - connected and !connect_pending: MQTT CONNECT/CONNACK is untouched.
+		 *   - confirmed ASLEEP only: GOING_TO_SLEEP/WAKING_UP handling is untouched.
+		 *   - blocking only: non-blocking recv keeps its existing EAGAIN behavior.
+		 */
+		if (!is_nonblock &&
+		    sock->type == SOCK_STREAM &&
+		    erpc_wifi_ps_is_enabled() &&
+		    sock->connected && !sock->connect_pending &&
+		    erpc_wifi_ps_is_module_asleep()) {
+			k_spinlock_key_t gate_key = k_spin_lock(&sock->state_lock);
+			bool rx_event_pending =
+				(sock->triggered_events &
+				 (SOCKET_EVENT_RX | SOCKET_EVENT_ERR | SOCKET_EVENT_CLOSE)) != 0U;
+
+			if (!rx_event_pending) {
+				int64_t gate_elapsed = k_uptime_get() - start_time;
+				if (timeout_ms != UINT32_MAX &&
+				    gate_elapsed >= (int64_t)timeout_ms) {
+					k_spin_unlock(&sock->state_lock, gate_key);
+					errno = EAGAIN;
+					return -1;
+				}
+
+				k_timeout_t gate_timeout =
+					(timeout_ms == UINT32_MAX) ?
+					K_FOREVER : K_MSEC(timeout_ms - gate_elapsed);
+
+				sock->waiting = true;
+				sock->poll_events = ZVFS_POLLIN;
+				k_poll_signal_reset(&sock->poll_signal);
+				k_spin_unlock(&sock->state_lock, gate_key);
+
+				/* Tell poll_task that this socket now has a real POLLIN waiter. */
+				k_sem_give(&poll_task_sem);
+
+				struct k_poll_event gate_event;
+				k_poll_event_init(&gate_event, K_POLL_TYPE_SIGNAL,
+						  K_POLL_MODE_NOTIFY_ONLY, &sock->poll_signal);
+
+				int gate_rc = k_poll(&gate_event, 1, gate_timeout);
+
+				gate_key = k_spin_lock(&sock->state_lock);
+				sock->waiting = false;
+				k_spin_unlock(&sock->state_lock, gate_key);
+
+				if (gate_rc != 0) {
+					errno = EAGAIN;
+					return -1;
+				}
+
+				/*
+				 * RX/ERR/CLOSE woke us.  Re-evaluate PS/socket state before
+				 * taking the TCP job mutex and entering ensure_awake_rx().
+				 */
+				continue;
+			}
+
+			k_spin_unlock(&sock->state_lock, gate_key);
+		}
+
 		if (sock->type == SOCK_STREAM && !mutex_locked) {
 			k_mutex_lock(&g_active_tcp_job_mutex, K_FOREVER);
 			mutex_locked = true;
@@ -2252,6 +2408,28 @@ static ssize_t erpc_wifi_socket_recvfrom(void *obj, void *buf, size_t max_len, i
 
 		if (no_data) {
 			/*
+			 * Customer HTTP/TLS timing recovery, without the eRPC storm:
+			 *
+			 * A successful TCP write arms a short response-progress window.  If
+			 * recv() immediately sees EAGAIN/no-data inside that window, re-check
+			 * RA6W1 in 50 ms slices.  This works whether PS is already enabled or
+			 * not, but the retry can last only ERPC_WIFI_TCP_RESPONSE_GRACE_MS.
+			 *
+			 * Idle MQTT receives have no recent TCP write, so they remain fully
+			 * event-driven and cannot create the continuous fd0/fd1 GET_SOCKET_EVT
+			 * traffic seen in the rejected build.
+			 */
+			tcp_rx_gap_recovery = false;
+			if (sock->type == SOCK_STREAM) {
+				k_spinlock_key_t grace_key = k_spin_lock(&sock->state_lock);
+				int64_t grace_until = sock->tcp_response_grace_until_ms;
+				k_spin_unlock(&sock->state_lock, grace_key);
+
+				tcp_rx_gap_recovery =
+					(grace_until > 0) && (k_uptime_get() < grace_until);
+			}
+
+			/*
 			 * The previous RX readiness notification has now
 			 * been consumed and proved stale/no-data.
 			 *
@@ -2265,13 +2443,13 @@ static ssize_t erpc_wifi_socket_recvfrom(void *obj, void *buf, size_t max_len, i
 			k_spin_unlock(&sock->state_lock, rx_key);
 
 			/*
-			 * hold_during_recv() cancelled the previous idle
-			 * timer. Re-arm it ONCE while we wait for real data.
-			 *
-			 * Subsequent stale EAGAIN retries must NOT keep
-			 * restarting the 5-second timer.
+			 * Do not start the DPM idle timer while we are inside the short
+			 * request/response grace window.  hold_during_recv() already cancelled
+			 * the old timer, which keeps RA6W1 stable while the HTTP/TLS response is
+			 * expected.  If the grace expires with no data, fall back to the normal
+			 * event-driven/DPM path and arm sleep exactly once.
 			 */
-			if (!recv_wait_sleep_armed) {
+			if (!tcp_rx_gap_recovery && !recv_wait_sleep_armed) {
 				erpc_wifi_ps_schedule_sleep("recv-wait-no-data");
 				recv_wait_sleep_armed = true;
 			}
@@ -2336,8 +2514,29 @@ static ssize_t erpc_wifi_socket_recvfrom(void *obj, void *buf, size_t max_len, i
 			return -1;
 		}
 
-		/* Calculate remaining timeout for the poll block. */
-		k_timeout_t rem_timeout = (timeout_ms == UINT32_MAX) ? K_FOREVER : K_MSEC(timeout_ms - elapsed);
+		/*
+		 * Blocking TCP receive recovery:
+		 * RA6W1 may transiently report no payload immediately after POLLIN
+		 * (common during HTTP/TLS response assembly over WAN/Internet).
+		 * Re-check the RA receive queue in short 50 ms slices while preserving
+		 * the caller's overall receive timeout (SO_RCVTIMEO).
+		 */
+		bool tcp_retry_slice = (sock->type == SOCK_STREAM && !is_nonblock);
+		k_timeout_t rem_timeout;
+		if (tcp_retry_slice) {
+			uint32_t wait_ms = 50U;
+			if (timeout_ms != UINT32_MAX) {
+				uint32_t remaining_ms = (elapsed < (int64_t)timeout_ms) ? (timeout_ms - (uint32_t)elapsed) : 0U;
+				wait_ms = MIN(wait_ms, remaining_ms);
+				if (wait_ms == 0U) {
+					wait_ms = 1U;
+				}
+			}
+			rem_timeout = K_MSEC(wait_ms);
+		} else {
+			rem_timeout = (timeout_ms == UINT32_MAX) ?
+				K_FOREVER : K_MSEC(timeout_ms - elapsed);
+		}
 
 		k_spinlock_key_t key2 = k_spin_lock(&sock->state_lock);
 		if (sock->triggered_events & (SOCKET_EVENT_RX | SOCKET_EVENT_ERR | SOCKET_EVENT_CLOSE)) {
@@ -2363,7 +2562,28 @@ static ssize_t erpc_wifi_socket_recvfrom(void *obj, void *buf, size_t max_len, i
 		k_spin_unlock(&sock->state_lock, key3);
 
 		if (poll_rc != 0) {
-			/* k_poll returned a timeout or error. */
+			if (tcp_retry_slice && poll_rc == -EAGAIN) {
+				/*
+				 * Only the short internal TCP retry slice expired.  This is not
+				 * the socket receive timeout.  Retry RECV until the real overall
+				 * timeout expires at the top of the loop.
+				 */
+				int64_t current_elapsed = k_uptime_get() - start_time;
+				if (timeout_ms == UINT32_MAX ||
+				    current_elapsed < (int64_t)timeout_ms) {
+					continue;
+				}
+				errno = EAGAIN;
+				return -1;
+			}
+
+			if (tcp_retry_slice && poll_rc < 0) {
+				/* Preserve real kernel/poll errors instead of hiding them as EAGAIN. */
+				errno = -poll_rc;
+				return -1;
+			}
+
+			/* Preserve the original datagram behavior. */
 			errno = EAGAIN;
 			return -1;
 		}
@@ -2758,6 +2978,10 @@ static int erpc_wifi_socket_poll_offload(struct zvfs_pollfd *fds, int nfds, int 
 			sock->poll_events = fds[i].events;
 			sock->waiting = true;
 
+			if (sock->type == SOCK_DGRAM) {
+				sock->triggered_events &= ~SOCKET_EVENT_RX;
+			}
+
 			k_poll_event_init(&events[tracked_count], K_POLL_TYPE_SIGNAL,
 					  K_POLL_MODE_NOTIFY_ONLY, &sock->poll_signal);
 			tracked_socks[tracked_count] = sock;
@@ -2874,35 +3098,43 @@ static int erpc_wifi_socket_ioctl(void *obj, unsigned int request, va_list args)
 	case F_SETFL: {
 		int new_flags = va_arg(args, int);
 		int old_flags = sock->flags;
-		
+
+		/*
+		 * Customer-proven HTTP/TLS behavior: Zephyr's local F_SETFL state must
+		 * succeed even if the RA6W1 firmware does not implement SO_NONBLOCK.
+		 * Forward the option remotely on a best-effort basis, then always update
+		 * the host-side flags.
+		 */
 		if ((new_flags ^ old_flags) & O_NONBLOCK) {
-			uint32_t val = (new_flags & O_NONBLOCK) ? 1U : 0U;
+			static uint32_t nb_val;
+			nb_val = (new_flags & O_NONBLOCK) ? 1U : 0U;
 			bool ram_held = false;
 			int __w = erpc_wifi_ensure_awake_tx(ERPC_PMGR_JOB_ID_SEND, &ram_held);
-			if (__w != 0) {
-				LOG_DBG("erpc_wifi_ensure_awake_tx failed: IN %s = %d", __func__, __w);
+
+			if (__w == 0) {
+				erpc_wifi_msg_socksetopt_t nb_msg = {
+					.fd = sock->fd,
+					.level = ERPC_WIFI_SOL_SOCKET,
+					.optname = ERPC_WIFI_SO_NONBLOCK,
+					.optval = &nb_val,
+					.optlen = sizeof(nb_val)
+				};
+				int rc = erpc_wifi_send_cmd(ERPC_WIFI_SOCKET_SETOPT_CMD,
+							    &nb_msg, sizeof(nb_msg), -1);
 				if (ram_held) {
 					erpc_wifi_pmgr_ram_release(ERPC_PMGR_JOB_ID_SEND);
 				}
 				erpc_wifi_ps_notify_wakeup();
-				errno = -__w;
-				return -1;
+				LOG_DBG("Forwarded O_NONBLOCK to RA6W1 for fd %d: val=%u (rc=%d)",
+					sock->fd, nb_val, rc);
+			} else {
+				if (ram_held) {
+					erpc_wifi_pmgr_ram_release(ERPC_PMGR_JOB_ID_SEND);
+				}
+				erpc_wifi_ps_notify_wakeup();
 			}
-			erpc_wifi_msg_socksetopt_t nb_msg = { .fd = sock->fd,
-											  .level = ERPC_WIFI_SOL_SOCKET,
-											  .optname = ERPC_WIFI_SO_NONBLOCK,
-											  .optval = &val, .optlen = sizeof(val) };
-			int rc = erpc_wifi_send_cmd(ERPC_WIFI_SOCKET_SETOPT_CMD, &nb_msg, sizeof(nb_msg), -1);
-			if (ram_held) {
-				erpc_wifi_pmgr_ram_release(ERPC_PMGR_JOB_ID_SEND);
-			}
-			erpc_wifi_ps_notify_wakeup();
-			if (rc < 0) {
-				errno = -rc;
-				return -1;
-			}
-			LOG_DBG("Forwarded O_NONBLOCK to server for fd %d: val=%u", sock->fd, val);
 		}
+
 		sock->flags = new_flags;
 		return 0;
 	}

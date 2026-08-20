@@ -1047,6 +1047,34 @@ void erpc_wifi_ps_wait_awake_rx(void)
 	}
 }
 
+/*
+ * The server-event monitor is a background consumer.  While RA6W1 is in DPM
+ * sleep it has no useful eRPC work to perform, so wait quietly for a genuine
+ * AWAKE transition instead of repeatedly calling the bounded RX wait and
+ * producing a 500 ms warning loop.  Use bounded chunks only so
+ * erpc_wifi_stop_event_monitor() can still terminate the thread while asleep.
+ */
+static bool erpc_wifi_ps_wait_awake_event_monitor(void)
+{
+	while (event_monitor_running) {
+		k_mutex_lock(&g_ps_mutex, K_FOREVER);
+		bool enabled = g_ps.enabled;
+		k_mutex_unlock(&g_ps_mutex);
+
+		if (!enabled) {
+			return true;
+		}
+
+		uint32_t events = k_event_wait(&erpc_ps_event, ERPC_PS_EVENT_AWAKE,
+					       false, K_MSEC(500));
+		if ((events & ERPC_PS_EVENT_AWAKE) != 0U) {
+			return true;
+		}
+	}
+
+	return false;
+}
+
 void erpc_wifi_ps_reset_state_awake(void)
 {
 	k_mutex_lock(&g_ps_mutex, K_FOREVER);
@@ -1675,7 +1703,7 @@ static void ps_allow_sleep_work(struct k_work *work)
 	 * PS_SET -> PS_APPLY -> SLEEP_PROHIBITED REMOVE sequence.
 	 *
 	 * TX callers will wait in erpc_wifi_ps_wait_awake_tx().
-	 * Event monitor will block in erpc_wifi_ps_wait_awake_rx().
+	 * Event monitor will block in erpc_wifi_ps_wait_awake_event_monitor().
 	 * Socket poll is blocked by wait_for_srdy_low.
 	 */
 	g_ps.wait_for_srdy_low = true;
@@ -2565,7 +2593,9 @@ static void erpc_wifi_server_event_monitor_thread(void *arg1, void *arg2, void *
 		 * With the ASLEEP state set directly by ps_allow_sleep_work,
 		 * this blocks the event monitor during all DPM sleep phases.
 		 */
-		erpc_wifi_ps_wait_awake_rx();
+		if (!erpc_wifi_ps_wait_awake_event_monitor()) {
+			break;
+		}
 
 		/* After waking, gate eRPC calls on SRDY to prevent CRC errors */
 		if (erpc_wifi_ps_is_enabled() && !erpc_wifi_transport_slave_ready()) {
