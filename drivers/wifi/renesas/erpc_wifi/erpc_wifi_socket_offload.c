@@ -485,12 +485,10 @@ static int erpc_wifi_poll_hup_on_iface_down(struct zvfs_pollfd *fds, int nfds)
 /*
  * Short request/response grace after a successful TCP write.
  *
- * This replaces the rejected unlimited 50 ms blocking-recv polling.
- * The customer's 200 ms HTTP workaround proved that only a short gap
- * needs to be bridged.  500 ms gives margin without allowing an idle
- * MQTT/DPM receive to continuously drive eRPC traffic.
+ * 500 ms gives sufficient margin for request/response gap without allowing an
+ * idle MQTT/DPM receive socket to continuously drive 50 ms eRPC polling traffic.
  */
-#define ERPC_WIFI_TCP_RESPONSE_GRACE_MS 500U
+#define ERPC_WIFI_TCP_RESPONSE_GRACE_MS 1000U
 
 #if 0
 struct erpc_wifi_socket {
@@ -2408,7 +2406,7 @@ static ssize_t erpc_wifi_socket_recvfrom(void *obj, void *buf, size_t max_len, i
 
 		if (no_data) {
 			/*
-			 * Customer HTTP/TLS timing recovery, without the eRPC storm:
+			 * HTTP/TLS timing recovery, without the eRPC storm:
 			 *
 			 * A successful TCP write arms a short response-progress window.  If
 			 * recv() immediately sees EAGAIN/no-data inside that window, re-check
@@ -2518,10 +2516,18 @@ static ssize_t erpc_wifi_socket_recvfrom(void *obj, void *buf, size_t max_len, i
 		 * Blocking TCP receive recovery:
 		 * RA6W1 may transiently report no payload immediately after POLLIN
 		 * (common during HTTP/TLS response assembly over WAN/Internet).
-		 * Re-check the RA receive queue in short 50 ms slices while preserving
+		 * Re-check the RA receive queue in short 50 ms slices during the 3000 ms
+		 * response grace window after a successful TCP write, while preserving
 		 * the caller's overall receive timeout (SO_RCVTIMEO).
 		 */
-		bool tcp_retry_slice = (sock->type == SOCK_STREAM && !is_nonblock);
+		bool tcp_retry_slice = false;
+		if (sock->type == SOCK_STREAM && !is_nonblock) {
+			k_spinlock_key_t grace_key = k_spin_lock(&sock->state_lock);
+			int64_t grace_until = sock->tcp_response_grace_until_ms;
+			k_spin_unlock(&sock->state_lock, grace_key);
+
+			tcp_retry_slice = (grace_until > 0) && (k_uptime_get() < grace_until);
+		}
 		k_timeout_t rem_timeout;
 		if (tcp_retry_slice) {
 			uint32_t wait_ms = 50U;
