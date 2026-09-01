@@ -482,13 +482,7 @@ static int erpc_wifi_poll_hup_on_iface_down(struct zvfs_pollfd *fds, int nfds)
 #define SOCKET_EVENT_ERR   0x04 // POLLERR - Error condition
 #define SOCKET_EVENT_CLOSE 0x08 // POLLHUP - Connection closed
 
-/*
- * Short request/response grace after a successful TCP write.
- *
- * 500 ms gives sufficient margin for request/response gap without allowing an
- * idle MQTT/DPM receive socket to continuously drive 50 ms eRPC polling traffic.
- */
-#define ERPC_WIFI_TCP_RESPONSE_GRACE_MS 1000U
+
 
 #if 0
 struct erpc_wifi_socket {
@@ -546,8 +540,6 @@ struct erpc_wifi_socket {
 	uint32_t flags;          /* O_NONBLOCK etc */
 	uint16_t bound_port;     // Local port from bind() (host order)
 	bool tcp_dpm_filter_set; // true if TCP DPM wake filter installed
-	/* End of short response-progress window after a successful TCP write. */
-	int64_t tcp_response_grace_until_ms;
 	uint32_t recv_timeout_ms;
 	uint32_t send_timeout_ms;
 	bool closing;            // true if close() is in progress
@@ -982,8 +974,7 @@ static void erpc_wifi_socket_poll_task(void *arg1, void *arg2, void *arg3)
 				ready = sock->triggered_events & requested_mask;
 			} else if (sock->type == SOCK_STREAM &&
 				   erpc_wifi_ps_is_enabled() &&
-				   sock->connected && !sock->connect_pending &&
-				   k_uptime_get() >= sock->tcp_response_grace_until_ms) {
+				   sock->connected && !sock->connect_pending) {
 				/*
 				 * Established TCP while PS/DPM is enabled:
 				 * honor the events the waiter actually requested.  In particular,
@@ -2061,12 +2052,7 @@ static ssize_t erpc_wifi_socket_sendto(void *obj, const void *buf, size_t len, i
 		return -1;
 	}
 
-	if (sock->type == SOCK_STREAM && ret > 0) {
-		k_spinlock_key_t tx_key = k_spin_lock(&sock->state_lock);
-		sock->tcp_response_grace_until_ms =
-			k_uptime_get() + (int64_t)ERPC_WIFI_TCP_RESPONSE_GRACE_MS;
-		k_spin_unlock(&sock->state_lock, tx_key);
-	}
+
 
 	if (ram_held) {
 		(void)erpc_wifi_pmgr_ram_release(ERPC_PMGR_JOB_ID_SEND);
@@ -2117,12 +2103,7 @@ ssize_t erpc_wifi_socket_sendmsg(void *obj, const struct msghdr *msg, int flags)
 			}
 		}
 
-		if (sock->type == SOCK_STREAM && len > 0) {
-			k_spinlock_key_t tx_key = k_spin_lock(&sock->state_lock);
-			sock->tcp_response_grace_until_ms =
-				k_uptime_get() + (int64_t)ERPC_WIFI_TCP_RESPONSE_GRACE_MS;
-			k_spin_unlock(&sock->state_lock, tx_key);
-		}
+
 
 		if (ram_held) {
 			(void)erpc_wifi_pmgr_ram_release(ERPC_PMGR_JOB_ID_SEND);
@@ -2174,14 +2155,6 @@ static ssize_t erpc_wifi_socket_recvfrom(void *obj, void *buf, size_t max_len, i
 	 */
 	bool recv_ps_hold_started = false;
 	bool recv_wait_sleep_armed = false;
-
-	/*
-	 * Short receive polling is only a recovery for a stale TCP RX indication:
-	 * Zephyr observed POLLIN, but RA6W1 had not exposed payload bytes yet.
-	 * Do not enable it merely because a TCP socket is blocking; that preserves
-	 * the proven MQTT TX/progress-kick behavior of the customer working driver.
-	 */
-	bool tcp_rx_gap_recovery = false;
 
 	for (;;) {
 		/*
@@ -2406,28 +2379,6 @@ static ssize_t erpc_wifi_socket_recvfrom(void *obj, void *buf, size_t max_len, i
 
 		if (no_data) {
 			/*
-			 * HTTP/TLS timing recovery, without the eRPC storm:
-			 *
-			 * A successful TCP write arms a short response-progress window.  If
-			 * recv() immediately sees EAGAIN/no-data inside that window, re-check
-			 * RA6W1 in 50 ms slices.  This works whether PS is already enabled or
-			 * not, but the retry can last only ERPC_WIFI_TCP_RESPONSE_GRACE_MS.
-			 *
-			 * Idle MQTT receives have no recent TCP write, so they remain fully
-			 * event-driven and cannot create the continuous fd0/fd1 GET_SOCKET_EVT
-			 * traffic seen in the rejected build.
-			 */
-			tcp_rx_gap_recovery = false;
-			if (sock->type == SOCK_STREAM) {
-				k_spinlock_key_t grace_key = k_spin_lock(&sock->state_lock);
-				int64_t grace_until = sock->tcp_response_grace_until_ms;
-				k_spin_unlock(&sock->state_lock, grace_key);
-
-				tcp_rx_gap_recovery =
-					(grace_until > 0) && (k_uptime_get() < grace_until);
-			}
-
-			/*
 			 * The previous RX readiness notification has now
 			 * been consumed and proved stale/no-data.
 			 *
@@ -2441,13 +2392,13 @@ static ssize_t erpc_wifi_socket_recvfrom(void *obj, void *buf, size_t max_len, i
 			k_spin_unlock(&sock->state_lock, rx_key);
 
 			/*
-			 * Do not start the DPM idle timer while we are inside the short
-			 * request/response grace window.  hold_during_recv() already cancelled
-			 * the old timer, which keeps RA6W1 stable while the HTTP/TLS response is
-			 * expected.  If the grace expires with no data, fall back to the normal
-			 * event-driven/DPM path and arm sleep exactly once.
+			 * hold_during_recv() cancelled the previous idle
+			 * timer. Re-arm it ONCE while we wait for real data.
+			 *
+			 * Subsequent stale EAGAIN retries must NOT keep
+			 * restarting the 5-second timer.
 			 */
-			if (!tcp_rx_gap_recovery && !recv_wait_sleep_armed) {
+			if (!recv_wait_sleep_armed) {
 				erpc_wifi_ps_schedule_sleep("recv-wait-no-data");
 				recv_wait_sleep_armed = true;
 			}
@@ -2512,37 +2463,8 @@ static ssize_t erpc_wifi_socket_recvfrom(void *obj, void *buf, size_t max_len, i
 			return -1;
 		}
 
-		/*
-		 * Blocking TCP receive recovery:
-		 * RA6W1 may transiently report no payload immediately after POLLIN
-		 * (common during HTTP/TLS response assembly over WAN/Internet).
-		 * Re-check the RA receive queue in short 50 ms slices during the 3000 ms
-		 * response grace window after a successful TCP write, while preserving
-		 * the caller's overall receive timeout (SO_RCVTIMEO).
-		 */
-		bool tcp_retry_slice = false;
-		if (sock->type == SOCK_STREAM && !is_nonblock) {
-			k_spinlock_key_t grace_key = k_spin_lock(&sock->state_lock);
-			int64_t grace_until = sock->tcp_response_grace_until_ms;
-			k_spin_unlock(&sock->state_lock, grace_key);
-
-			tcp_retry_slice = (grace_until > 0) && (k_uptime_get() < grace_until);
-		}
-		k_timeout_t rem_timeout;
-		if (tcp_retry_slice) {
-			uint32_t wait_ms = 50U;
-			if (timeout_ms != UINT32_MAX) {
-				uint32_t remaining_ms = (elapsed < (int64_t)timeout_ms) ? (timeout_ms - (uint32_t)elapsed) : 0U;
-				wait_ms = MIN(wait_ms, remaining_ms);
-				if (wait_ms == 0U) {
-					wait_ms = 1U;
-				}
-			}
-			rem_timeout = K_MSEC(wait_ms);
-		} else {
-			rem_timeout = (timeout_ms == UINT32_MAX) ?
-				K_FOREVER : K_MSEC(timeout_ms - elapsed);
-		}
+		/* Calculate remaining timeout for the poll block. */
+		k_timeout_t rem_timeout = (timeout_ms == UINT32_MAX) ? K_FOREVER : K_MSEC(timeout_ms - elapsed);
 
 		k_spinlock_key_t key2 = k_spin_lock(&sock->state_lock);
 		if (sock->triggered_events & (SOCKET_EVENT_RX | SOCKET_EVENT_ERR | SOCKET_EVENT_CLOSE)) {
@@ -2568,28 +2490,7 @@ static ssize_t erpc_wifi_socket_recvfrom(void *obj, void *buf, size_t max_len, i
 		k_spin_unlock(&sock->state_lock, key3);
 
 		if (poll_rc != 0) {
-			if (tcp_retry_slice && poll_rc == -EAGAIN) {
-				/*
-				 * Only the short internal TCP retry slice expired.  This is not
-				 * the socket receive timeout.  Retry RECV until the real overall
-				 * timeout expires at the top of the loop.
-				 */
-				int64_t current_elapsed = k_uptime_get() - start_time;
-				if (timeout_ms == UINT32_MAX ||
-				    current_elapsed < (int64_t)timeout_ms) {
-					continue;
-				}
-				errno = EAGAIN;
-				return -1;
-			}
-
-			if (tcp_retry_slice && poll_rc < 0) {
-				/* Preserve real kernel/poll errors instead of hiding them as EAGAIN. */
-				errno = -poll_rc;
-				return -1;
-			}
-
-			/* Preserve the original datagram behavior. */
+			/* k_poll returned a timeout or error. */
 			errno = EAGAIN;
 			return -1;
 		}
