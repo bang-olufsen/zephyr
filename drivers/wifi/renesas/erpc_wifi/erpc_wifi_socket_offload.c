@@ -18,7 +18,7 @@
 #ifndef ERPC_PMGR_JOB_ID_RECV
 #define ERPC_PMGR_JOB_ID_RECV (2U)
 #endif
-
+#define ERPC_WIFI_MAX_SOCKETS 4
 LOG_MODULE_REGISTER(erpc_wifi_socket_offload, CONFIG_WIFI_LOG_LEVEL);
 
 void erpc_wifi_lock(void);
@@ -453,7 +453,7 @@ int erpc_wifi_wake_for_tx_acquire(bool *ram_held)
 #define ERPC_WIFI_SO_BINDTODEVICE 0x100b
 #define ERPC_WIFI_SO_ACCEPTCONN   0x0002
 
-#define ERPC_WIFI_MAX_SOCKETS 4
+
 
 static struct net_if *net_iface;
 
@@ -551,6 +551,16 @@ struct erpc_wifi_socket {
 
 static struct erpc_wifi_socket sockets[ERPC_WIFI_MAX_SOCKETS];
 
+bool erpc_wifi_has_non_dpm_active_sockets(void)
+{
+	for (int i = 0; i < ERPC_WIFI_MAX_SOCKETS; i++) {
+		if (sockets[i].in_use && sockets[i].type == SOCK_STREAM && !sockets[i].tcp_dpm_filter_set) {
+			return true;
+		}
+	}
+	return false;
+}
+
 K_THREAD_STACK_DEFINE(erpc_wifi_socket_poll_stack, 8192);
 static struct k_thread erpc_wifi_socket_poll_thread_data;
 static k_tid_t erpc_wifi_socket_poll_tid;
@@ -635,7 +645,6 @@ static void erpc_wifi_socket_poll_task(void *arg1, void *arg2, void *arg3)
 	ARG_UNUSED(arg1);
 	ARG_UNUSED(arg2);
 	ARG_UNUSED(arg3);
-	int64_t last_not_ready_log = 0;
 	int last_srdy_level = erpc_wifi_transport_slave_ready();
 
 	while (1) {
@@ -2052,8 +2061,6 @@ static ssize_t erpc_wifi_socket_sendto(void *obj, const void *buf, size_t len, i
 		return -1;
 	}
 
-
-
 	if (ram_held) {
 		(void)erpc_wifi_pmgr_ram_release(ERPC_PMGR_JOB_ID_SEND);
 	}
@@ -2102,8 +2109,6 @@ ssize_t erpc_wifi_socket_sendmsg(void *obj, const struct msghdr *msg, int flags)
 				break;
 			}
 		}
-
-
 
 		if (ram_held) {
 			(void)erpc_wifi_pmgr_ram_release(ERPC_PMGR_JOB_ID_SEND);
@@ -2884,10 +2889,6 @@ static int erpc_wifi_socket_poll_offload(struct zvfs_pollfd *fds, int nfds, int 
 			k_poll_signal_reset(&sock->poll_signal);
 			sock->poll_events = fds[i].events;
 			sock->waiting = true;
-
-			if (sock->type == SOCK_DGRAM) {
-				sock->triggered_events &= ~SOCKET_EVENT_RX;
-			}
 
 			k_poll_event_init(&events[tracked_count], K_POLL_TYPE_SIGNAL,
 					  K_POLL_MODE_NOTIFY_ONLY, &sock->poll_signal);

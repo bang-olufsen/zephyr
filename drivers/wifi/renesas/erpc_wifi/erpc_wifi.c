@@ -1691,8 +1691,11 @@ static void ps_allow_sleep_work(struct k_work *work)
 
 	k_mutex_lock(&g_ps_mutex, K_FOREVER);
 
-	if (!g_ps.enabled || g_ps.socket_connect_pending) {
+	if (!g_ps.enabled || g_ps.socket_connect_pending || erpc_wifi_has_non_dpm_active_sockets()) {
 		k_mutex_unlock(&g_ps_mutex);
+		if (erpc_wifi_has_non_dpm_active_sockets()) {
+			erpc_wifi_ps_schedule_sleep("active-ephemeral-socket");
+		}
 		return;
 	}
 
