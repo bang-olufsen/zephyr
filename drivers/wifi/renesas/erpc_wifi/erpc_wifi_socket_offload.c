@@ -557,13 +557,14 @@ bool erpc_wifi_has_active_tcp_traffic(void)
 	int64_t now = k_uptime_get();
 	for (int i = 0; i < ERPC_WIFI_MAX_SOCKETS; i++) {
 		if (sockets[i].in_use && sockets[i].type == SOCK_STREAM) {
-			/* If the socket is actively waiting for data while module is awake, keep awake */
-			if (sockets[i].waiting && !erpc_wifi_ps_is_module_asleep()) {
-				return true;
-			}
-			/* For non-DPM sockets (like HTTPS), keep awake for 15s after TX */
-			if (!sockets[i].tcp_dpm_filter_set && sockets[i].last_tx_ms > 0 && (now - sockets[i].last_tx_ms) < 15000) {
-				return true;
+			/* Only non-DPM sockets (like HTTPS) hold sleep while waiting or after TX */
+			if (!sockets[i].tcp_dpm_filter_set) {
+				if (sockets[i].waiting && !erpc_wifi_ps_is_module_asleep()) {
+					return true;
+				}
+				if (sockets[i].last_tx_ms > 0 && (now - sockets[i].last_tx_ms) < 15000) {
+					return true;
+				}
 			}
 		}
 	}
@@ -1424,31 +1425,33 @@ static int erpc_wifi_socket_connect(void *obj, const struct sockaddr *addr, sock
 #endif
 
 	if (sock->type == SOCK_STREAM && sock->bound_port == 0) {
+		static uint16_t g_ephemeral_port_counter = 0;
+		uint16_t auto_port = (uint16_t)(55000 + ((sock->fd + (g_ephemeral_port_counter++ & 0x01FF)) % 1000));
 		if (sock->family == AF_INET) {
 			struct sockaddr_in local_addr = {
 				.sin_family = AF_INET,
-				.sin_port = htons(55000 + sock->fd),
+				.sin_port = htons(auto_port),
 				.sin_addr = { .s_addr = INADDR_ANY }
 			};
 			int bind_ret = erpc_wifi_socket_bind(sock, (const struct sockaddr *)&local_addr, sizeof(local_addr));
 			if (bind_ret < 0) {
-				LOG_WRN("Auto-bind to port %u failed: %d", 55000 + sock->fd, bind_ret);
+				LOG_WRN("Auto-bind to port %u failed: %d", auto_port, bind_ret);
 			} else {
-				LOG_INF("Auto-bound TCP client socket to port %u for DPM tracking", 55000 + sock->fd);
+				LOG_INF("Auto-bound TCP client socket to port %u for DPM tracking", auto_port);
 			}
 		}
 #if defined(CONFIG_NET_IPV6)
 		else if (sock->family == AF_INET6) {
 			struct sockaddr_in6 local_addr6 = {
 				.sin6_family = AF_INET6,
-				.sin6_port = htons(55000 + sock->fd),
+				.sin6_port = htons(auto_port),
 				.sin6_addr = IN6ADDR_ANY_INIT,
 			};
 			int bind_ret = erpc_wifi_socket_bind(sock, (const struct sockaddr *)&local_addr6, sizeof(local_addr6));
 			if (bind_ret < 0) {
-				LOG_WRN("Auto-bind IPv6 to port %u failed: %d", 55000 + sock->fd, bind_ret);
+				LOG_WRN("Auto-bind IPv6 to port %u failed: %d", auto_port, bind_ret);
 			} else {
-				LOG_INF("Auto-bound IPv6 TCP client socket to port %u for DPM tracking", 55000 + sock->fd);
+				LOG_INF("Auto-bound IPv6 TCP client socket to port %u for DPM tracking", auto_port);
 			}
 		}
 #endif
