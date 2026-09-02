@@ -17,7 +17,7 @@ int erpc_wifi_socket_offload_init(struct net_if *iface);
 void erpc_wifi_dns_offload_init(void);
 int erpc_wifi_wake_for_tx();
 void erpc_wifi_socket_tx_block_set(bool enable, uint32_t timeout_ms);
-bool erpc_wifi_has_non_dpm_active_sockets(void);
+bool erpc_wifi_has_active_tcp_traffic(void);
 void erpc_wifi_socket_invalidate_active_job_cache(void);
 void erpc_wifi_offload_srdy_callback(void);
 void erpc_wifi_offload_clear_srdy_pending(void);

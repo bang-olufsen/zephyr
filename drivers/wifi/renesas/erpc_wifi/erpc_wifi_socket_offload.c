@@ -540,6 +540,7 @@ struct erpc_wifi_socket {
 	uint32_t flags;          /* O_NONBLOCK etc */
 	uint16_t bound_port;     // Local port from bind() (host order)
 	bool tcp_dpm_filter_set; // true if TCP DPM wake filter installed
+	int64_t last_tx_ms;
 	uint32_t recv_timeout_ms;
 	uint32_t send_timeout_ms;
 	bool closing;            // true if close() is in progress
@@ -551,11 +552,14 @@ struct erpc_wifi_socket {
 
 static struct erpc_wifi_socket sockets[ERPC_WIFI_MAX_SOCKETS];
 
-bool erpc_wifi_has_non_dpm_active_sockets(void)
+bool erpc_wifi_has_active_tcp_traffic(void)
 {
+	int64_t now = k_uptime_get();
 	for (int i = 0; i < ERPC_WIFI_MAX_SOCKETS; i++) {
-		if (sockets[i].in_use && sockets[i].type == SOCK_STREAM && !sockets[i].tcp_dpm_filter_set) {
-			return true;
+		if (sockets[i].in_use && sockets[i].type == SOCK_STREAM) {
+			if (sockets[i].last_tx_ms > 0 && (now - sockets[i].last_tx_ms) < 3000) {
+				return true;
+			}
 		}
 	}
 	return false;
@@ -982,14 +986,12 @@ static void erpc_wifi_socket_poll_task(void *arg1, void *arg2, void *arg3)
 				}
 				ready = sock->triggered_events & requested_mask;
 			} else if (sock->type == SOCK_STREAM &&
-				   erpc_wifi_ps_is_enabled() &&
 				   sock->connected && !sock->connect_pending) {
 				/*
-				 * Established TCP while PS/DPM is enabled:
-				 * honor the events the waiter actually requested.  In particular,
-				 * do not release an MQTT POLLIN waiter for a persistent TX-only
-				 * indication; doing so makes recv() enter wait_awake_rx() while the
-				 * RA6W1 is sleeping and produces repeated 500 ms timeout churn.
+				 * Established TCP (both with PS enabled and disabled):
+				 * honor the events the waiter actually requested. A POLLIN
+				 * waiter must NEVER be released by a persistent TX indication;
+				 * doing so causes 0ms spurious poll wakeups with empty data.
 				 * ERR/CLOSE are always delivered.
 				 */
 				uint32_t requested_mask = SOCKET_EVENT_ERR | SOCKET_EVENT_CLOSE;
@@ -1002,9 +1004,8 @@ static void erpc_wifi_socket_poll_task(void *arg1, void *arg2, void *arg3)
 				ready = sock->triggered_events & requested_mask;
 			} else {
 				/*
-				 * PS disabled, or TCP connect still in progress:
-				 * preserve the exact customer-working low-latency TCP semantics.
-				 * TX can act as the existing connection/progress recovery kick.
+				 * TCP connect still in progress:
+				 * TX acts as the connection completion kick.
 				 */
 				ready = sock->triggered_events &
 					(SOCKET_EVENT_RX | SOCKET_EVENT_TX |
@@ -2061,6 +2062,12 @@ static ssize_t erpc_wifi_socket_sendto(void *obj, const void *buf, size_t len, i
 		return -1;
 	}
 
+	if (sock->type == SOCK_STREAM && ret > 0) {
+		k_spinlock_key_t tx_key = k_spin_lock(&sock->state_lock);
+		sock->last_tx_ms = k_uptime_get();
+		k_spin_unlock(&sock->state_lock, tx_key);
+	}
+
 	if (ram_held) {
 		(void)erpc_wifi_pmgr_ram_release(ERPC_PMGR_JOB_ID_SEND);
 	}
@@ -2108,6 +2115,12 @@ ssize_t erpc_wifi_socket_sendmsg(void *obj, const struct msghdr *msg, int flags)
 			if (ret < msg->msg_iov[i].iov_len) {
 				break;
 			}
+		}
+
+		if (sock->type == SOCK_STREAM && len > 0) {
+			k_spinlock_key_t tx_key = k_spin_lock(&sock->state_lock);
+			sock->last_tx_ms = k_uptime_get();
+			k_spin_unlock(&sock->state_lock, tx_key);
 		}
 
 		if (ram_held) {
@@ -2795,6 +2808,9 @@ static int erpc_wifi_socket_close(void *obj)
 	}
 
 	/* Unconditionally free driver socket state so slot is reusable */
+	k_spinlock_key_t free_key = k_spin_lock(&sock->state_lock);
+	sock->last_tx_ms = 0;
+	k_spin_unlock(&sock->state_lock, free_key);
 	erpc_wifi_socket_free(sock);
 
 	return 0;
