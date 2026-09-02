@@ -561,8 +561,8 @@ bool erpc_wifi_has_active_tcp_traffic(void)
 			if (sockets[i].waiting && !erpc_wifi_ps_is_module_asleep()) {
 				return true;
 			}
-			/* If the socket transmitted data within the last 30s, keep awake for cloud response */
-			if (sockets[i].last_tx_ms > 0 && (now - sockets[i].last_tx_ms) < 30000) {
+			/* For non-DPM sockets (like HTTPS), keep awake for 15s after TX */
+			if (!sockets[i].tcp_dpm_filter_set && sockets[i].last_tx_ms > 0 && (now - sockets[i].last_tx_ms) < 15000) {
 				return true;
 			}
 		}
@@ -2805,10 +2805,10 @@ static int erpc_wifi_socket_close(void *obj)
 	return 0;
 }
 
-static struct erpc_wifi_socket *find_socket_by_fd(int zfd)
+static struct erpc_wifi_socket *find_socket_by_fd(int fd)
 {
 	for (int i = 0; i < ERPC_WIFI_MAX_SOCKETS; i++) {
-		if (sockets[i].in_use && sockets[i].zfd == zfd) {
+		if (sockets[i].in_use && (sockets[i].zfd == fd || sockets[i].fd == fd)) {
 			return &sockets[i];
 		}
 	}
