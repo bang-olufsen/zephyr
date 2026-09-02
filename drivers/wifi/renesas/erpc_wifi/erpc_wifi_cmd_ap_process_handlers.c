@@ -193,6 +193,12 @@ static int erpc_wifi_pmgr_remove_sleep_constraint_msg_process(void *data)
 	return (int)ra6w1_pmgr_remove_sleep_constraint(msg->constraint);
 }
 
+static int erpc_wifi_pmgr_enter_sleep2_msg_process(void *data)
+{
+	ARG_UNUSED(data);
+	return (int)ra6w1_pmgr_enter_sleep2();
+}
+
 static int erpc_wifi_pmgr_dpm_rcv_ready_set_msg_process(void *data)
 {
 	erpc_wifi_pmgr_job_t *msg = (erpc_wifi_pmgr_job_t *)data;
@@ -268,6 +274,8 @@ int erpc_wifi_cmd_ap_handlers_init(void)
 								   erpc_wifi_pmgr_add_sleep_constraint_msg_process);
 	erpc_wifi_register_cmd_handler(ERPC_WIFI_PMGR_REMOVE_SLEEP_CONSTRAINT_CMD,
 								   erpc_wifi_pmgr_remove_sleep_constraint_msg_process);
+	erpc_wifi_register_cmd_handler(ERPC_WIFI_PMGR_ENTER_SLEEP2_CMD,
+								   erpc_wifi_pmgr_enter_sleep2_msg_process);
 	erpc_wifi_register_cmd_handler(ERPC_WIFI_PMGR_DPM_RCV_READY_SET_CMD,
 								   erpc_wifi_pmgr_dpm_rcv_ready_set_msg_process);
 	erpc_wifi_register_cmd_handler(ERPC_WIFI_PMGR_DPM_IS_ENABLED_CMD,

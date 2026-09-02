@@ -90,6 +90,11 @@ static WIFIConnectionInfo_t g_cached_connection_info;
 #define PMGR_CONSTRAINT_SLEEP_PROHIBITED (1U << 0)
 #endif
 
+ /* The driver decides when to put RA6W1 back to Sleep2 after a
+ * pre-connect version query. Cancelled if a scan/connect starts first. */
+#define ERPC_WIFI_SLEEP2_REENTRY_DELAY_MS 2000U
+static struct k_work_delayable g_sleep2_reentry_work;
+
 void erpc_wifi_lock(void)
 {
 	//k_mutex_lock(&g_erpc_wifi_mutex, K_FOREVER);
@@ -160,6 +165,39 @@ void erpc_wifi_gpio_trigger_wakeup(void)
 #endif
 }
 
+int erpc_wifi_ensure_slave_awake(uint32_t timeout_ms)
+{
+    if (erpc_wifi_transport_slave_ready()) {
+        //return 0;
+		if (erpc_wifi_ping(1000) != 0){
+			LOG_INF(" post wake ping failed");
+			return -ETIMEDOUT;
+		}
+    }
+ 
+    LOG_DBG("Slave not ready/asleep; triggering GPIO wakeup pulse");
+    erpc_wifi_gpio_trigger_wakeup();
+ 
+    int64_t start = k_uptime_get();
+    int64_t last_pulse = start;
+ 
+    while (!erpc_wifi_transport_slave_ready()) {
+        if ((k_uptime_get() - start) > (int64_t)timeout_ms) {
+            LOG_WRN("Slave wake handshake timeout (%u ms)", (unsigned int)timeout_ms);
+            return -ETIMEDOUT;
+        }
+ 
+        if ((k_uptime_get() - last_pulse) > 300) {
+            erpc_wifi_gpio_trigger_wakeup();
+            last_pulse = k_uptime_get();
+        }
+ 
+        k_msleep(10);
+    }
+ 
+    k_msleep(20);
+    return 0;
+}
 /* Short pulse for re-asserting SRDY when module is already awake (no DPM boot wait) */
 void erpc_wifi_gpio_wakeup_pulse_fast(void)
 {
@@ -204,6 +242,8 @@ int erpc_wifi_otp_mac_read(uint8_t mac[WIFI_MAC_ADDR_LEN])
 		return -EINVAL;
 	}
 
+	(void)erpc_wifi_ensure_slave_awake(5000);
+
 	erpc_wifi_mac_t msg = { .mac = mac };
 	return erpc_wifi_send_cmd(ERPC_WIFI_OTP_MAC_READ_CMD, &msg, sizeof(msg), -1);
 }
@@ -216,6 +256,8 @@ int erpc_wifi_otp_mac_write(const uint8_t mac[WIFI_MAC_ADDR_LEN])
 		return -EINVAL;
 	}
 
+	(void)erpc_wifi_ensure_slave_awake(5000);
+
 	erpc_wifi_mac_t msg = { .mac = (uint8_t *)mac };
 	return erpc_wifi_send_cmd(ERPC_WIFI_OTP_MAC_WRITE_CMD, &msg, sizeof(msg), -1);
 }
@@ -227,6 +269,8 @@ int erpc_wifi_get_mac(uint8_t mac[WIFI_MAC_ADDR_LEN])
 	if (mac == NULL) {
 		return -EINVAL;
 	}
+
+	(void)erpc_wifi_ensure_slave_awake(5000);
 
 	erpc_wifi_mac_t msg = { .mac = mac };
 	return erpc_wifi_send_cmd(ERPC_WIFI_GET_MAC_CMD, &msg, sizeof(msg), -1);
@@ -476,7 +520,7 @@ static int erpc_wifi_mgmt_scan(const struct device *dev, struct wifi_scan_params
 	data->scan_cb = cb;
 	data->scan_max_bss_cnt = params->max_bss_cnt;
 	data->state = WIFI_STATE_SCANNING;
-
+    k_work_cancel_delayable(&g_sleep2_reentry_work);
 	k_work_submit_to_queue(&data->workq, &data->scan_work);
 
 error:
@@ -543,6 +587,8 @@ static void erpc_wifi_mgmt_scan_work(struct k_work *work)
 	results = malloc(dev->scan_max_bss_cnt * sizeof(WIFIScanResult_t));
 	if (results != NULL) {
 		memset(results, 0, dev->scan_max_bss_cnt * sizeof(WIFIScanResult_t));
+
+		(void)erpc_wifi_ensure_slave_awake(5000);
 
 		erpc_wifi_scan_t scan_msg = { .scan_results = results, .max_bss_cnt = (uint8_t)dev->scan_max_bss_cnt };
 		ret = (WIFIReturnCode_t)erpc_wifi_send_cmd(ERPC_WIFI_AP_SCAN_CMD, &scan_msg, sizeof(scan_msg), 10000);
@@ -749,6 +795,7 @@ static int erpc_wifi_mgmt_connect(const struct device *dev, struct wifi_connect_
 
 	data->state = WIFI_STATE_ASSOCIATING;
 	data->wifi_params_read = false;
+	k_work_cancel_delayable(&g_sleep2_reentry_work);
 	int ret =k_work_submit_to_queue(&data->workq, &data->connect_work);
 	if (ret < 0) {
 		data->state = WIFI_STATE_DISCONNECTED;
@@ -777,29 +824,7 @@ static void erpc_wifi_mgmt_connect_work(struct k_work *work)
 
 	/* Server may be in Sleep2 on POR; wake it before eRPC Wi-Fi connect. */
 	LOG_INF("WiFi connect API: triggering wakeup");
-	erpc_wifi_gpio_trigger_wakeup();
-	/* old delay was fixed and can be too short/too long across wake cycles */
-	// k_msleep(30);
-	{
-		int64_t start = k_uptime_get();
-		int64_t last_pulse = start;
-
-		while (!erpc_wifi_transport_slave_ready()) {
-			if ((k_uptime_get() - start) > 5000) {
-				LOG_WRN("WiFi connect API: wake handshake timeout, proceeding with connect");
-				break;
-			}
-
-			if ((k_uptime_get() - last_pulse) > 300) {
-				erpc_wifi_gpio_trigger_wakeup();
-				last_pulse = k_uptime_get();
-			}
-
-			k_msleep(20);
-		}
-
-		k_msleep(50);
-	}
+	erpc_wifi_ensure_slave_awake(5000);
 	//erpc_wifi_ps_push_defaults();
 	LOG_INF("WiFi connect API: calling WIFI_ConnectAP");
 	ret = eWiFiFailure;
@@ -2152,18 +2177,54 @@ int erpc_wifi_mgmt_iface_status(const struct device *dev, struct wifi_iface_stat
 	return ret;
 }
 
+static void sleep2_reentry_work_handler(struct k_work *work)
+{
+	ARG_UNUSED(work);
+	struct erpc_wifi_data *data = &erpc_wifi_driver_data;
+
+	if (data->state != WIFI_STATE_DISCONNECTED && data->state != WIFI_STATE_INACTIVE) {
+		return;
+	}
+
+	int32_t rc = (int32_t)erpc_wifi_send_cmd(ERPC_WIFI_PMGR_ENTER_SLEEP2_CMD, NULL, 0, 500);
+	if (rc != 0) {
+		LOG_WRN("PMGR enter_sleep2 rejected/failed rc=%d", rc);
+	}
+}
+
 int erpc_wifi_mgmt_get_version(const struct device *dev, struct wifi_version *params)
 {
 	struct erpc_wifi_data *data = dev->data;
+
+	(void)erpc_wifi_ensure_slave_awake(5000);
 
 	erpc_wifi_driver_version_t ver_msg = {
 		.fw_version_driver = data->fw_version_driver,
 		.fw_ver_drv_len = sizeof(data->fw_version_driver),
 	};
-	(void)erpc_wifi_send_cmd(ERPC_WIFI_GET_DRIVER_VER_CMD, &ver_msg, sizeof(ver_msg), -1);
+	//(void)erpc_wifi_send_cmd(ERPC_WIFI_GET_DRIVER_VER_CMD, &ver_msg, sizeof(ver_msg), -1);
 
+	/* Retry with extra GPIO pulses like erpc_wifi_mgmt_connect_work() does, instead of guessing awake. */
+	int ret = -ETIMEDOUT;
+	for (int attempt = 1; attempt <= 3 && ret != 0; attempt++) {
+		ret = erpc_wifi_ensure_slave_awake(5000);
+		if (ret != 0 && attempt < 3) {
+			erpc_wifi_gpio_trigger_wakeup();
+			k_msleep(200);
+		}
+	}
+	if (ret != 0) {
+		LOG_WRN("fw_version: module did not wake (rc=%d)", ret);
+		return ret;
+	}
+	
+	(void)erpc_wifi_send_cmd(ERPC_WIFI_GET_DRIVER_VER_CMD, &ver_msg, sizeof(ver_msg), -1);
 	params->drv_version = data->fw_version_driver;
 	params->fw_version = NULL;
+
+	if (data->state == WIFI_STATE_DISCONNECTED || data->state == WIFI_STATE_INACTIVE) {
+		k_work_reschedule(&g_sleep2_reentry_work, K_MSEC(ERPC_WIFI_SLEEP2_REENTRY_DELAY_MS));
+	}
 
 	return 0;
 }
@@ -2969,6 +3030,7 @@ static int erpc_wifi_init(const struct device *dev)
 
 	k_work_init_delayable(&g_ps_enable_work, ps_allow_sleep_work);
 	k_work_init_delayable(&g_ps_entry_guard_work, ps_entry_guard_work);
+	k_work_init_delayable(&g_sleep2_reentry_work, sleep2_reentry_work_handler);
 
 	/* Driver-owned default PS policy for apps that only toggle STATE. */
 	g_ps.listen_interval = ERPC_WIFI_PS_DEFAULT_LISTEN_INTERVAL;
