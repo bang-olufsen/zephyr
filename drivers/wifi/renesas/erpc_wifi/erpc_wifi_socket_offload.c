@@ -557,7 +557,12 @@ bool erpc_wifi_has_active_tcp_traffic(void)
 	int64_t now = k_uptime_get();
 	for (int i = 0; i < ERPC_WIFI_MAX_SOCKETS; i++) {
 		if (sockets[i].in_use && sockets[i].type == SOCK_STREAM) {
-			if (sockets[i].last_tx_ms > 0 && (now - sockets[i].last_tx_ms) < 3000) {
+			/* If the socket is actively waiting for data while module is awake, keep awake */
+			if (sockets[i].waiting && !erpc_wifi_ps_is_module_asleep()) {
+				return true;
+			}
+			/* If the socket transmitted data within the last 30s, keep awake for cloud response */
+			if (sockets[i].last_tx_ms > 0 && (now - sockets[i].last_tx_ms) < 30000) {
 				return true;
 			}
 		}
@@ -847,23 +852,7 @@ static void erpc_wifi_socket_poll_task(void *arg1, void *arg2, void *arg3)
 			int srdy = erpc_wifi_transport_slave_ready();
 
 			if (!srdy && !dpm_event_probe) {
-				bool pollout_probe =
-					waiter_probe &&
-					((sock->poll_events & ZVFS_POLLOUT) || sock->connect_pending);
-
-				bool irq_wait_probe =
-					waiter_probe && srdy_irq;
-
-				/*
-				 * Customer-stable code services an awake waiter even when SRDY has
-				 * already fallen after the previous eRPC. ensure_awake_rx() below
-				 * reasserts SRDY for the query. This is the missing 200 ms retry
-				 * behavior needed by TLS/MQTT waiters.
-				 */
-				bool awake_waiter_probe = waiter_probe && !module_asleep;
-
-				if (!pollout_probe && !irq_wait_probe &&
-				    !awake_waiter_probe && !awake_fallback_probe) {
+				if (!waiter_probe && !awake_fallback_probe) {
 					continue;
 				}
 			}
