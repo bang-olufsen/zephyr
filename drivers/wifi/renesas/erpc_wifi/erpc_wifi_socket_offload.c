@@ -2060,6 +2060,7 @@ static ssize_t erpc_wifi_socket_sendto(void *obj, const void *buf, size_t len, i
 	if (sock->type == SOCK_STREAM && ret > 0) {
 		k_spinlock_key_t tx_key = k_spin_lock(&sock->state_lock);
 		sock->last_tx_ms = k_uptime_get();
+		sock->triggered_events &= ~SOCKET_EVENT_RX;
 		k_spin_unlock(&sock->state_lock, tx_key);
 	}
 
@@ -2115,6 +2116,7 @@ ssize_t erpc_wifi_socket_sendmsg(void *obj, const struct msghdr *msg, int flags)
 		if (sock->type == SOCK_STREAM && len > 0) {
 			k_spinlock_key_t tx_key = k_spin_lock(&sock->state_lock);
 			sock->last_tx_ms = k_uptime_get();
+			sock->triggered_events &= ~SOCKET_EVENT_RX;
 			k_spin_unlock(&sock->state_lock, tx_key);
 		}
 
@@ -2480,11 +2482,11 @@ static ssize_t erpc_wifi_socket_recvfrom(void *obj, void *buf, size_t max_len, i
 		k_timeout_t rem_timeout = (timeout_ms == UINT32_MAX) ? K_FOREVER : K_MSEC(timeout_ms - elapsed);
 
 		k_spinlock_key_t key2 = k_spin_lock(&sock->state_lock);
-		if (sock->triggered_events & (SOCKET_EVENT_RX | SOCKET_EVENT_ERR | SOCKET_EVENT_CLOSE)) {
+		sock->triggered_events &= ~SOCKET_EVENT_RX;
+		if (sock->triggered_events & (SOCKET_EVENT_ERR | SOCKET_EVENT_CLOSE)) {
 			k_spin_unlock(&sock->state_lock, key2);
 			continue;
 		}
-		sock->triggered_events &= ~SOCKET_EVENT_RX;
 		sock->waiting = true;
 		sock->poll_events = ZVFS_POLLIN;
 		k_poll_signal_reset(&sock->poll_signal);
@@ -2813,16 +2815,8 @@ static int erpc_wifi_socket_close(void *obj)
 
 static struct erpc_wifi_socket *find_socket_by_fd(int fd)
 {
-	/* Pass 1 (Primary): Match exact Zephyr VFS descriptor (standard POSIX / TLS ctx->sock) */
 	for (int i = 0; i < ERPC_WIFI_MAX_SOCKETS; i++) {
-		if (sockets[i].in_use && sockets[i].zfd == fd) {
-			return &sockets[i];
-		}
-	}
-
-	/* Pass 2 (Fallback): Match remote driver descriptor only if no Zephyr zfd matched */
-	for (int i = 0; i < ERPC_WIFI_MAX_SOCKETS; i++) {
-		if (sockets[i].in_use && sockets[i].fd == fd) {
+		if (sockets[i].in_use && (sockets[i].zfd == fd || sockets[i].fd == fd)) {
 			return &sockets[i];
 		}
 	}
