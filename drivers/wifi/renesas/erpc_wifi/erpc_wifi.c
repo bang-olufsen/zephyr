@@ -746,6 +746,7 @@ static void erpc_wifi_mgmt_scan_work(struct k_work *work)
 */
 static void erpc_wifi_ps_set_state_internal(bool enabled, const char *source);
 static void erpc_wifi_ps_push_defaults(void);
+static void erpc_wifi_ps_push_listen_interval_pre_connect(void);
 
 static int erpc_wifi_mgmt_connect(const struct device *dev, struct wifi_connect_req_params *params)
 {
@@ -825,7 +826,14 @@ static void erpc_wifi_mgmt_connect_work(struct k_work *work)
 	/* Server may be in Sleep2 on POR; wake it before eRPC Wi-Fi connect. */
 	LOG_INF("WiFi connect API: triggering wakeup");
 	erpc_wifi_ensure_slave_awake(5000);
-	//erpc_wifi_ps_push_defaults();
+
+	/*
+	 * Listen interval must reach RA6W1 before WIFI_ConnectAP so it is applied
+	 * to the radio and used in the association request, independent of the
+	 * PS "enabled" state.
+	 */
+	erpc_wifi_ps_push_listen_interval_pre_connect();
+
 	LOG_INF("WiFi connect API: calling WIFI_ConnectAP");
 	ret = eWiFiFailure;
 	for (int attempt = 1; attempt <= 3 && ret != eWiFiSuccess; attempt++) {
@@ -1708,6 +1716,17 @@ static void erpc_wifi_ps_push_defaults(void)
 		ps_send_param_to_ra((ra_wifi_ps_param_t)RA_WIFI_PS_PARAM_TIMEOUT_MS,
 				    g_ps.timeout_ms);
 	}
+}
+static void erpc_wifi_ps_push_listen_interval_pre_connect(void)
+{
+	uint32_t li = g_ps.li_set ? g_ps.listen_interval : ERPC_WIFI_PS_DEFAULT_LISTEN_INTERVAL;
+	erpc_wifi_ps_t ps_msg = {
+		.param = (ra_wifi_ps_param_t)RA_WIFI_PS_PARAM_LISTEN_INTERVAL,
+		.value = li,
+	};
+
+	LOG_INF("PS: pushing LISTEN_INTERVAL=%u before connect", li);
+	(void)erpc_wifi_send_cmd(ERPC_WIFI_PS_SET_PARAM_CMD, &ps_msg, sizeof(ps_msg), 500);
 }
 
 static void ps_allow_sleep_work(struct k_work *work)
