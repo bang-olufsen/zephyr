@@ -228,6 +228,9 @@ static void erpc_wifi_msg_handler_task(void *arg1, void *arg2, void *arg3)
 
 int erpc_wifi_cmd_init(void)
 {
+	if (msgq_task_tid != NULL) {
+		return 0;
+	}
 	/* Create handler thread at preemptive priority to ensure queue processing */
 	msgq_task_tid = k_thread_create(&msgq_thread, msg_task_stack, MSG_TASK_STACK_SIZE,
 					erpc_wifi_msg_handler_task, NULL, NULL, NULL,

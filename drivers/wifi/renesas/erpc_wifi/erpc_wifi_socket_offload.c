@@ -577,6 +577,7 @@ bool erpc_wifi_has_active_tcp_traffic(void)
 K_THREAD_STACK_DEFINE(erpc_wifi_socket_poll_stack, 8192);
 static struct k_thread erpc_wifi_socket_poll_thread_data;
 static k_tid_t erpc_wifi_socket_poll_tid;
+static atomic_t erpc_wifi_socket_poll_running;
 struct k_sem poll_task_sem;
 static atomic_t g_srdy_irq_pending;
 static atomic_t g_socket_evt_query_inflight;
@@ -660,7 +661,7 @@ static void erpc_wifi_socket_poll_task(void *arg1, void *arg2, void *arg3)
 	ARG_UNUSED(arg3);
 	int last_srdy_level = erpc_wifi_transport_slave_ready();
 
-	while (1) {
+	while (atomic_get(&erpc_wifi_socket_poll_running)) {
 		/*
 		 * Customer-stable servicing semantics:
 		 *   - an active socket waiter is revisited every 200 ms;
@@ -693,6 +694,9 @@ static void erpc_wifi_socket_poll_task(void *arg1, void *arg2, void *arg3)
 			(dpm_polling_needed ? K_MSEC(500) : K_FOREVER);
 
 		int wait_rc = k_sem_take(&poll_task_sem, wait_timeout);
+		if (!atomic_get(&erpc_wifi_socket_poll_running)) {
+		    break;
+		}
 		bool fallback_timeout = (wait_rc != 0);
 		bool dpm_timeout = fallback_timeout && !waiter_polling_needed && dpm_polling_needed;
 
@@ -1043,12 +1047,42 @@ static void ensure_poll_task_started(void)
 		return;
 	}
 
+	atomic_set(&erpc_wifi_socket_poll_running, 1);
 	erpc_wifi_socket_poll_tid = k_thread_create(
 		&erpc_wifi_socket_poll_thread_data, erpc_wifi_socket_poll_stack,
 		K_THREAD_STACK_SIZEOF(erpc_wifi_socket_poll_stack), erpc_wifi_socket_poll_task,
 		NULL, NULL, NULL, K_PRIO_PREEMPT(7), 0, K_NO_WAIT);
+	if (!erpc_wifi_socket_poll_tid) {
+		atomic_set(&erpc_wifi_socket_poll_running, 0);
+		LOG_ERR("Failed to create socket poll thread");
+		return;
+	}
 	k_thread_name_set(erpc_wifi_socket_poll_tid, "erpc_socket_poll");
 }
+
+int erpc_wifi_socket_poll_stop(void)
+{
+	struct k_work_sync sync;
+
+	if (erpc_wifi_socket_poll_tid == NULL) {
+		return 0;
+	}
+
+	atomic_set(&erpc_wifi_socket_poll_running, 0);
+	(void)k_work_cancel_delayable_sync(&g_srdy_deferred_work, &sync);
+	erpc_wifi_offload_clear_srdy_pending();
+	k_sem_give(&poll_task_sem);
+
+	if (k_thread_join(&erpc_wifi_socket_poll_thread_data, K_FOREVER) != 0) {
+		LOG_ERR("Failed to join socket poll thread");
+		return -EIO;
+	}
+
+	erpc_wifi_socket_poll_tid = NULL;
+	LOG_INF("Socket poll thread stopped");
+	return 0;
+}
+
 static const struct socket_op_vtable erpc_wifi_socket_fd_op_vtable;
 
 static int erpc_wifi_socket_level_from_posix(int level, int *level_erpc_wifi)

@@ -885,6 +885,12 @@ static int erpc_wifi_mgmt_disconnect(const struct device *dev)
  		return -EBUSY;
  	}
  
+	int wake_ret = erpc_wifi_ensure_slave_awake(5000);
+	if (wake_ret != 0) {
+		LOG_ERR("Failed to wake module before disconnect: %d", wake_ret);
+		return wake_ret;
+	}
+
  	int ret = k_work_submit_to_queue(&data->workq, &data->disconnect_work);
  	if (ret < 0) {
  		data->state = WIFI_STATE_DISCONNECTED;
@@ -940,6 +946,17 @@ static void erpc_wifi_iface_disable(const struct device *dev)
  
  	k_sem_take(&data->sem_cmd_process, K_MSEC(300));
  
+	int poll_ret = erpc_wifi_socket_poll_stop();
+	if (poll_ret != 0) {
+		LOG_ERR("Failed to stop socket poll thread: %d", poll_ret);
+		return;
+	}
+
+	int32_t rc = (int32_t)erpc_wifi_send_cmd(ERPC_WIFI_PMGR_ENTER_SLEEP2_CMD, NULL, 0, 500);
+	if (rc != 0) {
+		LOG_WRN("PMGR enter_sleep2 rejected/failed rc=%d", rc);
+	}
+
  	erpc_wifi_deinit_erpc(data);
  	net_mgmt_event_notify(NET_EVENT_IF_DOWN, data->net_iface);
  
