@@ -1041,6 +1041,41 @@ static void erpc_wifi_socket_poll_task(void *arg1, void *arg2, void *arg3)
 	}
 }
 
+/*
+ * sockets[] is only zeroed once at boot, so a slot left in_use across an
+ * iface_down/iface_up cycle permanently consumes one of ERPC_WIFI_MAX_SOCKETS.
+ */
+static void erpc_wifi_socket_flush_all(void)
+{
+	erpc_wifi_lock();
+	for (int i = 0; i < ERPC_WIFI_MAX_SOCKETS; i++) {
+		struct erpc_wifi_socket *s = &sockets[i];
+		bool waiting;
+
+		if (!s->in_use) {
+			continue;
+		}
+
+		LOG_WRN("Flushing stale socket slot %d (fd=%d zfd=%d)", i, s->fd, s->zfd);
+
+		k_spinlock_key_t key = k_spin_lock(&s->state_lock);
+		s->in_use = false;
+		s->connected = false;
+		s->connect_pending = false;
+		s->fd = -1;
+		s->triggered_events |= SOCKET_EVENT_ERR | SOCKET_EVENT_CLOSE;
+		waiting = s->waiting;
+		s->waiting = false;
+		k_spin_unlock(&s->state_lock, key);
+
+		if (waiting) {
+			k_poll_signal_raise(&s->poll_signal, 0);
+		}
+		k_sem_give(&s->read_sem);
+	}
+	erpc_wifi_unlock();
+}
+
 static void ensure_poll_task_started(void)
 {
 	if (erpc_wifi_socket_poll_tid != NULL) {
@@ -1060,11 +1095,32 @@ static void ensure_poll_task_started(void)
 	k_thread_name_set(erpc_wifi_socket_poll_tid, "erpc_socket_poll");
 }
 
+/*
+ * Restart the poll task explicitly on iface_up; it is otherwise only created
+ * lazily from poll()/select(), so a reconnect with no socket activity would
+ * leave socket RX and DNS unserviced.
+ */
+int erpc_wifi_socket_poll_start(void)
+{
+	if (erpc_wifi_socket_poll_tid != NULL) {
+		return 0;
+	}
+
+	erpc_wifi_socket_flush_all();
+	erpc_wifi_offload_clear_srdy_pending();
+	k_sem_reset(&poll_task_sem);
+
+	ensure_poll_task_started();
+
+	return (erpc_wifi_socket_poll_tid != NULL) ? 0 : -EAGAIN;
+}
+
 int erpc_wifi_socket_poll_stop(void)
 {
 	struct k_work_sync sync;
 
 	if (erpc_wifi_socket_poll_tid == NULL) {
+		erpc_wifi_socket_flush_all();
 		return 0;
 	}
 
@@ -1079,6 +1135,7 @@ int erpc_wifi_socket_poll_stop(void)
 	}
 
 	erpc_wifi_socket_poll_tid = NULL;
+	erpc_wifi_socket_flush_all();
 	LOG_INF("Socket poll thread stopped");
 	return 0;
 }

@@ -934,6 +934,22 @@ static void erpc_wifi_mgmt_disconnect_work(struct k_work *work)
 	k_sem_give(&dev->sem_cmd_process);
 }
 
+/* Its sockets belong to the eRPC session that is about to be torn down. */
+static void erpc_wifi_dns_resolver_close(void)
+{
+#ifdef CONFIG_DNS_RESOLVER
+	struct dns_resolve_context *ctx = dns_resolve_get_default();
+
+	if (ctx != NULL) {
+		int rc = dns_resolve_close(ctx);
+
+		if (rc != 0 && rc != -ENOENT) {
+			LOG_WRN("DNS resolver close failed: %d", rc);
+		}
+	}
+#endif
+}
+
 static void erpc_wifi_iface_disable(const struct device *dev)
 {
  	struct erpc_wifi_data *data = dev->data;
@@ -945,6 +961,8 @@ static void erpc_wifi_iface_disable(const struct device *dev)
  	erpc_wifi_mgmt_disconnect(dev);
  
  	k_sem_take(&data->sem_cmd_process, K_MSEC(300));
+
+	erpc_wifi_dns_resolver_close();
  
 	int poll_ret = erpc_wifi_socket_poll_stop();
 	if (poll_ret != 0) {
@@ -2310,6 +2328,13 @@ static enum offloaded_net_if_types erpc_wifi_offload_get_type(void)
  
 		if (!ret) {
 			data->state = WIFI_STATE_INACTIVE;
+
+			/* Poll task is otherwise only created lazily by poll()/select() */
+			int poll_ret = erpc_wifi_socket_poll_start();
+
+			if (poll_ret != 0) {
+				LOG_ERR("Failed to start socket poll thread: %d", poll_ret);
+			}
 		} else {
 			erpc_wifi_deinit_erpc(data);
 		}
@@ -2459,6 +2484,11 @@ static void apply_dhcp_servers(struct net_if *iface, struct WIFIIPConfiguration_
 		LOG_WRN("DNS resolver context unavailable");
 		return;
 	}
+
+	/* An unchanged server list makes the reconfigure a no-op, which would keep
+	 * the resolver bound to sockets from the previous eRPC session.
+	 */
+	(void)dns_resolve_remove_source(ctx, net_if_get_by_iface(iface), DNS_SOURCE_DHCPV4);
 
 	int ret = dns_resolve_reconfigure_with_interfaces(ctx, dns_servers, NULL, dns_ifaces,
 							  DNS_SOURCE_DHCPV4);
