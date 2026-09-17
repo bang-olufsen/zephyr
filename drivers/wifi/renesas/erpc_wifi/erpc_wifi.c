@@ -1939,6 +1939,11 @@ static int erpc_wifi_mgmt_set_power_save(struct net_if *iface, struct wifi_ps_pa
 	switch (params->type) {
 
 	case WIFI_PS_PARAM_LISTEN_INTERVAL:
+		if (params->listen_interval == 0U || params->listen_interval == UINT16_MAX) {
+			LOG_WRN("PS set: invalid LISTEN_INTERVAL=%u", params->listen_interval);
+			return -EINVAL;
+		}
+
 		g_ps.listen_interval = (uint32_t)params->listen_interval;
 		g_ps.li_set = true;
 		return 0;
