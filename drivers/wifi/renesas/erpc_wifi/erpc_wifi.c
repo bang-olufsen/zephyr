@@ -1148,6 +1148,7 @@ static void ps_entry_guard_work(struct k_work *work)
 
 #define ERPC_WIFI_PS_DEFAULT_TIMEOUT_MS 3000U
 #define ERPC_WIFI_PS_DEFAULT_LISTEN_INTERVAL 10U
+#define ERPC_WIFI_PS_MAX_LISTEN_INTERVAL 6000U
 
 static bool erpc_wifi_ps_ip_ready(void)
 {
@@ -1939,7 +1940,8 @@ static int erpc_wifi_mgmt_set_power_save(struct net_if *iface, struct wifi_ps_pa
 	switch (params->type) {
 
 	case WIFI_PS_PARAM_LISTEN_INTERVAL:
-		if (params->listen_interval == 0U || params->listen_interval == UINT16_MAX) {
+		if (params->listen_interval == 0U ||
+		    params->listen_interval > ERPC_WIFI_PS_MAX_LISTEN_INTERVAL) {
 			LOG_WRN("PS set: invalid LISTEN_INTERVAL=%u", params->listen_interval);
 			return -EINVAL;
 		}
