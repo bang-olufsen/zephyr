@@ -1,0 +1,22 @@
+/*
+ * Copyright (c) 2026 Renesas Electronics Corporation
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+/ {
+	aliases {
+		/* Without this alias erpc_wifi_gpio_trigger_wakeup() compiles to a
+		 * no-op and the RA6W1 can never be woken from Sleep2/DPM.
+		 */
+		wakeup-gpio = &gpio_wakeup;
+	};
+
+	gpio_wakeup {
+		compatible = "gpio-leds";
+		gpio_wakeup: wakeup_gpio {
+			gpios = <&ioport2 6 GPIO_ACTIVE_HIGH>;
+			label = "Wakeup GPIO P206";
+		};
+	};
+};

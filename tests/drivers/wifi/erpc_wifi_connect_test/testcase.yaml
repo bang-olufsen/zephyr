@@ -1,0 +1,12 @@
+tests:
+  drivers.wifi.erpc_wifi.connect_test:
+    tags:
+      - drivers
+      - wifi
+      - erpc
+    platform_allow:
+      - ek_ra6m4
+    harness: ztest
+    # Needs a real RA6W1 running ra_wifi_erpc_server plus a reachable AP.
+    build_only: false
+    slow: true
