@@ -1102,6 +1102,12 @@ static void erpc_wifi_iface_disable(const struct device *dev)
 	erpc_wifi_cancel_work_bounded(&data->disconnect_work, 1000);
 	data->scan_cb = NULL;
 
+	/* If the module is asleep, wake it now before any eRPC-touching steps
+	 * (DNS resolver close, socket poll stop, disconnect). */
+	if (!erpc_wifi_transport_slave_ready()) {
+		LOG_INF("iface_disable: module asleep, triggering GPIO wakeup before socket cleanup");
+		(void)erpc_wifi_ensure_slave_awake(2000);
+	}
 	/* Close the DNS resolver while sockets and transport are still alive, so
 	 * its UDP sockets are really closed on RA6W1 and their slots are freed.
 	 */
