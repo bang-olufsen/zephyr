@@ -167,36 +167,60 @@ void erpc_wifi_gpio_trigger_wakeup(void)
 
 int erpc_wifi_ensure_slave_awake(uint32_t timeout_ms)
 {
-    if (erpc_wifi_transport_slave_ready()) {
-        //return 0;
-		if (erpc_wifi_ping(1000) != 0){
-			LOG_INF(" post wake ping failed");
+	if (erpc_wifi_transport_slave_ready()) {
+		if (erpc_wifi_ping(1000) == 0) {
+			/* Already awake and answering eRPC: nothing to do. */
+			return 0;
+		}
+		LOG_INF("Slave ready but ping failed; triggering GPIO wakeup pulse");
+	}
+
+	LOG_DBG("Slave not ready/asleep; triggering GPIO wakeup pulse");
+	erpc_wifi_gpio_trigger_wakeup();
+
+	int64_t start = k_uptime_get();
+	int64_t last_pulse = start;
+
+	while (!erpc_wifi_transport_slave_ready()) {
+		if ((k_uptime_get() - start) > (int64_t)timeout_ms) {
+			LOG_WRN("Slave wake handshake timeout (%u ms)", (unsigned int)timeout_ms);
 			return -ETIMEDOUT;
 		}
-    }
- 
-    LOG_DBG("Slave not ready/asleep; triggering GPIO wakeup pulse");
-    erpc_wifi_gpio_trigger_wakeup();
- 
-    int64_t start = k_uptime_get();
-    int64_t last_pulse = start;
- 
-    while (!erpc_wifi_transport_slave_ready()) {
-        if ((k_uptime_get() - start) > (int64_t)timeout_ms) {
-            LOG_WRN("Slave wake handshake timeout (%u ms)", (unsigned int)timeout_ms);
-            return -ETIMEDOUT;
-        }
- 
-        if ((k_uptime_get() - last_pulse) > 300) {
-            erpc_wifi_gpio_trigger_wakeup();
-            last_pulse = k_uptime_get();
-        }
- 
-        k_msleep(10);
-    }
- 
-    k_msleep(20);
-    return 0;
+
+		if ((k_uptime_get() - last_pulse) > 300) {
+			erpc_wifi_gpio_trigger_wakeup();
+			last_pulse = k_uptime_get();
+		}
+
+		k_msleep(10);
+	}
+
+	k_msleep(20);
+	return 0;
+}
+
+/*
+ * After a reset the RA6W1 boots into Sleep2 and needs a moment before it
+ * answers eRPC. Without this the first real command (WIFI_ConnectAP) fails with
+ * an eRPC error and is retried, which cost ~5 s and one failed association.
+ */
+static int erpc_wifi_wait_module_ready(uint32_t timeout_ms)
+{
+	int64_t deadline = k_uptime_get() + (int64_t)timeout_ms;
+	int rc = -ETIMEDOUT;
+
+	do {
+		(void)erpc_wifi_ensure_slave_awake(1000);
+
+		rc = erpc_wifi_send_cmd(ERPC_WIFI_PMGR_DPM_IS_ENABLED_CMD, NULL, 0, 1000);
+		if (rc >= 0) {
+			return 0;
+		}
+
+		k_msleep(100);
+	} while (k_uptime_get() < deadline);
+
+	return rc;
 }
 /* Short pulse for re-asserting SRDY when module is already awake (no DPM boot wait) */
 void erpc_wifi_gpio_wakeup_pulse_fast(void)
@@ -228,6 +252,25 @@ static void pmgr_timer_work_handler(struct k_work *work);
 static K_WORK_DEFINE(pmgr_timer_work, pmgr_timer_work_handler);
 static int erpc_wifi_init_erpc(struct erpc_wifi_data *data);
 static void erpc_wifi_deinit_erpc(struct erpc_wifi_data *data);
+static void erpc_wifi_ps_shutdown_local(void);
+int erpc_wifi_ping(uint32_t timeout_ms);
+static void erpc_wifi_ps_reset_session_local(void);
+static void erpc_wifi_dns_force_refresh_on_next_lease(void);
+
+/* Set for the whole iface_down teardown; cleared by iface_up. */
+static atomic_t g_iface_disabling;
+
+static inline bool erpc_wifi_iface_is_disabling(void)
+{
+	return atomic_get(&g_iface_disabling) != 0;
+}
+
+/* Management/API entry points must not start eRPC work while down/tearing down. */
+static inline bool erpc_wifi_iface_unavailable(const struct erpc_wifi_data *data)
+{
+	return erpc_wifi_iface_is_disabling() ||
+	       (data->state == WIFI_STATE_INTERFACE_DISABLED);
+}
 
 __weak void erpc_wifi_pmgr_timer_fired_hook(uint32_t job_id, const char *timer_name)
 {
@@ -375,67 +418,49 @@ static void n_int_iface_active_cb(const struct device *dev, struct gpio_callback
 	k_sem_give(&sem_if_enabled);
 }
 
- static int erpc_wifi_reset(void)
- {
+static int erpc_wifi_reset(void)
+{
 	erpc_wifi_socket_invalidate_active_job_cache();
 	k_timeout_t timeout = K_NO_WAIT;
- 	int err = 0;
- 
- 	err = erpc_wifi_acquire_reset_pin();
- 	if (err) {
- 		return err;
- 	}
- 
- #if DT_INST_NODE_HAS_PROP(0, reset_gpios)
- 	k_sleep(K_MSEC(DT_INST_PROP_OR(0, reset_assert_duration_ms, 0)));
- #endif
- 
- 	/* Release the device from reset */
- 	err = erpc_wifi_release_reset_pin();
- 	if (err) {
- 		return err;
- 	}
- 
- 	/* We can either wait a fixed amount of time for the RA6Wx device to
- 	   finish booting or we can wait for it to send us the reset complete
- 	   eveent. At present, the SPI interface does not support sending the
- 	   reset complete event so we have to just wait for boot to complete. */
- #if DT_INST_NODE_HAS_PROP(0, boot_duration_ms)
- 	k_sleep(K_MSEC(DT_INST_PROP_OR(0, boot_duration_ms, 0)));
- #else
- 	/*
- 	   While we are waiting for this sempahore the erpc_wifi_server_thread
- 	   is running and calling erpc_server_poll to check for any incoming
- 	   message. When a valid message is received the ra_erpc_server_event_handler
- 	   function is called. The eRPC middleware sets the nestingDetection flag
- 	   to true just before calling the hanlder and sets it to false when execution
- 	   of the handler is complete and it has returned.
- 
- 	   When the handler receives the eDeviceReset event it gives the
- 	   sem_if_ready sempaphore. This causes the thread running the handler
- 	   to immediately suspend and the RTOS starts running this init function
- 	   once again. It continues through this init function and starts running
- 	   main. In main the application calls a driver function, however this call
- 	   fails as when it calls the associated eRPC function a nesting error occurs
- 	   as the ra_erpc_server_event_handler has not yet had time to finish and so
- 	   the nestingDetection flag is still true...
- 
- 	   According to the Zephyr documentation, the system thread running this init
- 	   function has the highest priority and therefore we can simply increase the
- 	   priority of the erpc_wifi_server_thread to resolve this issue:
- 	   https://docs.zephyrproject.org/latest/kernel/services/threads/system_threads.html
- 	*/
- 	//err = k_sem_take(&erpc_wifi_driver_data->sem_if_ready, K_MSEC(CONFIG_WIFI_ERPC_WIFI_RESET_TIMEOUT));
- 	
+	int err = 0;
+
+	err = erpc_wifi_acquire_reset_pin();
+	if (err) {
+		return err;
+	}
+
+#if DT_INST_NODE_HAS_PROP(0, reset_gpios)
+	k_sleep(K_MSEC(DT_INST_PROP_OR(0, reset_assert_duration_ms, 0)));
+#endif
+
+	/* Drop any interface-ready indication latched before this reset (e.g. an
+	 * SRDY/n_int edge from the previous session) so the wait below really
+	 * waits for THIS boot.
+	 */
+	k_sem_reset(&sem_if_enabled);
+
+	/* Release the device from reset */
+	err = erpc_wifi_release_reset_pin();
+	if (err) {
+		return err;
+	}
+
+#if DT_INST_NODE_HAS_PROP(0, boot_duration_ms)
+	k_sleep(K_MSEC(DT_INST_PROP_OR(0, boot_duration_ms, 0)));
+#else
+	/* See git history for the eDeviceReset / nesting-detection background. */
 #ifdef CONFIG_WIFI_ERPC_WIFI_RESET_TIMEOUT
 	timeout = K_MSEC(CONFIG_WIFI_ERPC_WIFI_RESET_TIMEOUT);
 #endif
 	err = k_sem_take(&sem_if_enabled, timeout);
 	if (err) {
- 		return err;
- 	}
- #endif
- 
+		/* Not fatal: the RA boots into Sleep2 and is woken (with retries) by
+		 * the first connect/API call.
+		 */
+		LOG_WRN("RA6W1 boot indication not seen within timeout (%d); continuing", err);
+	}
+#endif
+
 	return 0;
 }
 
@@ -493,6 +518,10 @@ static int erpc_wifi_mgmt_scan(const struct device *dev, struct wifi_scan_params
 	int ret = 0;
 
 	LOG_DBG("erpc_wifi_mgmt_scan");
+
+	if (erpc_wifi_iface_unavailable(data)) {
+		return -ENETDOWN;
+	}
 	LOG_DBG("type: %d cb: 0x%x", params->scan_type, (int)data->scan_cb);
 
 	if (data->scan_cb != NULL) {
@@ -633,7 +662,9 @@ static void erpc_wifi_mgmt_scan_work(struct k_work *work)
 	//dev->scan_cb(dev->net_iface, 0, NULL);
 	dev->scan_cb = NULL;
 	net_mgmt_event_notify(NET_EVENT_WIFI_SCAN_DONE, dev->net_iface);
-	dev->state = WIFI_STATE_DISCONNECTED;
+	if (!erpc_wifi_iface_is_disabling()) {
+		dev->state = WIFI_STATE_DISCONNECTED;
+	}
 	
 	LOG_DBG("Scan end. Device state: %d", dev->state);
 }
@@ -754,6 +785,10 @@ static int erpc_wifi_mgmt_connect(const struct device *dev, struct wifi_connect_
 
 	LOG_INF("erpc_wifi_mgmt_connect: state: %d", data->state);
 
+	if (erpc_wifi_iface_unavailable(data)) {
+		return -ENETDOWN;
+	}
+
  	switch (data->state) {
  	case WIFI_STATE_DISCONNECTED:
  	case WIFI_STATE_INACTIVE:
@@ -847,6 +882,12 @@ static void erpc_wifi_mgmt_connect_work(struct k_work *work)
 
 	LOG_DBG("WIFI_ConnectAP: %d", ret);
 
+	if (erpc_wifi_iface_is_disabling()) {
+		/* iface_down teardown owns the state now. */
+		LOG_WRN("Connect finished during iface disable; result ignored");
+		return;
+	}
+
 	if (ret == eWiFiSuccess) {
 		dev->state = WIFI_STATE_COMPLETED;
 		LOG_INF("PS TRACE: enabling PS state after WIFI_ConnectAP success");
@@ -866,6 +907,10 @@ static int erpc_wifi_mgmt_disconnect(const struct device *dev)
 	struct erpc_wifi_data *data = dev->data;
 
 	LOG_DBG("erpc_wifi_mgmt_disconnect");
+
+	if (erpc_wifi_iface_unavailable(data)) {
+		return -ENETDOWN;
+	}
 
  	switch (data->state) {
  	case WIFI_STATE_DISCONNECTED:
@@ -912,6 +957,12 @@ static void erpc_wifi_mgmt_disconnect_work(struct k_work *work)
 
 	ret = (WIFIReturnCode_t)erpc_wifi_send_cmd(ERPC_WIFI_AP_DISCONNECT_CMD, NULL, 0, 5000);
 
+	if (erpc_wifi_iface_is_disabling()) {
+		/* iface_down teardown performs the disconnect cleanup itself. */
+		k_sem_give(&dev->sem_cmd_process);
+		return;
+	}
+
 	LOG_DBG("WIFI_Disconnect: %d", ret);
 
 	if (ret == eWiFiSuccess) {
@@ -935,52 +986,186 @@ static void erpc_wifi_mgmt_disconnect_work(struct k_work *work)
 }
 
 /* Its sockets belong to the eRPC session that is about to be torn down. */
-static void erpc_wifi_dns_resolver_close(void)
+#ifdef CONFIG_DNS_RESOLVER
+/*
+ * Diagnostic helper: how many server sockets the resolver currently holds.
+ * Touches dns_resolve_context internals, so it is kept in one place; if a
+ * Zephyr version renames these fields, only this function needs adjusting.
+ */
+static void erpc_wifi_dns_log_state(struct dns_resolve_context *ctx, const char *why)
+{
+	int open_socks = 0;
+
+	if (ctx == NULL) {
+		LOG_WRN("DNS[%s]: no default resolver context", why);
+		return;
+	}
+
+	for (int i = 0; i < (int)ARRAY_SIZE(ctx->servers); i++) {
+		if (ctx->servers[i].sock >= 0) {
+			LOG_INF("DNS[%s]: server[%d] sock=%d", why, i, ctx->servers[i].sock);
+			open_socks++;
+		}
+	}
+
+	LOG_INF("DNS[%s]: state=%d open_server_sockets=%d", why, (int)ctx->state, open_socks);
+}
+#endif
+
+static void erpc_wifi_dns_resolver_close(struct net_if *iface)
 {
 #ifdef CONFIG_DNS_RESOLVER
 	struct dns_resolve_context *ctx = dns_resolve_get_default();
 
 	if (ctx != NULL) {
-		int rc = dns_resolve_close(ctx);
+		int rc;
 
+		erpc_wifi_dns_log_state(ctx, "before-close");
+
+		/* Drop the DHCP-sourced entries so a future reconnect can't see an
+		 * "unchanged server list" and skip re-init against the new session.
+		 */
+		rc = dns_resolve_remove_source(ctx, net_if_get_by_iface(iface), DNS_SOURCE_DHCPV4);
+		LOG_INF("DNS: remove DHCPv4 source rc=%d", rc);
+
+		rc = dns_resolve_close(ctx);
 		if (rc != 0 && rc != -ENOENT) {
 			LOG_WRN("DNS resolver close failed: %d", rc);
+		} else {
+			LOG_INF("DNS: resolver closed rc=%d", rc);
 		}
+
+		erpc_wifi_dns_log_state(ctx, "after-close");
+	} else {
+		LOG_WRN("DNS: no default resolver context to close");
 	}
 #endif
 }
 
-static void erpc_wifi_iface_disable(const struct device *dev)
+/*
+ * iface_down fully closed the resolver context, so it must be reactivated here
+ * (with no/static servers) before a later DHCP lease can reconfigure it.
+ */
+static void erpc_wifi_dns_resolver_restore(void)
 {
- 	struct erpc_wifi_data *data = dev->data;
- 	WIFIReturnCode_t ret;
- 
- 	LOG_INF("erpc_wifi_iface_disable");
- 
- 	/* Queue disconnect first */
- 	erpc_wifi_mgmt_disconnect(dev);
- 
- 	k_sem_take(&data->sem_cmd_process, K_MSEC(300));
+#ifdef CONFIG_DNS_RESOLVER
+	struct dns_resolve_context *ctx = dns_resolve_get_default();
+	int rc;
 
-	erpc_wifi_dns_resolver_close();
- 
-	int poll_ret = erpc_wifi_socket_poll_stop();
-	if (poll_ret != 0) {
-		LOG_ERR("Failed to stop socket poll thread: %d", poll_ret);
+	if (ctx == NULL) {
+		LOG_WRN("DNS: no default resolver context to restore");
 		return;
 	}
 
-	int32_t rc = (int32_t)erpc_wifi_send_cmd(ERPC_WIFI_PMGR_ENTER_SLEEP2_CMD, NULL, 0, 500);
+	rc = dns_resolve_init_default(ctx);
+	if (rc != 0 && rc != -EALREADY && rc != -ENOTEMPTY && rc != -EINVAL) {
+		LOG_WRN("DNS resolver restore failed: %d", rc);
+	} else {
+		LOG_INF("DNS: resolver re-initialized rc=%d", rc);
+	}
+
+	erpc_wifi_dns_log_state(ctx, "after-restore");
+#endif
+}
+
+/* Cancel a work item and wait (bounded) if it is already running. Bounded on
+ * purpose: works may block on the net_if lock that net_if_down() holds while
+ * calling us. Any eRPC they still issue fails fast once the command queue is
+ * suspended.
+ */
+static void erpc_wifi_cancel_work_bounded(struct k_work *work, uint32_t timeout_ms)
+{
+	int64_t end = k_uptime_get() + (int64_t)timeout_ms;
+
+	(void)k_work_cancel(work);
+	while (((k_work_busy_get(work) & K_WORK_RUNNING) != 0) && (k_uptime_get() < end)) {
+		k_msleep(20);
+	}
+}
+
+static void erpc_wifi_iface_disable(const struct device *dev)
+{
+	struct erpc_wifi_data *data = dev->data;
+	enum wifi_iface_state prev_state = data->state;
+	int rc;
+
+	LOG_INF("erpc_wifi_iface_disable (state=%d)", prev_state);
+	atomic_set(&g_iface_disabling, 1);
+	erpc_wifi_socket_dump_table("iface_down-enter");
+
+	/* Stop DPM/PS timers locally (no eRPC). */
+	erpc_wifi_ps_shutdown_local();
+
+	/* Cancel pending scan/connect/disconnect works. */
+	erpc_wifi_cancel_work_bounded(&data->scan_work, 1000);
+	erpc_wifi_cancel_work_bounded(&data->connect_work, 1000);
+	erpc_wifi_cancel_work_bounded(&data->disconnect_work, 1000);
+	data->scan_cb = NULL;
+
+	/* Close the DNS resolver while sockets and transport are still alive, so
+	 * its UDP sockets are really closed on RA6W1 and their slots are freed.
+	 */
+	erpc_wifi_dns_resolver_close(data->net_iface);
+
+	/* Stop the socket poll task; remaining app sockets are invalidated */
+	erpc_wifi_socket_dump_table("after-dns-close");
+
+	rc = erpc_wifi_socket_poll_stop();
+	if (rc != 0) {
+		LOG_ERR("Failed to stop socket poll thread: %d (continuing teardown)", rc);
+	}
+
+	/* Disconnect synchronously in this thread. The disconnect work cannot be
+	 * used here: it takes the net_if lock that net_if_down() is holding.
+	 */
+	if (prev_state != WIFI_STATE_DISCONNECTED && prev_state != WIFI_STATE_INACTIVE &&
+	    prev_state != WIFI_STATE_INTERFACE_DISABLED) {
+		(void)erpc_wifi_ensure_slave_awake(2000);
+		rc = erpc_wifi_send_cmd(ERPC_WIFI_AP_DISCONNECT_CMD, NULL, 0, 5000);
+		LOG_INF("iface_disable: WIFI_Disconnect rc=%d", rc);
+		if (prev_state == WIFI_STATE_COMPLETED) {
+			wifi_mgmt_raise_disconnect_result_event(data->net_iface,
+								 WIFI_REASON_DISCONN_SUCCESS);
+		}
+	}
+	data->state = WIFI_STATE_DISCONNECTED;
+
+	rc = erpc_wifi_send_cmd(ERPC_WIFI_PMGR_ENTER_SLEEP2_CMD, NULL, 0, 500);
 	if (rc != 0) {
 		LOG_WRN("PMGR enter_sleep2 rejected/failed rc=%d", rc);
 	}
 
- 	erpc_wifi_deinit_erpc(data);
- 	net_mgmt_event_notify(NET_EVENT_IF_DOWN, data->net_iface);
- 
- 	data->state = WIFI_STATE_INTERFACE_DISABLED;
- 
- 	erpc_wifi_acquire_reset_pin();
+	rc = erpc_wifi_cmd_suspend(3000);
+	if (rc != 0) {
+		LOG_WRN("Command queue did not go idle (%d); deinit anyway", rc);
+	}
+
+	erpc_wifi_deinit_erpc(data);
+
+	/* Host-side cleanup: nothing of this session may survive into the next. */
+#if defined(CONFIG_NET_IPV4)
+	if (data->addr.s_addr != 0U) {
+		(void)net_if_ipv4_addr_rm(data->net_iface, &data->addr);
+	}
+#endif
+	memset(&data->addr, 0, sizeof(data->addr));
+	data->ipv4_assigned = false;
+#if defined(CONFIG_NET_IPV6)
+	data->ipv6_assigned = false;
+#endif
+	data->wifi_params_read = false;
+	net_if_dormant_on(data->net_iface);
+
+	erpc_wifi_ps_reset_session_local();
+	erpc_wifi_socket_session_reset();
+	erpc_wifi_dns_force_refresh_on_next_lease();
+
+	net_mgmt_event_notify(NET_EVENT_IF_DOWN, data->net_iface);
+
+	data->state = WIFI_STATE_INTERFACE_DISABLED;
+	erpc_wifi_socket_dump_table("iface_down-exit");
+
+	erpc_wifi_acquire_reset_pin();
 }
 /* -------------------------------------------------------------------------- */
 /* Wi-Fi Power Save (DPM)
@@ -1372,6 +1557,69 @@ void erpc_wifi_ps_cancel_sleep_work(void)
 		struct k_work_sync sync;
 		k_work_cancel_delayable_sync(&g_ps_enable_work, &sync);
 	}
+}
+
+/*
+ * Halt all PS/DPM timers locally (no eRPC) before touching the transport, so
+ * that a timer firing mid-teardown can never call into a partially/fully
+ * deinitialized eRPC client (matches prior MPU FAULT root cause).
+ */
+/*
+ * Cancel a delayable work item without k_work_cancel_delayable_sync():
+ * iface_down/iface_up run with the net_if lock held, while the PS work itself
+ * takes that lock (net_if_ipv4_get_global_addr), so a *_sync cancel can
+ * deadlock. Bounded wait instead; a late-running handler finds PS disabled and
+ * its eRPC calls fail fast once the command queue is suspended.
+ */
+static void erpc_wifi_cancel_delayable_bounded(struct k_work_delayable *dwork, uint32_t timeout_ms)
+{
+	int64_t end = k_uptime_get() + (int64_t)timeout_ms;
+
+	(void)k_work_cancel_delayable(dwork);
+	while ((k_work_delayable_busy_get(dwork) != 0) && (k_uptime_get() < end)) {
+		k_msleep(10);
+	}
+}
+
+static void erpc_wifi_ps_shutdown_local(void)
+{
+	erpc_wifi_cancel_delayable_bounded(&g_ps_enable_work, 1000);
+	erpc_wifi_cancel_delayable_bounded(&g_ps_entry_guard_work, 500);
+	erpc_wifi_cancel_delayable_bounded(&g_sleep2_reentry_work, 500);
+
+	k_mutex_lock(&g_ps_mutex, K_FOREVER);
+	g_ps.allow_sleep_sent = false;
+	g_ps.sleep_confirmed = false;
+	g_ps.socket_connect_pending = false;
+	g_ps.wait_for_srdy_low = false;
+	k_mutex_unlock(&g_ps_mutex);
+}
+
+/*
+ * Full host-side PS reset for a new RA6W1 session (the module is hardware
+ * reset on iface_up, so it holds no sleep constraint and has PS disabled).
+ * Without this, e.g. a stale sleep_constraint_held=true makes the next
+ * "ps 1" skip the SLEEP_PROHIBITED ADD, and the host/RA states diverge.
+ * Configured PS parameters (listen interval, timeout, ...) are kept.
+ */
+static void erpc_wifi_ps_reset_session_local(void)
+{
+	erpc_wifi_cancel_delayable_bounded(&g_ps_enable_work, 1000);
+	erpc_wifi_cancel_delayable_bounded(&g_ps_entry_guard_work, 500);
+
+	k_mutex_lock(&g_ps_mutex, K_FOREVER);
+	g_ps.enabled = false;
+	g_ps.allow_sleep_sent = false;
+	g_ps.sleep_confirmed = false;
+	g_ps.socket_connect_pending = false;
+	g_ps.sleep_constraint_held = false;
+	g_ps.transitioning = false;
+	g_ps.wait_for_srdy_low = false;
+	g_ps.constraint_transition = false;
+	erpc_wifi_ps_set_state(ERPC_WIFI_PS_STATE_AWAKE);
+	k_mutex_unlock(&g_ps_mutex);
+
+	erpc_wifi_socket_tx_block_set(false, 0U);
 }
 
 static void erpc_wifi_ps_set_state_internal(bool enabled, const char *source)
@@ -1956,15 +2204,16 @@ static int erpc_wifi_mgmt_get_power_save_config(const struct device *dev, struct
   	return 0;
 }
   
-static int erpc_wifi_mgmt_set_power_save(struct net_if *iface, struct wifi_ps_params *params)
+/* Signature must match wifi_mgmt_ops.set_power_save in this Zephyr version. */
+static int erpc_wifi_mgmt_set_power_save(const struct device *dev, struct wifi_ps_params *params)
 {
-	ARG_UNUSED(iface);
+	ARG_UNUSED(dev);
 	struct erpc_wifi_data *data = &erpc_wifi_driver_data;
 	if (params == NULL) {
 		return -EINVAL;
 	}
 
-	if (data && data->state == WIFI_STATE_INTERFACE_DISABLED) {
+	if (data && erpc_wifi_iface_unavailable(data)) {
 		return -EPERM;
 	}
 
@@ -2208,7 +2457,10 @@ int erpc_wifi_mgmt_iface_status(const struct device *dev, struct wifi_iface_stat
 				}
 			}
 
-			int8_t live_rssi = g_cached_iface_rssi;
+			/* static: the queued command may still write it after a caller timeout */
+			static int8_t live_rssi;
+
+			live_rssi = g_cached_iface_rssi;
 			erpc_wifi_get_rssi_t rssi_msg = { .rssi = &live_rssi };
 			int rssi_rc = erpc_wifi_send_cmd(
 				ERPC_WIFI_AP_GET_RSSI_CMD,
@@ -2257,6 +2509,10 @@ int erpc_wifi_mgmt_get_version(const struct device *dev, struct wifi_version *pa
 {
 	struct erpc_wifi_data *data = dev->data;
 
+	if (erpc_wifi_iface_unavailable(data)) {
+		return -ENETDOWN;
+	}
+
 	(void)erpc_wifi_ensure_slave_awake(5000);
 
 	erpc_wifi_driver_version_t ver_msg = {
@@ -2295,64 +2551,98 @@ static enum offloaded_net_if_types erpc_wifi_offload_get_type(void)
 	return L2_OFFLOADED_NET_IF_TYPE_WIFI;
 }
 
- static int erpc_wifi_iface_enable(const struct net_if *iface, bool state)
- {
- 	int ret = 0;
- 	struct erpc_wifi_data *data = &erpc_wifi_driver_data;
- 
- 	LOG_DBG("WiFi Iface %p enable: %d", iface, state);
- 
- 	if (!iface) {
- 		return -ENODEV;
- 	}
- 
- 	if (state) {
- 
- 		if (data->state != WIFI_STATE_INTERFACE_DISABLED) {
- 			LOG_INF("Device already enabled");
- 			return -EALREADY;
- 		}
- 
- 		ret = erpc_wifi_init_erpc(data);
- 		if (ret != 0) {
- 			LOG_ERR("Failed to initialize eRPC stack: %d", ret);
- 			data->state = WIFI_STATE_INTERFACE_DISABLED;
- 		} else {
- 			data->state = WIFI_STATE_INACTIVE;
- 		}
- 
- 		erpc_wifi_release_reset_pin();
-		erpc_wifi_reset();
- 
+static int erpc_wifi_iface_enable(const struct net_if *iface, bool state)
+{
+	int ret = 0;
+	struct erpc_wifi_data *data = &erpc_wifi_driver_data;
+
+	LOG_DBG("WiFi Iface %p enable: %d", iface, state);
+
+	if (!iface) {
+		return -ENODEV;
+	}
+
+	if (state) {
+
+		if (data->state != WIFI_STATE_INTERFACE_DISABLED) {
+			LOG_INF("Device already enabled");
+			return -EALREADY;
+		}
+
+		/* New RA6W1 boot = new session: drop every host-side cache. */
+		erpc_wifi_ps_reset_session_local();
+		erpc_wifi_socket_session_reset();
+		erpc_wifi_dns_force_refresh_on_next_lease();
+		memset(&data->addr, 0, sizeof(data->addr));
+		data->ipv4_assigned = false;
+#if defined(CONFIG_NET_IPV6)
+		data->ipv6_assigned = false;
+#endif
+		data->wifi_params_read = false;
+		data->scan_cb = NULL;
+
+		ret = erpc_wifi_init_erpc(data);
+		if (ret != 0) {
+			LOG_ERR("Failed to initialize eRPC stack: %d", ret);
+			data->state = WIFI_STATE_INTERFACE_DISABLED;
+		} else {
+			erpc_wifi_cmd_resume();
+			data->state = WIFI_STATE_INACTIVE;
+		}
+
+		/* erpc_wifi_reset() asserts and then releases reset itself. */
+		int reset_ret = erpc_wifi_reset();
+		if (reset_ret != 0) {
+			LOG_ERR("Module reset/boot-wait failed: %d", reset_ret);
+			data->state = WIFI_STATE_INTERFACE_DISABLED;
+			ret = ret ? ret : reset_ret;
+		}
+
 		gpio_remove_callback(data->n_int_gpio->port, &data->n_int_cb);
- 
+
 		if (!ret) {
 			data->state = WIFI_STATE_INACTIVE;
+			atomic_set(&g_iface_disabling, 0);
 
-			/* Poll task is otherwise only created lazily by poll()/select() */
+			/* Let the module finish booting before the first real command. */
+			int ready_rc = erpc_wifi_wait_module_ready(3000);
+
+			if (ready_rc != 0) {
+				LOG_WRN("RA6W1 not answering eRPC after reset (%d); first command will retry",
+					ready_rc);
+			} else {
+				LOG_INF("RA6W1 ready after reset");
+			}
+
+			/* Restart the socket poll task (flushes sockets[] and resets
+			 * SRDY bookkeeping).
+			 */
 			int poll_ret = erpc_wifi_socket_poll_start();
 
 			if (poll_ret != 0) {
 				LOG_ERR("Failed to start socket poll thread: %d", poll_ret);
 			}
+
+			/* Re-activate the resolver; the next DHCP lease re-applies DNS. */
+			erpc_wifi_dns_resolver_restore();
+			erpc_wifi_socket_dump_table("iface_up-done");
 		} else {
+			(void)erpc_wifi_cmd_suspend(1000);
 			erpc_wifi_deinit_erpc(data);
+			data->state = WIFI_STATE_INTERFACE_DISABLED;
 		}
- 
- 	} else {
- 
- 		if (data->state != WIFI_STATE_INTERFACE_DISABLED) {
- 			// erpc_wifi_deinit_erpc(data);
- 			// erpc_wifi_stop_event_monitor();
- 			// data->state = WIFI_STATE_INTERFACE_DISABLED;
+
+	} else {
+
+		if (data->state != WIFI_STATE_INTERFACE_DISABLED) {
 			erpc_wifi_iface_disable(iface->if_dev->dev);
- 		}
- 	}
- 
- 	LOG_DBG("enable state: %d satus: %d (%s)", state, ret, strerror(-ret));
- 
- 	return ret;
- }
+		}
+	}
+
+	LOG_DBG("enable state: %d satus: %d (%s)", state, ret, strerror(-ret));
+
+	return ret;
+}
  
 static void erpc_wifi_iface_init(struct net_if *iface)
 {
@@ -2441,6 +2731,18 @@ static void erpc_wifi_client_error_handler(erpc_status_t err, uint32_t func_id)
 }
 
 #ifdef CONFIG_DNS_RESOLVER
+/* DNS servers currently applied to the resolver (raw, network order). */
+static uint32_t g_dns_applied[2];
+/* DNS servers from the most recent DHCP lease (used by refresh). */
+static uint32_t g_dns_last_lease[2];
+/* Force the next apply even if the list is unchanged (new session / dead socket). */
+static atomic_t g_dns_force_apply = ATOMIC_INIT(1);
+
+static void erpc_wifi_dns_force_refresh_on_next_lease(void)
+{
+	atomic_set(&g_dns_force_apply, 1);
+}
+
 static void apply_dhcp_servers(struct net_if *iface, struct WIFIIPConfiguration_t *config)
 {
 	// erpc Driver is hard coded to 2 entries
@@ -2448,20 +2750,12 @@ static void apply_dhcp_servers(struct net_if *iface, struct WIFIIPConfiguration_
 	const char *dns_servers[CONFIG_DNS_RESOLVER_MAX_SERVERS + 1] = {0};
 	int dns_ifaces[CONFIG_DNS_RESOLVER_MAX_SERVERS + 1] = {0};
 	char addr_strings[num_servers][NET_IPV4_ADDR_LEN + 1];
+	uint32_t raw[2] = { config->xDns1.ulAddress[0], config->xDns2.ulAddress[0] };
 	int count = 0;
 	struct dns_resolve_context *ctx;
 
 	for (int i = 0; i < num_servers; i++) {
-		uint32_t addr_raw;
-
-		if (i == 0) {
-			addr_raw = config->xDns1.ulAddress[0];
-		} else if (i == 1) {
-			addr_raw = config->xDns2.ulAddress[0];
-		} else {
-			assert(false);
-			continue;
-		}
+		uint32_t addr_raw = raw[i];
 
 		if (addr_raw == 0U) {
 			continue;
@@ -2475,7 +2769,22 @@ static void apply_dhcp_servers(struct net_if *iface, struct WIFIIPConfiguration_
 	}
 
 	if (count == 0) {
-		LOG_WRN("No valid DHCP DNS servers to apply");
+		LOG_DBG("No valid DHCP DNS servers in this event");
+		return;
+	}
+
+	g_dns_last_lease[0] = raw[0];
+	g_dns_last_lease[1] = raw[1];
+
+	/*
+	 * RA6W1 repeats eNetworkInterfaceIPAssigned. Re-configuring the resolver on
+	 * every repeat closes and recreates its UDP sockets (in-flight queries fail,
+	 * and RA fd numbers churn and collide with new sockets such as MQTT).
+	 * Only apply when the server list changed or a refresh is forced.
+	 */
+	if (atomic_get(&g_dns_force_apply) == 0 &&
+	    raw[0] == g_dns_applied[0] && raw[1] == g_dns_applied[1]) {
+		LOG_DBG("DHCP DNS servers unchanged; resolver already configured");
 		return;
 	}
 
@@ -2493,9 +2802,50 @@ static void apply_dhcp_servers(struct net_if *iface, struct WIFIIPConfiguration_
 	int ret = dns_resolve_reconfigure_with_interfaces(ctx, dns_servers, NULL, dns_ifaces,
 							  DNS_SOURCE_DHCPV4);
 	LOG_INF("DNS resolve reconfigure: %d (%s)", ret, strerror(-ret));
+
+	if (ret == 0) {
+		g_dns_applied[0] = raw[0];
+		g_dns_applied[1] = raw[1];
+		atomic_set(&g_dns_force_apply, 0);
+	}
+}
+
+static void erpc_wifi_dns_refresh_work_handler(struct k_work *work)
+{
+	ARG_UNUSED(work);
+	struct erpc_wifi_data *data = &erpc_wifi_driver_data;
+	struct WIFIIPConfiguration_t cfg;
+
+	if (erpc_wifi_iface_is_disabling() || data->state != WIFI_STATE_COMPLETED) {
+		/* Force flag stays set: the next DHCP lease re-applies. */
+		return;
+	}
+
+	if (g_dns_last_lease[0] == 0U && g_dns_last_lease[1] == 0U) {
+		LOG_WRN("DNS refresh requested but no DHCP DNS servers known yet");
+		return;
+	}
+
+	memset(&cfg, 0, sizeof(cfg));
+	cfg.xDns1.ulAddress[0] = g_dns_last_lease[0];
+	cfg.xDns2.ulAddress[0] = g_dns_last_lease[1];
+
+	LOG_INF("Re-applying DNS servers (resolver socket was invalidated)");
+	atomic_set(&g_dns_force_apply, 1);
+	apply_dhcp_servers(data->net_iface, &cfg);
+}
+
+static K_WORK_DEFINE(g_dns_refresh_work, erpc_wifi_dns_refresh_work_handler);
+
+void erpc_wifi_dns_request_refresh(void)
+{
+	atomic_set(&g_dns_force_apply, 1);
+	(void)k_work_submit_to_queue(&erpc_wifi_driver_data.workq, &g_dns_refresh_work);
 }
 #else
 static void apply_dhcp_servers(struct net_if *iface, struct WIFIIPConfiguration_t *config) {}
+static void erpc_wifi_dns_force_refresh_on_next_lease(void) {}
+void erpc_wifi_dns_request_refresh(void) {}
 #endif
 
 static void erpc_wifi_apply_dhcp_lease(struct net_if *iface, struct WIFIIPConfiguration_t *config)
@@ -2545,10 +2895,26 @@ static void erpc_wifi_apply_dhcp_lease(struct net_if *iface, struct WIFIIPConfig
 
 		// Clear existing addresses and add new one
 #if defined(CONFIG_NET_IPV4)
-		net_if_ipv4_addr_rm(iface, &ip);
-		struct net_if_addr *ifaddr = net_if_ipv4_addr_add(iface, &ip, NET_ADDR_DHCP, 0);
+		/* RA6W1 repeats the IP-assigned event; re-adding the same address
+		 * removes it for a moment (breaking sockets being set up) and spams
+		 * DHCP_BOUND. Only (re)apply when the address actually changed.
+		 */
+		bool addr_unchanged = data->ipv4_assigned && (data->addr.s_addr == ip.s_addr);
+		struct net_if_addr *ifaddr = NULL;
 
-		if (ifaddr) {
+		if (addr_unchanged) {
+			LOG_DBG("IPv4 lease unchanged; address already applied");
+		} else {
+			if (data->addr.s_addr != 0U && data->addr.s_addr != ip.s_addr) {
+				(void)net_if_ipv4_addr_rm(iface, &data->addr);
+			}
+			net_if_ipv4_addr_rm(iface, &ip);
+			ifaddr = net_if_ipv4_addr_add(iface, &ip, NET_ADDR_DHCP, 0);
+		}
+
+		if (addr_unchanged) {
+			/* Nothing to do for this session. */
+		} else if (ifaddr) {
 			net_if_ipv4_set_netmask_by_addr(iface, &ip, &netmask);
 			net_if_ipv4_set_gw(iface, &gateway);
 

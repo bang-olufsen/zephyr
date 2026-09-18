@@ -8,6 +8,7 @@
 #include <zephyr/kernel.h>
 #include <zephyr/toolchain.h>
 #include "erpc_wifi.h"
+#include "erpc_wifi_socket_offload.h"
 #include "erpc_wifi_transport.h"
 #include "erpc_wifi_cmd.h"
 #include "erpc_wifi_cmd_process_handlers.h"
@@ -19,6 +20,17 @@
 #define ERPC_PMGR_JOB_ID_RECV (2U)
 #endif
 #define ERPC_WIFI_MAX_SOCKETS 4
+
+/*
+ * Minimum spacing between two GET_SOCKET_EVT queries for the same socket.
+ *
+ * Every host eRPC response also produces an SRDY edge, which kicks the poll
+ * task, which queries again: without this floor the poll task issues one
+ * SPI/eRPC transaction every ~20 ms for minutes, starving real send/recv
+ * traffic and keeping RA6W1 from ever settling. Waiters were serviced every
+ * 200 ms by design, so a 100 ms floor costs no real latency.
+ */
+#define ERPC_WIFI_SOCK_EVT_MIN_INTERVAL_MS 100
 LOG_MODULE_REGISTER(erpc_wifi_socket_offload, CONFIG_WIFI_LOG_LEVEL);
 
 void erpc_wifi_lock(void);
@@ -301,18 +313,40 @@ extern void erpc_wifi_unlock(void);
 #define PMGR_CONSTRAINT_POWER_RAM (1U << 2)
 #endif
 
+/* Cached per eRPC session; reset by erpc_wifi_socket_session_reset() because
+ * the RA6W1 is hardware-reset on every iface_up.
+ */
+static atomic_t g_pmgr_dpm_cached = ATOMIC_INIT(-1);
+
 static int pmgr_dpm_cached_enabled(void)
 {
-	static int cached = -1;
+	atomic_val_t cached = atomic_get(&g_pmgr_dpm_cached);
 
 	if (cached >= 0) {
-		return cached;
+		return (int)cached;
 	}
 
 	int32_t en = (int32_t)erpc_wifi_send_cmd(ERPC_WIFI_PMGR_DPM_IS_ENABLED_CMD, NULL, 0, -1);
-	cached = (en == 1) ? 1 : 0;
-	return cached;
+
+	if (en < 0) {
+		/* Queue/transport error: do not cache a guess for the whole session. */
+		return 0;
+	}
+
+	atomic_set(&g_pmgr_dpm_cached, (en == 1) ? 1 : 0);
+	return (en == 1) ? 1 : 0;
 }
+
+/* Clear every host-side cache that describes the previous RA6W1 boot. */
+void erpc_wifi_socket_session_reset(void)
+{
+	atomic_set(&g_pmgr_dpm_cached, -1);
+	atomic_set(&g_host_wake_inflight, 0);
+	erpc_wifi_socket_tx_block_set(false, 0U);
+	erpc_wifi_socket_invalidate_active_job_cache();
+	erpc_wifi_offload_clear_srdy_pending();
+}
+
 
 static inline int pmgr_ram_hold(void)
 {
@@ -461,7 +495,18 @@ static int erpc_wifi_poll_hup_on_iface_down(struct zvfs_pollfd *fds, int nfds)
 {
 	int ret = 0;
 
-	if (net_if_is_up(net_iface)) {
+	if (net_iface == NULL) {
+		return 0;
+	}
+
+	/*
+	 * Only a disabled/torn-down interface means every driver socket is gone.
+	 * net_if_is_up() is ALSO false while the interface is merely DORMANT (admin
+	 * up, Wi-Fi not connected yet), and HUP-ing sockets in that window breaks
+	 * every socket created between iface_up and a successful connect.
+	 */
+	if (erpc_wifi_driver_data.state != WIFI_STATE_INTERFACE_DISABLED &&
+	    net_if_flag_is_set(net_iface, NET_IF_UP)) {
 		return 0;
 	}
 
@@ -542,6 +587,8 @@ struct erpc_wifi_socket {
 	uint32_t recv_timeout_ms;
 	uint32_t send_timeout_ms;
 	bool closing;            // true if close() is in progress
+	bool dead;               // remote socket is gone (iface down / RA fd reuse); slot kept until app close()
+	int64_t last_evt_query_ms; // last GET_SOCKET_EVT for this socket (rate limit)
 	struct k_spinlock state_lock;
 
 	struct sockaddr addr;
@@ -550,11 +597,54 @@ struct erpc_wifi_socket {
 
 static struct erpc_wifi_socket sockets[ERPC_WIFI_MAX_SOCKETS];
 
+/* Protects slot allocation/invalidation/free (erpc_wifi_lock() is a no-op). */
+static K_MUTEX_DEFINE(g_socket_table_mutex);
+
+/*
+ * A "dead" socket still owns its slot (the application still holds the Zephyr
+ * fd), but it has no remote counterpart any more. All operations on it must
+ * fail locally instead of issuing eRPC calls with a stale/invalid remote fd,
+ * and the slot must not be handed to a new socket until the app closes it.
+ */
+static inline bool erpc_wifi_socket_is_dead(const struct erpc_wifi_socket *sock)
+{
+	return (sock == NULL) || !sock->in_use || sock->dead || (sock->fd < 0);
+}
+/* Diagnostic: print every slot so a socket that survives a teardown is named. */
+void erpc_wifi_socket_dump_table(const char *why)
+{
+	bool any = false;
+
+	for (int i = 0; i < ERPC_WIFI_MAX_SOCKETS; i++) {
+		struct erpc_wifi_socket *s = &sockets[i];
+
+		if (!s->in_use) {
+			continue;
+		}
+
+		any = true;
+		LOG_INF("SOCKTAB[%s] slot=%d zfd=%d ra_fd=%d type=%s dead=%d waiting=%d conn=%d conn_pend=%d port=%u dpm_filter=%d",
+			why ? why : "?", i, s->zfd, s->fd,
+			(s->type == SOCK_STREAM) ? "TCP" : ((s->type == SOCK_DGRAM) ? "UDP" : "other"),
+			(int)s->dead, (int)s->waiting, (int)s->connected,
+			(int)s->connect_pending, (unsigned int)s->bound_port,
+			(int)s->tcp_dpm_filter_set);
+	}
+
+	if (!any) {
+		LOG_INF("SOCKTAB[%s] no sockets in use", why ? why : "?");
+	}
+}
+
 bool erpc_wifi_has_active_tcp_traffic(void)
 {
 	int64_t now = k_uptime_get();
 	for (int i = 0; i < ERPC_WIFI_MAX_SOCKETS; i++) {
-		if (sockets[i].in_use && sockets[i].type == SOCK_STREAM) {
+		if (!sockets[i].in_use || sockets[i].dead) {
+			continue;
+		}
+
+		if (sockets[i].type == SOCK_STREAM) {
 			/* For non-DPM sockets (like HTTPS), hold sleep while waiting or for 15s after TX */
 			if (!sockets[i].tcp_dpm_filter_set) {
 				if (sockets[i].waiting && !erpc_wifi_ps_is_module_asleep()) {
@@ -568,6 +658,15 @@ bool erpc_wifi_has_active_tcp_traffic(void)
 				if (sockets[i].last_tx_ms > 0 && (now - sockets[i].last_tx_ms) < 3000) {
 					return true;
 				}
+			}
+		} else if (sockets[i].type == SOCK_DGRAM) {
+			/*
+			 * UDP (DNS) replies cannot wake RA6W1 from DPM (no UDP DPM filter
+			 * support), so keep the module awake for a short window after a
+			 * datagram was sent, long enough for the reply / one retransmit.
+			 */
+			if (sockets[i].last_tx_ms > 0 && (now - sockets[i].last_tx_ms) < 4000) {
+				return true;
 			}
 		}
 	}
@@ -627,7 +726,7 @@ static void erpc_wifi_srdy_deferred_work(struct k_work *work)
 	/*
 	 * Do one socket-event recovery pass for the deferred SRDY event.
 	 */
-	LOG_INF("SRDY deferred work: executing poll task recovery kick");
+	LOG_DBG("SRDY deferred work: executing poll task recovery kick");
 	k_sem_give(&poll_task_sem);
 }
 
@@ -674,7 +773,7 @@ static void erpc_wifi_socket_poll_task(void *arg1, void *arg2, void *arg3)
 		bool dpm_polling_needed = false;
 
 		for (int i = 0; i < ERPC_WIFI_MAX_SOCKETS; i++) {
-			if (!sockets[i].in_use) {
+			if (!sockets[i].in_use || sockets[i].dead) {
 				continue;
 			}
 
@@ -698,6 +797,7 @@ static void erpc_wifi_socket_poll_task(void *arg1, void *arg2, void *arg3)
 		    break;
 		}
 		bool fallback_timeout = (wait_rc != 0);
+		bool queried_any = false;
 		bool dpm_timeout = fallback_timeout && !waiter_polling_needed && dpm_polling_needed;
 
 		/*
@@ -797,7 +897,7 @@ static void erpc_wifi_socket_poll_task(void *arg1, void *arg2, void *arg3)
 		for (int i = 0; i < ERPC_WIFI_MAX_SOCKETS; i++) {
 			struct erpc_wifi_socket *sock = &sockets[i];
 
-			if (!sock->in_use) {
+			if (!sock->in_use || sock->dead) {
 				continue;
 			}
 
@@ -913,6 +1013,21 @@ static void erpc_wifi_socket_poll_task(void *arg1, void *arg2, void *arg3)
 				}
 			}
 
+			/*
+			 * Rate-limit event queries per socket (see
+			 * ERPC_WIFI_SOCK_EVT_MIN_INTERVAL_MS). ERR/CLOSE/RX that arrive in
+			 * between are picked up by the next pass, at most 100 ms later.
+			 */
+			int64_t evt_now = k_uptime_get();
+
+			if (sock->last_evt_query_ms != 0 &&
+			    (evt_now - sock->last_evt_query_ms) <
+				    (int64_t)ERPC_WIFI_SOCK_EVT_MIN_INTERVAL_MS) {
+				continue;
+			}
+			sock->last_evt_query_ms = evt_now;
+			queried_any = true;
+
 			int ev_fd = sock->fd;
 
 			atomic_set(&g_socket_evt_query_inflight, 1);
@@ -925,7 +1040,9 @@ static void erpc_wifi_socket_poll_task(void *arg1, void *arg2, void *arg3)
 
 			atomic_set(&g_socket_evt_query_inflight, 0);
 
-			if (events == UINT32_MAX) {
+			/* Any negative send_cmd() result (-EAGAIN, -ETIMEDOUT, -ENETDOWN, ...)
+			 * is a failure, not an event bitmask. */
+			if ((int32_t)events < 0) {
 				LOG_DBG("poll get_socket_events failed fd=%d; deferring", sock->fd);
 				continue;
 			}
@@ -940,7 +1057,7 @@ static void erpc_wifi_socket_poll_task(void *arg1, void *arg2, void *arg3)
 			sock->triggered_events |= (short)all_events;
 
 			if (events != 0 && events != UINT32_MAX) {
-				LOG_INF("poll_task: fd=%d events=0x%04x (all_events=0x%04x, waiting=%d)",
+				LOG_DBG("poll_task: fd=%d events=0x%04x (all_events=0x%04x, waiting=%d)",
 					sock->fd, events, all_events, sock->waiting);
 			}
 
@@ -1026,7 +1143,7 @@ static void erpc_wifi_socket_poll_task(void *arg1, void *arg2, void *arg3)
 			}
 
 			if (do_signal) {
-				LOG_INF("poll_task: raising poll_signal for fd=%d (ready=0x%04x)", sock->fd, ready);
+				LOG_DBG("poll_task: raising poll_signal for fd=%d (ready=0x%04x)", sock->fd, ready);
 				k_poll_signal_raise(&sock->poll_signal, (int)ready);
 			}
 		}
@@ -1038,6 +1155,15 @@ static void erpc_wifi_socket_poll_task(void *arg1, void *arg2, void *arg3)
 		if (autonomous_started) {
 			erpc_wifi_ps_finish_autonomous_wakeup();
 		}
+
+		/*
+		 * Nothing was queried (all sockets inside their rate-limit window) and
+		 * this pass came from a semaphore give, not the servicing timeout:
+		 * back off briefly so the SRDY-edge/poll feedback loop cannot spin.
+		 */
+		if (!queried_any && !fallback_timeout) {
+			k_msleep(20);
+		}
 	}
 }
 
@@ -1045,35 +1171,54 @@ static void erpc_wifi_socket_poll_task(void *arg1, void *arg2, void *arg3)
  * sockets[] is only zeroed once at boot, so a slot left in_use across an
  * iface_down/iface_up cycle permanently consumes one of ERPC_WIFI_MAX_SOCKETS.
  */
+static void erpc_wifi_socket_mark_dead(struct erpc_wifi_socket *s)
+{
+	bool was_connect_pending;
+
+	k_spinlock_key_t key = k_spin_lock(&s->state_lock);
+	was_connect_pending = s->connect_pending;
+	s->dead = true;
+	s->connected = false;
+	s->connect_pending = false;
+	s->fd = -1;
+	s->tcp_dpm_filter_set = false;
+	s->last_tx_ms = 0;
+	s->socket_error = ECONNRESET;
+	s->triggered_events |= SOCKET_EVENT_ERR | SOCKET_EVENT_CLOSE;
+	s->waiting = false;
+	k_spin_unlock(&s->state_lock, key);
+
+	/* Always release any waiter; raising a signal with no waiter is harmless. */
+	k_poll_signal_raise(&s->poll_signal, SOCKET_EVENT_ERR | SOCKET_EVENT_CLOSE);
+	k_sem_give(&s->read_sem);
+
+	if (was_connect_pending) {
+		erpc_wifi_ps_notify_socket_connect_failed();
+	}
+}
+
+/*
+ * Called when the eRPC session ends (iface_down) / restarts (iface_up).
+ * Slots are NOT freed here: the application still owns the Zephyr fd, and
+ * reusing the slot for a new socket would alias the old fd onto the new socket
+ * (old recv() stealing new data, old close() closing the new socket).
+ * The slot is released when the application calls close().
+ */
 static void erpc_wifi_socket_flush_all(void)
 {
-	erpc_wifi_lock();
+	k_mutex_lock(&g_socket_table_mutex, K_FOREVER);
 	for (int i = 0; i < ERPC_WIFI_MAX_SOCKETS; i++) {
 		struct erpc_wifi_socket *s = &sockets[i];
-		bool waiting;
 
-		if (!s->in_use) {
+		if (!s->in_use || s->dead) {
 			continue;
 		}
 
-		LOG_WRN("Flushing stale socket slot %d (fd=%d zfd=%d)", i, s->fd, s->zfd);
-
-		k_spinlock_key_t key = k_spin_lock(&s->state_lock);
-		s->in_use = false;
-		s->connected = false;
-		s->connect_pending = false;
-		s->fd = -1;
-		s->triggered_events |= SOCKET_EVENT_ERR | SOCKET_EVENT_CLOSE;
-		waiting = s->waiting;
-		s->waiting = false;
-		k_spin_unlock(&s->state_lock, key);
-
-		if (waiting) {
-			k_poll_signal_raise(&s->poll_signal, 0);
-		}
-		k_sem_give(&s->read_sem);
+		LOG_WRN("Invalidating socket slot %d (fd=%d zfd=%d): eRPC session ended",
+			i, s->fd, s->zfd);
+		erpc_wifi_socket_mark_dead(s);
 	}
-	erpc_wifi_unlock();
+	k_mutex_unlock(&g_socket_table_mutex);
 }
 
 static void ensure_poll_task_started(void)
@@ -1341,23 +1486,24 @@ static int erpc_wifi_socket_addr_to_posix(struct sockaddr *addr,
 static struct erpc_wifi_socket *erpc_wifi_socket_allocate(int fd, int zfd)
 {
 	struct erpc_wifi_socket *socket = NULL;
+	bool dns_refresh = false;
 
-	erpc_wifi_lock();
-	
-	/* If RA6W1 reallocated an FD that Zephyr still thinks is in use (e.g., the RA6W1 implicitly
-	 * closed a DHCP UDP socket and reused the FD for a TLS TCP socket), we must force-close
-	 * the old Zephyr socket so background threads like DHCP don't steal the new socket's data!
+	k_mutex_lock(&g_socket_table_mutex, K_FOREVER);
+
+	/* If RA6W1 handed out an FD that a live host socket still maps to, the RA
+	 * has already closed that socket. Invalidate the stale host socket (its
+	 * owner gets ERR/HUP/ECONNRESET), but keep the slot reserved until the
+	 * owner closes its Zephyr fd.
 	 */
 	for (int i = 0; i < ERPC_WIFI_MAX_SOCKETS; i++) {
-		if (sockets[i].in_use && sockets[i].fd == fd) {
-			LOG_WRN("RA6W1 FD %d reused! Force-closing stale Zephyr socket (zfd=%d)", 
+		if (sockets[i].in_use && !sockets[i].dead && sockets[i].fd == fd) {
+			LOG_WRN("RA6W1 FD %d reused while zfd=%d still open: invalidating stale socket",
 				fd, sockets[i].zfd);
-			sockets[i].in_use = false;
-			sockets[i].fd = -1;
-			sockets[i].triggered_events |= SOCKET_EVENT_ERR | SOCKET_EVENT_CLOSE;
-			if (sockets[i].waiting) {
-				k_poll_signal_raise(&sockets[i].poll_signal, 0);
+			if (sockets[i].type == SOCK_DGRAM) {
+				/* Most likely the DNS resolver's UDP socket. */
+				dns_refresh = true;
 			}
+			erpc_wifi_socket_mark_dead(&sockets[i]);
 		}
 	}
 
@@ -1378,11 +1524,17 @@ static struct erpc_wifi_socket *erpc_wifi_socket_allocate(int fd, int zfd)
 			break;
 		}
 	}
-	erpc_wifi_unlock();
+	k_mutex_unlock(&g_socket_table_mutex);
 
 	if (socket != NULL) {
 		/* Wake the poll task so it begins monitoring the newly allocated socket */
 		k_sem_give(&poll_task_sem);
+	} else {
+		LOG_ERR("No free socket slot (max %d)", ERPC_WIFI_MAX_SOCKETS);
+	}
+
+	if (dns_refresh) {
+		erpc_wifi_dns_request_refresh();
 	}
 
 	return socket;
@@ -1390,16 +1542,26 @@ static struct erpc_wifi_socket *erpc_wifi_socket_allocate(int fd, int zfd)
 
 static void erpc_wifi_socket_free(struct erpc_wifi_socket *sock)
 {
+	k_mutex_lock(&g_socket_table_mutex, K_FOREVER);
 	k_spinlock_key_t key = k_spin_lock(&sock->state_lock);
 	sock->in_use = false;
+	sock->dead = false;
 	sock->connected = false;
 	sock->connect_pending = false;
 	sock->waiting = false;
+	sock->fd = -1;
 	k_spin_unlock(&sock->state_lock, key);
+	/* Detach any remaining poll waiter before the slot can be re-initialized. */
+	k_poll_signal_raise(&sock->poll_signal, SOCKET_EVENT_CLOSE);
+	k_mutex_unlock(&g_socket_table_mutex);
 }
 
 static int erpc_wifi_socket_bind(void *obj, const struct sockaddr *addr, socklen_t addrlen)
 {
+	if (erpc_wifi_socket_is_dead((struct erpc_wifi_socket *)obj)) {
+		errno = ECONNRESET;
+		return -1;
+	}
 	bool ram_held = false;
 	int __w = erpc_wifi_ensure_awake_tx(ERPC_PMGR_JOB_ID_SEND, &ram_held);
 	if (__w != 0) {
@@ -1470,6 +1632,10 @@ static int erpc_wifi_socket_bind(void *obj, const struct sockaddr *addr, socklen
 
 static int erpc_wifi_socket_connect(void *obj, const struct sockaddr *addr, socklen_t addrlen)
 {
+	if (erpc_wifi_socket_is_dead((struct erpc_wifi_socket *)obj)) {
+		errno = ECONNRESET;
+		return -1;
+	}
 	erpc_wifi_ps_notify_socket_connect_start();
 
 	bool ram_held = false;
@@ -1716,6 +1882,10 @@ static int erpc_wifi_socket_connect(void *obj, const struct sockaddr *addr, sock
 
 static int erpc_wifi_socket_listen(void *obj, int backlog)
 {
+	if (erpc_wifi_socket_is_dead((struct erpc_wifi_socket *)obj)) {
+		errno = ECONNRESET;
+		return -1;
+	}
 	bool ram_held = false;
 	int __w = erpc_wifi_ensure_awake_tx(ERPC_PMGR_JOB_ID_SEND, &ram_held);
 	if (__w != 0) {
@@ -1771,6 +1941,10 @@ static int erpc_wifi_socket_listen(void *obj, int backlog)
 
 static int erpc_wifi_socket_accept(void *obj, struct sockaddr *addr, socklen_t *addrlen)
 {
+	if (erpc_wifi_socket_is_dead((struct erpc_wifi_socket *)obj)) {
+		errno = ECONNRESET;
+		return -1;
+	}
 	int fd;
 	int conn_fd;
 	struct ra_erpc_sockaddr remote_addr;
@@ -2121,6 +2295,10 @@ static ssize_t erpc_wifi_socket_send_core(struct erpc_wifi_socket *sock, const v
 static ssize_t erpc_wifi_socket_sendto(void *obj, const void *buf, size_t len, int flags,
 				       const struct sockaddr *dest_addr, socklen_t addrlen)
 {
+	if (erpc_wifi_socket_is_dead((struct erpc_wifi_socket *)obj)) {
+		errno = ECONNRESET;
+		return -1;
+	}
 	LOG_DBG("TX wake request (len=%u)", (unsigned int)len);
 
 	bool ram_held = false;
@@ -2148,6 +2326,12 @@ static ssize_t erpc_wifi_socket_sendto(void *obj, const void *buf, size_t len, i
 		return -1;
 	}
 
+	if (sock->type == SOCK_DGRAM && ret > 0) {
+		k_spinlock_key_t udp_key = k_spin_lock(&sock->state_lock);
+		sock->last_tx_ms = k_uptime_get();
+		k_spin_unlock(&sock->state_lock, udp_key);
+	}
+
 	if (sock->type == SOCK_STREAM && ret > 0) {
 		k_spinlock_key_t tx_key = k_spin_lock(&sock->state_lock);
 		sock->last_tx_ms = k_uptime_get();
@@ -2165,6 +2349,10 @@ static ssize_t erpc_wifi_socket_sendto(void *obj, const void *buf, size_t len, i
 
 ssize_t erpc_wifi_socket_sendmsg(void *obj, const struct msghdr *msg, int flags)
 {
+	if (erpc_wifi_socket_is_dead((struct erpc_wifi_socket *)obj)) {
+		errno = ECONNRESET;
+		return -1;
+	}
 	if (msg->msg_iov) {
 		bool ram_held = false;
 		int __w = erpc_wifi_ensure_awake_tx(ERPC_PMGR_JOB_ID_SEND, &ram_held);
@@ -2226,6 +2414,14 @@ ssize_t erpc_wifi_socket_sendmsg(void *obj, const struct msghdr *msg, int flags)
 static ssize_t erpc_wifi_socket_recvfrom(void *obj, void *buf, size_t max_len, int flags,
 					 struct sockaddr *src_addr, socklen_t *addrlen)
 {
+	if (erpc_wifi_socket_is_dead((struct erpc_wifi_socket *)obj)) {
+		/* Remote socket is gone: EOF for streams, error for datagrams. */
+		if (obj != NULL && ((struct erpc_wifi_socket *)obj)->type == SOCK_STREAM) {
+			return 0;
+		}
+		errno = ECONNRESET;
+		return -1;
+	}
 	struct erpc_wifi_socket *sock = (struct erpc_wifi_socket *)obj;
 	bool mutex_locked = false;
 
@@ -2576,6 +2772,39 @@ static ssize_t erpc_wifi_socket_recvfrom(void *obj, void *buf, size_t max_len, i
 		sock->triggered_events &= ~SOCKET_EVENT_RX;
 		if (sock->triggered_events & (SOCKET_EVENT_ERR | SOCKET_EVENT_CLOSE)) {
 			k_spin_unlock(&sock->state_lock, key2);
+			/*
+			 * Only a driver-invalidated socket (iface down / RA fd reuse) is
+			 * definitely gone. A latched ERR/CLOSE reported by the module can
+			 * be stale, so do not fail a healthy stream on it: retry until the
+			 * socket timeout (30 s cap for an untimed blocking read) instead of
+			 * busy-looping.
+			 */
+			if (erpc_wifi_socket_is_dead(sock)) {
+				if (sock->type == SOCK_STREAM) {
+					return 0;
+				}
+				errno = ECONNRESET;
+				return -1;
+			}
+			{
+				int64_t err_elapsed = k_uptime_get() - start_time;
+
+				if (timeout_ms != UINT32_MAX &&
+				    err_elapsed >= (int64_t)timeout_ms) {
+					errno = EAGAIN;
+					return -1;
+				}
+				if (timeout_ms == UINT32_MAX && err_elapsed >= 30000) {
+					LOG_WRN("recv fd=%d: ERR/CLOSE latched for 30s, reporting closed",
+						sock->fd);
+					if (sock->type == SOCK_STREAM) {
+						return 0;
+					}
+					errno = ECONNRESET;
+					return -1;
+				}
+			}
+			k_msleep(20);
 			continue;
 		}
 		sock->waiting = true;
@@ -2609,6 +2838,10 @@ static ssize_t erpc_wifi_socket_recvfrom(void *obj, void *buf, size_t max_len, i
 static int erpc_wifi_socket_getsockopt(void *obj, int level, int optname, void *optval,
 				       socklen_t *optlen)
 {
+	if (erpc_wifi_socket_is_dead((struct erpc_wifi_socket *)obj)) {
+		errno = ECONNRESET;
+		return -1;
+	}
 	struct erpc_wifi_socket *sock = (struct erpc_wifi_socket *)obj;
 
 	if (!sock) {
@@ -2734,6 +2967,10 @@ static int erpc_wifi_socket_getsockopt(void *obj, int level, int optname, void *
 static int erpc_wifi_socket_setsockopt(void *obj, int level, int optname, const void *optval,
 				       socklen_t optlen)
 {
+	if (erpc_wifi_socket_is_dead((struct erpc_wifi_socket *)obj)) {
+		errno = ECONNRESET;
+		return -1;
+	}
 	bool ram_held = false;
 	int __w = erpc_wifi_ensure_awake_tx(ERPC_PMGR_JOB_ID_SEND, &ram_held);
 	if (__w != 0) { 
@@ -2816,6 +3053,19 @@ static ssize_t erpc_wifi_socket_write(void *obj, const void *buf, size_t sz)
 
 static int erpc_wifi_socket_close(void *obj)
 {
+	{
+		struct erpc_wifi_socket *dsock = (struct erpc_wifi_socket *)obj;
+
+		if (dsock != NULL && dsock->in_use && (dsock->dead || dsock->fd < 0)) {
+			/* No remote socket any more: release the slot locally, no eRPC. */
+			LOG_INF("Closing invalidated socket zfd=%d (no remote close)", dsock->zfd);
+			if (dsock->lock != NULL) {
+				k_mutex_unlock(dsock->lock);
+			}
+			erpc_wifi_socket_free(dsock);
+			return 0;
+		}
+	}
 	bool ram_held = false;
 	int __w = erpc_wifi_ensure_awake_tx(ERPC_PMGR_JOB_ID_SEND, &ram_held);
 	if (__w != 0) {
@@ -2907,7 +3157,8 @@ static int erpc_wifi_socket_close(void *obj)
 static struct erpc_wifi_socket *find_socket_by_fd(int fd)
 {
 	for (int i = 0; i < ERPC_WIFI_MAX_SOCKETS; i++) {
-		if (sockets[i].in_use && (sockets[i].zfd == fd || sockets[i].fd == fd)) {
+		/* Callers pass Zephyr fds only; never match the RA6W1 fd namespace. */
+		if (sockets[i].in_use && sockets[i].zfd == fd) {
 			return &sockets[i];
 		}
 	}
@@ -2979,6 +3230,11 @@ static int erpc_wifi_socket_poll_offload(struct zvfs_pollfd *fds, int nfds, int 
 		}
 
 		uint32_t ready = sock->triggered_events & requested_mask;
+		if (sock->dead) {
+			/* Invalidated socket: always release the waiter with ERR/HUP. */
+			ready |= (uint32_t)sock->triggered_events &
+				 (SOCKET_EVENT_ERR | SOCKET_EVENT_CLOSE);
+		}
 		if (ready != 0) {
 			/* Already has ready events, will be filled in update_revents. Just continue without blocking. */
 			immediate_ready = true;
@@ -3117,8 +3373,8 @@ static int erpc_wifi_socket_ioctl(void *obj, unsigned int request, va_list args)
 		 * Forward the option remotely on a best-effort basis, then always update
 		 * the host-side flags.
 		 */
-		if ((new_flags ^ old_flags) & O_NONBLOCK) {
-			static uint32_t nb_val;
+		if (((new_flags ^ old_flags) & O_NONBLOCK) && !erpc_wifi_socket_is_dead(sock)) {
+			uint32_t nb_val;
 			nb_val = (new_flags & O_NONBLOCK) ? 1U : 0U;
 			bool ram_held = false;
 			int __w = erpc_wifi_ensure_awake_tx(ERPC_PMGR_JOB_ID_SEND, &ram_held);
@@ -3201,6 +3457,11 @@ static int erpc_wifi_socket_ioctl(void *obj, unsigned int request, va_list args)
 		(*pev)++;
 
 		uint32_t ready = sock->triggered_events & requested_mask;
+		if (sock->dead) {
+			/* Invalidated socket: always release the waiter with ERR/HUP. */
+			ready |= (uint32_t)sock->triggered_events &
+				 (SOCKET_EVENT_ERR | SOCKET_EVENT_CLOSE);
+		}
 		bool writable = (sock->type == SOCK_DGRAM) ||
 				(sock->type == SOCK_STREAM && sock->connected && !sock->connect_pending && sock->socket_error == 0);
 

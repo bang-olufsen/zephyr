@@ -27,6 +27,8 @@ void erpc_wifi_offload_server_evt_query_begin(void);
 void erpc_wifi_offload_server_evt_query_end(void);
 void erpc_wifi_offload_host_erpc_begin(void);
 void erpc_wifi_offload_host_erpc_end(void);
+void erpc_wifi_socket_session_reset(void);
+void erpc_wifi_socket_dump_table(const char *why);
 
 #ifdef __cplusplus
 }

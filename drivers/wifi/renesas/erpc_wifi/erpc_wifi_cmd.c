@@ -15,6 +15,18 @@ K_THREAD_STACK_DEFINE(msg_task_stack, MSG_TASK_STACK_SIZE);
 static struct k_thread msgq_thread;
 static k_tid_t msgq_task_tid;
 
+/*
+ * iface up/down support:
+ *  - g_cmd_suspended: while set (iface_down teardown), no command may reach the
+ *    eRPC client. New requests fail with -ENETDOWN and queued requests are
+ *    completed with -ENETDOWN without touching the transport.
+ *  - g_cmd_handler_busy: set while the handler thread owns a dequeued message,
+ *    so erpc_wifi_cmd_suspend() can wait for an in-flight eRPC call to finish
+ *    before the client/transport are deinitialized.
+ */
+static atomic_t g_cmd_suspended;
+static atomic_t g_cmd_handler_busy;
+
 K_MSGQ_DEFINE(cmd_msg_queue, sizeof(erpc_wifi_msg_data_t), ERPC_WIFI_MSG_MAX, 4);
 
 typedef struct {
@@ -75,6 +87,10 @@ int erpc_wifi_send_cmd(erpc_wifi_cmd_t cmd, void *data, size_t size, int tout)
 
 	if (cmd >= ERPC_WIFI_LAST_CMD) {
 		return -ERANGE;
+	}
+
+	if (atomic_get(&g_cmd_suspended) != 0) {
+		return -ENETDOWN;
 	}
 
 	if (!is_erpc_wifi_cmd_handler_registered(cmd)) {
@@ -168,17 +184,24 @@ static void erpc_wifi_msg_handler_task(void *arg1, void *arg2, void *arg3)
 
 	while (1) {
 		/* Wait for message - blocks here until message available */
+		atomic_set(&g_cmd_handler_busy, 0);
 		if (k_msgq_get(&cmd_msg_queue, &msg, K_FOREVER) != 0) {
 			LOG_ERR("Failed to get message from queue");
 			continue;
 		}
 
+		atomic_set(&g_cmd_handler_busy, 1);
 		bool timed_out = false;
 		if (msg.ctx && atomic_get(&msg.ctx->timed_out) != 0) {
 			timed_out = true;
 		}
 
-		if (!timed_out) {
+		if (!timed_out && atomic_get(&g_cmd_suspended) != 0) {
+			/* Session is being torn down: never touch the eRPC client. */
+			if (msg.ctx) {
+				msg.ctx->cmd_ret = -ENETDOWN;
+			}
+		} else if (!timed_out) {
 			if (msg.cmd < ERPC_WIFI_LAST_CMD && erpc_wifi_socket_handlers[msg.cmd].h) {
 				bool server_evt_query =
 					(msg.cmd == EPRC_WIFI_GET_SERVER_EVT_CMD);
@@ -246,4 +269,41 @@ int erpc_wifi_cmd_init(void)
 	LOG_INF("erpc_wifi message queue initialized (capacity: %d)", ERPC_WIFI_MSG_MAX);
 
 	return 0;
+}
+
+int erpc_wifi_cmd_suspend(uint32_t timeout_ms)
+{
+	int64_t deadline = k_uptime_get() + (int64_t)timeout_ms;
+
+	atomic_set(&g_cmd_suspended, 1);
+
+	/* Queued messages are drained by the handler thread (it completes them with
+	 * -ENETDOWN). Wait until the queue is empty and no message is in progress.
+	 */
+	while (k_msgq_num_used_get(&cmd_msg_queue) > 0U ||
+	       atomic_get(&g_cmd_handler_busy) != 0) {
+		if (msgq_task_tid == NULL) {
+			k_msgq_purge(&cmd_msg_queue);
+			break;
+		}
+		if (k_uptime_get() >= deadline) {
+			LOG_WRN("CMD suspend: in-flight command did not finish within %u ms",
+				(unsigned int)timeout_ms);
+			return -ETIMEDOUT;
+		}
+		k_msleep(10);
+	}
+
+	LOG_INF("erpc_wifi command queue suspended");
+	return 0;
+}
+
+void erpc_wifi_cmd_resume(void)
+{
+	atomic_set(&g_cmd_suspended, 0);
+}
+
+bool erpc_wifi_cmd_is_suspended(void)
+{
+	return atomic_get(&g_cmd_suspended) != 0;
 }

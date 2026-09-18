@@ -104,6 +104,8 @@ void erpc_wifi_ps_wait_awake_tx(void);
 void erpc_wifi_ps_wait_awake_rx(void);
 void erpc_wifi_ps_reset_state_awake(void);
 void erpc_wifi_ps_wake_failed(void);
+/* Ask the driver to re-apply the DHCP DNS servers (recreates resolver sockets). */
+void erpc_wifi_dns_request_refresh(void);
 
 #ifdef __cplusplus
 }

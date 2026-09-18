@@ -237,3 +237,8 @@ int erpc_wifi_unregister_cmd_handler(erpc_wifi_cmd_t cmd);
 
 /* Primary API: send command through queue and wait for completion */
 int erpc_wifi_send_cmd(erpc_wifi_cmd_t cmd, void *data, size_t size, int tout);
+
+/* Block all eRPC traffic (iface_down) / allow it again (iface_up). */
+int erpc_wifi_cmd_suspend(uint32_t timeout_ms);
+void erpc_wifi_cmd_resume(void);
+bool erpc_wifi_cmd_is_suspended(void);
