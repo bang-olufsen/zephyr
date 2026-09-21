@@ -90,8 +90,16 @@ void erpc_transport_register_srdy_cb(erpc_transport_srdy_cb_t cb)
 	g_srdy_cb = cb;
 
 	if (g_slave_ready_gpio && cb) {
-		/* Configure SRDY GPIO for edge-triggered interrupts (rising edge to ACTIVE_HIGH) */
-		int ret = gpio_pin_configure_dt(g_slave_ready_gpio, GPIO_INPUT | GPIO_INT_EDGE_TO_ACTIVE);
+		/* Configure SRDY GPIO for edge-triggered interrupts (rising edge to ACTIVE_HIGH).
+		 * Interrupt flags must go through gpio_pin_interrupt_configure_dt(), not
+		 * gpio_pin_configure_dt() - the latter asserts if GPIO_INT_MASK bits are set.
+		 */
+		int ret = gpio_pin_configure_dt(g_slave_ready_gpio, GPIO_INPUT);
+		if (ret < 0) {
+			return;  /* Failed to configure GPIO */
+		}
+
+		ret = gpio_pin_interrupt_configure_dt(g_slave_ready_gpio, GPIO_INT_EDGE_TO_ACTIVE);
 		if (ret < 0) {
 			return;  /* Failed to configure GPIO interrupts */
 		}

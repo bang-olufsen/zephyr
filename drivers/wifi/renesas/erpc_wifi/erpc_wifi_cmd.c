@@ -8,7 +8,9 @@
 LOG_MODULE_REGISTER(erpc_wifi_cmd, CONFIG_WIFI_LOG_LEVEL);
 
 #define ERPC_WIFI_MSG_MAX 64
-#define MSG_TASK_STACK_SIZE 3200
+/* Runs the full C++ eRPC call chain (codec, marshaling, SPI transport);
+ * 3200 was tight enough to risk heap-corrupting stack overflow. */
+#define MSG_TASK_STACK_SIZE 6144
 
 K_THREAD_STACK_DEFINE(msg_task_stack, MSG_TASK_STACK_SIZE);
 

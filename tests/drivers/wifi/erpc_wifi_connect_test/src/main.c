@@ -27,7 +27,7 @@
 LOG_MODULE_REGISTER(erpc_wifi_connect_test, LOG_LEVEL_INF);
 
 /* EDIT THESE to match your AP before flashing. */
-#define TEST_WIFI_SSID "TP-Link_1218"
+#define TEST_WIFI_SSID "Anjana"
 #define TEST_WIFI_PSK  "12345678"
 
 #define WIFI_EVENT_MASK   (NET_EVENT_WIFI_CONNECT_RESULT | NET_EVENT_WIFI_DISCONNECT_RESULT)
