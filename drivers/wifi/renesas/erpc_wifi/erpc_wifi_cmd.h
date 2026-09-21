@@ -238,6 +238,22 @@ int erpc_wifi_unregister_cmd_handler(erpc_wifi_cmd_t cmd);
 /* Primary API: send command through queue and wait for completion */
 int erpc_wifi_send_cmd(erpc_wifi_cmd_t cmd, void *data, size_t size, int tout);
 
+/*
+ * eRPC link health accounting.
+ *
+ * The command queue is single-threaded: one stuck transport operation burns
+ * CONFIG_WIFI_ERPC_WAKE_TIMEOUT_MS and every caller behind it (500/1000 ms
+ * timeouts) loses. Once that state is entered it is self-sustaining, so the
+ * driver needs to be able to see it. These counters are updated only from the
+ * handler thread, where the real transport result is known.
+ *
+ *  fail_streak    consecutive handler results < 0 with no success in between
+ *                 (-ENETDOWN during iface_down teardown is not counted)
+ *  secs_since_ok  seconds since the last successful eRPC transaction
+ */
+void erpc_wifi_cmd_link_stats(uint32_t *fail_streak, uint32_t *secs_since_ok);
+void erpc_wifi_cmd_link_stats_reset(void);
+
 /* Block all eRPC traffic (iface_down) / allow it again (iface_up). */
 int erpc_wifi_cmd_suspend(uint32_t timeout_ms);
 void erpc_wifi_cmd_resume(void);

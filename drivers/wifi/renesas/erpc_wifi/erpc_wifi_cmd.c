@@ -27,6 +27,61 @@ static k_tid_t msgq_task_tid;
 static atomic_t g_cmd_suspended;
 static atomic_t g_cmd_handler_busy;
 
+/*
+ * Link health (see erpc_wifi_cmd_link_stats()). Seconds are used for the
+ * timestamp so the 32-bit atomic cannot wrap during a long-run test.
+ */
+static atomic_t g_cmd_fail_streak;
+static atomic_t g_cmd_last_ok_s;
+
+static void erpc_wifi_cmd_account_result(erpc_wifi_cmd_t cmd, int ret)
+{
+	/*
+	 * The server-event poll carries no liveness information: its handler
+	 * (erpc_wifi_get_server_evt_msg_process) returns 0 unconditionally,
+	 * whatever the eRPC call did. It runs every ~200 ms, so counting it as a
+	 * success would clear the failure streak continuously and the link
+	 * watchdog could never fire on a wedged link.
+	 */
+	if (cmd == EPRC_WIFI_GET_SERVER_EVT_CMD) {
+		return;
+	}
+
+	if (ret >= 0) {
+		atomic_set(&g_cmd_fail_streak, 0);
+		atomic_set(&g_cmd_last_ok_s, (atomic_val_t)(k_uptime_get() / 1000));
+		return;
+	}
+
+	/* Teardown rejects every command by design; that is not a link fault. */
+	if (ret == -ENETDOWN) {
+		return;
+	}
+
+	atomic_inc(&g_cmd_fail_streak);
+}
+
+void erpc_wifi_cmd_link_stats(uint32_t *fail_streak, uint32_t *secs_since_ok)
+{
+	int64_t now_s = k_uptime_get() / 1000;
+	atomic_val_t last_s = atomic_get(&g_cmd_last_ok_s);
+
+	if (fail_streak) {
+		*fail_streak = (uint32_t)atomic_get(&g_cmd_fail_streak);
+	}
+	if (secs_since_ok) {
+		int64_t d = now_s - (int64_t)last_s;
+
+		*secs_since_ok = (d > 0) ? (uint32_t)d : 0U;
+	}
+}
+
+void erpc_wifi_cmd_link_stats_reset(void)
+{
+	atomic_set(&g_cmd_fail_streak, 0);
+	atomic_set(&g_cmd_last_ok_s, (atomic_val_t)(k_uptime_get() / 1000));
+}
+
 K_MSGQ_DEFINE(cmd_msg_queue, sizeof(erpc_wifi_msg_data_t), ERPC_WIFI_MSG_MAX, 4);
 
 typedef struct {
@@ -127,6 +182,13 @@ int erpc_wifi_send_cmd(erpc_wifi_cmd_t cmd, void *data, size_t size, int tout)
 				atomic_set(&ctx->timed_out, 1);
 				LOG_ERR("CMD timeout: cmd=%d timeout_ms=%d", cmd, tout);
 				ret = -ETIMEDOUT;
+				/*
+				 * A caller timeout is the dominant symptom of a wedged
+				 * link: the handler then SKIPS the message, so it never
+				 * reports a result of its own. Count it here or the
+				 * failure streak stays near zero while the link is dead.
+				 */
+				erpc_wifi_cmd_account_result(cmd, ret);
 			} else {
 				ret = ctx->cmd_ret;
 			}
@@ -143,6 +205,7 @@ int erpc_wifi_send_cmd(erpc_wifi_cmd_t cmd, void *data, size_t size, int tout)
 		}
 		LOG_ERR("CMD queue full: cmd=%d used=%u max=%u",
 			cmd, (unsigned int)used, (unsigned int)ERPC_WIFI_MSG_MAX);
+		erpc_wifi_cmd_account_result(cmd, -EAGAIN);
 		return -EAGAIN;
 	}
 
@@ -219,6 +282,8 @@ static void erpc_wifi_msg_handler_task(void *arg1, void *arg2, void *arg3)
 				int ret = erpc_wifi_socket_handlers[msg.cmd].h(msg.data);
 				erpc_wifi_offload_host_erpc_end();
 
+				erpc_wifi_cmd_account_result(msg.cmd, ret);
+
 				if (server_evt_query) {
 					erpc_wifi_offload_server_evt_query_end();
 				}
@@ -254,6 +319,8 @@ int erpc_wifi_cmd_init(void)
 	if (msgq_task_tid != NULL) {
 		return 0;
 	}
+
+	erpc_wifi_cmd_link_stats_reset();
 	/* Create handler thread at preemptive priority to ensure queue processing */
 	msgq_task_tid = k_thread_create(&msgq_thread, msg_task_stack, MSG_TASK_STACK_SIZE,
 					erpc_wifi_msg_handler_task, NULL, NULL, NULL,
@@ -300,6 +367,10 @@ int erpc_wifi_cmd_suspend(uint32_t timeout_ms)
 
 void erpc_wifi_cmd_resume(void)
 {
+	/* New session: do not let the previous session's failures trigger a
+	 * recovery before the first command of this one has even run.
+	 */
+	erpc_wifi_cmd_link_stats_reset();
 	atomic_set(&g_cmd_suspended, 0);
 }
 

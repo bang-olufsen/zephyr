@@ -60,6 +60,32 @@ K_KERNEL_STACK_DEFINE(erpc_wifi_workq_stack, CONFIG_WIFI_ERPC_WIFI_WORKQ_STACK_S
 #define EVENT_MONITOR_STACK_SIZE 8192
 K_THREAD_STACK_DEFINE(event_monitor_stack, EVENT_MONITOR_STACK_SIZE);
 
+/*
+ * eRPC link watchdog.
+ *
+ * Failure mode it exists for: the RA6W1 stops answering eRPC while still
+ * asserting SRDY (observed after the module powers down mid-TCP-transaction).
+ * Every transport operation then burns CONFIG_WIFI_ERPC_WAKE_TIMEOUT_MS while
+ * callers time out after 500/1000 ms, so the single command queue never
+ * recovers on its own and the link stays dead until the board is reset.
+ *
+ * Trigger is deliberately conservative - it needs BOTH a long run of
+ * consecutive transport failures AND no successful transaction at all in that
+ * window, on an interface that is up and associated. A normal DPM wake always
+ * ends in a success, so a sleeping-but-healthy module can never trip it, and an
+ * idle link (no traffic, no failures) cannot either.
+ */
+#define ERPC_WIFI_LINK_WD_PERIOD_MS	2000
+#define ERPC_WIFI_LINK_WD_FAIL_STREAK	30U
+#define ERPC_WIFI_LINK_WD_SILENCE_S	30U
+#define ERPC_WIFI_LINK_WD_COOLDOWN_S	120
+#define ERPC_WIFI_LINK_WD_REASSOC_WAIT_MS	30000
+#define ERPC_WIFI_LINK_WD_REASSOC_POLL_MS	250
+
+#define ERPC_WIFI_LINK_WD_STACK_SIZE 4096
+K_THREAD_STACK_DEFINE(erpc_wifi_link_wd_stack, ERPC_WIFI_LINK_WD_STACK_SIZE);
+static struct k_thread erpc_wifi_link_wd_thread;
+
 static struct gpio_dt_spec n_int_gpio = GPIO_DT_SPEC_GET(DT_DRV_INST(0), int_gpios);
 static struct k_sem sem_if_enabled;
 
@@ -167,12 +193,23 @@ void erpc_wifi_gpio_trigger_wakeup(void)
 
 int erpc_wifi_ensure_slave_awake(uint32_t timeout_ms)
 {
+	bool ready_but_deaf = false;
+
 	if (erpc_wifi_transport_slave_ready()) {
 		if (erpc_wifi_ping(1000) == 0) {
 			/* Already awake and answering eRPC: nothing to do. */
 			return 0;
 		}
 		LOG_INF("Slave ready but ping failed; triggering GPIO wakeup pulse");
+
+		/*
+		 * SRDY is already asserted, so the wait loop below would fall
+		 * through immediately and report success for a module that is
+		 * not answering eRPC at all. Remember that here and re-check by
+		 * ping (the only meaningful liveness test in this state) before
+		 * returning 0.
+		 */
+		ready_but_deaf = true;
 	}
 
 	LOG_DBG("Slave not ready/asleep; triggering GPIO wakeup pulse");
@@ -196,6 +233,12 @@ int erpc_wifi_ensure_slave_awake(uint32_t timeout_ms)
 	}
 
 	k_msleep(20);
+
+	if (ready_but_deaf && erpc_wifi_ping(1000) != 0) {
+		LOG_WRN("Slave asserts SRDY but does not answer eRPC after wake pulse");
+		return -ETIMEDOUT;
+	}
+
 	return 0;
 }
 
@@ -2650,6 +2693,252 @@ static int erpc_wifi_iface_enable(const struct net_if *iface, bool state)
 	return ret;
 }
  
+/*
+ * Recover a wedged eRPC link: full interface down/up, which runs the existing
+ * teardown and re-init path (erpc_wifi_iface_disable -> erpc_wifi_iface_enable:
+ * queue suspend, eRPC deinit, module reset, wait_module_ready, poll restart,
+/*
+ * PS enable state captured at the start of a recovery, so a later bring-up
+ * retry (which no longer has the pre-teardown state) can still restore it.
+ */
+static bool g_link_wd_ps_wanted;
+
+/*
+ * Set only when a bring-up WE started failed, so the watchdog knows the
+ * interface is down because of us. Without it, an interface the application
+ * deliberately took down (the iface up/down feature) would be forced back up
+ * by the retry path.
+ */
+static bool g_link_wd_bringup_pending;
+
+/*
+ * Second half of a recovery: bring the interface back up, re-associate, and
+ * restore power save. Split out so a failed bring-up can be retried on its own
+ * without going through net_if_down() again - the interface is already down at
+ * that point and net_if_down() would report an error instead of doing anything.
+ */
+static void erpc_wifi_link_bring_up(struct erpc_wifi_data *data, bool ps_was_enabled)
+{
+	struct net_if *iface = data->net_iface;
+	bool had_creds = (data->drv_nwk_params.ucSSIDLength != 0U);
+	int rc;
+
+	rc = net_if_up(iface);
+	if (rc != 0) {
+		LOG_ERR("link recovery: net_if_up failed (%d)", rc);
+		g_link_wd_bringup_pending = true;
+		return;
+	}
+
+	if (data->state == WIFI_STATE_INTERFACE_DISABLED) {
+		/* erpc_wifi_iface_enable() ran but the re-init failed. */
+		LOG_ERR("link recovery: interface did not come up (re-init failed)");
+		g_link_wd_bringup_pending = true;
+		return;
+	}
+
+	g_link_wd_bringup_pending = false;
+	erpc_wifi_cmd_link_stats_reset();
+
+	/*
+	 * The interface is up again but not associated. Re-associate with the
+	 * credentials the application already gave us, so recovery does not
+	 * depend on the application noticing the disconnect event.
+	 */
+	if (!had_creds) {
+		LOG_WRN("link recovery: no stored credentials; application must reconnect");
+		return;
+	}
+
+	if (data->state != WIFI_STATE_DISCONNECTED && data->state != WIFI_STATE_INACTIVE) {
+		return;
+	}
+
+	if (k_work_is_pending(&data->connect_work)) {
+		return;
+	}
+
+	LOG_INF("link recovery: re-associating with stored credentials");
+	data->state = WIFI_STATE_ASSOCIATING;
+	data->wifi_params_read = false;
+	k_work_cancel_delayable(&g_sleep2_reentry_work);
+	(void)k_work_submit_to_queue(&data->workq, &data->connect_work);
+
+	if (!ps_was_enabled) {
+		return;
+	}
+
+	/*
+	 * Wait (bounded) for the association to complete before re-enabling power
+	 * save: enabling it mid-associate would push PS parameters into a radio
+	 * that is not yet on the AP. If the association does not complete in time
+	 * we leave PS off rather than force it - a link that is awake is
+	 * recoverable, one that sleeps without a valid session is not.
+	 */
+	for (int waited = 0; waited < ERPC_WIFI_LINK_WD_REASSOC_WAIT_MS;
+	     waited += ERPC_WIFI_LINK_WD_REASSOC_POLL_MS) {
+		if (data->state == WIFI_STATE_COMPLETED) {
+			LOG_INF("link recovery: re-enabling power save");
+			erpc_wifi_ps_set_state_internal(true, "link-recovery");
+			return;
+		}
+
+		if (erpc_wifi_iface_is_disabling() || erpc_wifi_cmd_is_suspended()) {
+			return;
+		}
+
+		k_msleep(ERPC_WIFI_LINK_WD_REASSOC_POLL_MS);
+	}
+
+	LOG_WRN("link recovery: not associated within %d ms; power save left disabled",
+		ERPC_WIFI_LINK_WD_REASSOC_WAIT_MS);
+}
+
+/*
+ * Recover a wedged eRPC link: full interface down/up, which runs the existing
+ * teardown and re-init path (erpc_wifi_iface_disable -> erpc_wifi_iface_enable:
+ * queue suspend, eRPC deinit, module reset, wait_module_ready, poll restart,
+ * DNS resolver restore). Nothing new is invented here.
+ */
+static void erpc_wifi_link_recover(struct erpc_wifi_data *data)
+{
+	int rc;
+
+	/*
+	 * erpc_wifi_iface_enable() -> erpc_wifi_ps_reset_session_local() clears
+	 * g_ps.enabled, so power save would stay OFF after recovery unless the
+	 * application happened to set it again. The cached PS parameters (listen
+	 * interval, wakeup mode, exit strategy, timeout) survive the session reset,
+	 * so only the enable flag has to be replayed.
+	 */
+	g_link_wd_ps_wanted = erpc_wifi_ps_is_enabled();
+
+	/*
+	 * Fence the command queue BEFORE net_if_down().
+	 *
+	 * erpc_wifi_iface_disable() calls erpc_wifi_socket_poll_stop(), which does
+	 * k_thread_join(K_FOREVER) on the poll thread, and the poll thread issues
+	 * EPRC_WIFI_GET_SOCKET_EVT_CMD with tout = -1 (K_FOREVER). On a wedged link
+	 * every queued transaction costs CONFIG_WIFI_ERPC_WAKE_TIMEOUT_MS, so that
+	 * join would block for backlog x 3 s while net_if_down() holds the net_if
+	 * lock. Suspending first completes queued and new commands immediately with
+	 * -ENETDOWN, so the poll thread unwinds at once.
+	 *
+	 * Nothing is lost by this: every eRPC step in the teardown path tolerates a
+	 * failed command, and erpc_wifi_reset() in iface_enable is what actually
+	 * revives the module. erpc_wifi_cmd_resume() is called by iface_enable.
+	 */
+	(void)erpc_wifi_cmd_suspend(500);
+
+	rc = net_if_down(data->net_iface);
+	if (rc != 0) {
+		LOG_ERR("link recovery: net_if_down failed (%d); aborting", rc);
+		/* Never leave the queue fenced if the interface did not go down. */
+		erpc_wifi_cmd_resume();
+		return;
+	}
+
+	k_msleep(200);
+
+	erpc_wifi_link_bring_up(data, g_link_wd_ps_wanted);
+}
+
+static void erpc_wifi_link_watchdog_thread(void *arg1, void *arg2, void *arg3)
+{
+	ARG_UNUSED(arg1);
+	ARG_UNUSED(arg2);
+	ARG_UNUSED(arg3);
+
+	struct erpc_wifi_data *data = &erpc_wifi_driver_data;
+	int64_t last_recovery_s = 0;
+
+	for (;;) {
+		uint32_t fail_streak = 0U;
+		uint32_t secs_since_ok = 0U;
+		int64_t now_s;
+
+		k_msleep(ERPC_WIFI_LINK_WD_PERIOD_MS);
+
+		if (data->net_iface == NULL) {
+			continue;
+		}
+
+		now_s = k_uptime_get() / 1000;
+
+		/*
+		 * A recovery of ours left the interface down (net_if_up failed, or
+		 * the re-init did). Nothing else will retry it, and an unattended
+		 * board would sit dead until someone power-cycles it, which is the
+		 * outcome this watchdog exists to prevent. Only ever do this after a
+		 * recovery WE started - an interface the application deliberately
+		 * keeps down is not ours to bring up.
+		 */
+		if (g_link_wd_bringup_pending) {
+			/* The application brought it up itself: nothing owed. */
+			if (data->state != WIFI_STATE_INTERFACE_DISABLED) {
+				g_link_wd_bringup_pending = false;
+				continue;
+			}
+
+			/* An application teardown is in progress: not ours to touch. */
+			if (erpc_wifi_iface_is_disabling()) {
+				continue;
+			}
+
+			if ((now_s - last_recovery_s) < ERPC_WIFI_LINK_WD_COOLDOWN_S) {
+				continue;
+			}
+
+			last_recovery_s = now_s;
+			LOG_ERR("link recovery: interface still down; retrying bring-up");
+			/*
+			 * Bring-up only. The interface is already down, so a second
+			 * net_if_down() would just fail, and erpc_wifi_iface_enable()
+			 * calls erpc_wifi_cmd_resume() itself at the right point - doing
+			 * it here would unfence the queue while the eRPC client is still
+			 * deinitialised.
+			 */
+			erpc_wifi_link_bring_up(data, g_link_wd_ps_wanted);
+			continue;
+		}
+
+		/* Only guard an established link. Connect/scan/disconnect and the
+		 * iface_down teardown have their own error handling.
+		 */
+		if (data->state != WIFI_STATE_COMPLETED) {
+			continue;
+		}
+
+		if (erpc_wifi_iface_is_disabling() || erpc_wifi_cmd_is_suspended()) {
+			continue;
+		}
+
+		if (!net_if_flag_is_set(data->net_iface, NET_IF_UP)) {
+			continue;
+		}
+
+		erpc_wifi_cmd_link_stats(&fail_streak, &secs_since_ok);
+
+		if (fail_streak < ERPC_WIFI_LINK_WD_FAIL_STREAK ||
+		    secs_since_ok < ERPC_WIFI_LINK_WD_SILENCE_S) {
+			continue;
+		}
+
+		if (last_recovery_s != 0 &&
+		    (now_s - last_recovery_s) < ERPC_WIFI_LINK_WD_COOLDOWN_S) {
+			continue;
+		}
+
+		last_recovery_s = now_s;
+
+		LOG_ERR("eRPC link wedged: %u consecutive failures, no successful "
+			"transaction for %u s - recovering interface",
+			fail_streak, secs_since_ok);
+
+		erpc_wifi_link_recover(data);
+	}
+}
+
 static void erpc_wifi_iface_init(struct net_if *iface)
 {
 	erpc_wifi_socket_offload_init(iface);
@@ -3500,6 +3789,13 @@ static int erpc_wifi_init(const struct device *dev)
 			   K_KERNEL_STACK_SIZEOF(erpc_wifi_workq_stack),
 			   K_PRIO_COOP(CONFIG_WIFI_ERPC_WIFI_WORKQ_THREAD_PRIORITY), NULL);
 	k_thread_name_set(&data->workq.thread, "erpc_wifi_workq");
+
+	erpc_wifi_cmd_link_stats_reset();
+	k_thread_name_set(k_thread_create(&erpc_wifi_link_wd_thread, erpc_wifi_link_wd_stack,
+					  K_THREAD_STACK_SIZEOF(erpc_wifi_link_wd_stack),
+					  erpc_wifi_link_watchdog_thread, NULL, NULL, NULL,
+					  K_PRIO_PREEMPT(9), 0, K_NO_WAIT),
+			  "erpc_wifi_link_wd");
 
 #if DT_NODE_HAS_STATUS(DT_ALIAS(wakeup_gpio), okay)
 	ret = gpio_wakeup_init(&g_gpio_wakeup_dev);
