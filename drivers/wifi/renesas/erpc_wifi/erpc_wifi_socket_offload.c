@@ -185,9 +185,11 @@ static int erpc_wifi_ensure_awake_tx(uint32_t job_id, bool *ram_held)
 			job_id);
 	}
 
-	int64_t start = k_uptime_get();
+	int64_t total_start = k_uptime_get();
+	int64_t attempt_start = total_start;
 	uint32_t tmo = CONFIG_WIFI_ERPC_WAKE_TIMEOUT_MS;
-	int64_t last_pulse = start;
+	uint32_t attempt = 1U;
+	int64_t last_pulse = attempt_start;
 
 	/*
 	 * From this point until the wake is either completed or abandoned,
@@ -200,8 +202,33 @@ static int erpc_wifi_ensure_awake_tx(uint32_t job_id, bool *ram_held)
 	erpc_wifi_gpio_wakeup_pulse_fast();
 
 	for (;;) {
-		if (tmo > 0U && (k_uptime_get() - start) >= (int64_t)tmo) {
-			LOG_WRN("TX wake timeout job=%u tmo=%u", job_id, tmo);
+		if (tmo > 0U && (k_uptime_get() - attempt_start) >= (int64_t)tmo) {
+			bool ps_enabled = erpc_wifi_ps_is_enabled();
+			bool module_awake = erpc_wifi_ps_is_module_awake();
+			bool module_asleep = erpc_wifi_ps_is_module_asleep();
+			bool sleep_sent = erpc_wifi_ps_sleep_is_sent();
+			bool sleep_confirmed = erpc_wifi_ps_sleep_is_confirmed();
+			bool wait_srdy_low = erpc_wifi_ps_wait_for_srdy_low_get();
+			int srdy = erpc_wifi_transport_slave_ready();
+			bool dpm_transition = ps_enabled &&
+				(!module_awake || module_asleep || sleep_sent ||
+				 sleep_confirmed || wait_srdy_low || srdy != 1);
+
+			LOG_WRN("TX wake attempt %u/%u expired: job=%u attempt_ms=%u total_ms=%lld srdy=%d dpm_transition=%d ps=%d awake=%d asleep=%d sleep_sent=%d sleep_confirmed=%d wait_srdy_low=%d tx_blocked=%d block_tmo=%d",
+				attempt, CONFIG_WIFI_ERPC_WAKE_MAX_ATTEMPTS, job_id, tmo,
+				(long long)(k_uptime_get() - total_start), srdy,
+				dpm_transition, ps_enabled, module_awake, module_asleep,
+				sleep_sent, sleep_confirmed, wait_srdy_low,
+				(int)atomic_get(&g_erpc_tx_blocked),
+				(int)atomic_get(&g_erpc_tx_block_timeout_ms));
+
+			if (attempt < CONFIG_WIFI_ERPC_WAKE_MAX_ATTEMPTS) {
+				attempt++;
+				attempt_start = k_uptime_get();
+				last_pulse = attempt_start;
+				erpc_wifi_gpio_wakeup_pulse_fast();
+				continue;
+			}
 
 			/*
 			 * Drop wake ownership BEFORE publishing the failed host state.
@@ -210,6 +237,8 @@ static int erpc_wifi_ensure_awake_tx(uint32_t job_id, bool *ram_held)
 			 */
 			atomic_set(&g_host_wake_inflight, 0);
 			erpc_wifi_ps_wake_failed();
+			LOG_ERR("TX wake exhausted after %u attempts (%lld ms): socket/MQTT TX will fail because RA6W1 remained unavailable during DPM sleep/transition",
+				attempt, (long long)(k_uptime_get() - total_start));
 			return -EAGAIN;
 		}
 

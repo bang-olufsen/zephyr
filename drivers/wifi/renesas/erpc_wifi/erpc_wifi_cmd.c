@@ -9,6 +9,7 @@ LOG_MODULE_REGISTER(erpc_wifi_cmd, CONFIG_WIFI_LOG_LEVEL);
 
 #define ERPC_WIFI_MSG_MAX 64
 #define MSG_TASK_STACK_SIZE 3200
+#define ERPC_WIFI_CMD_TIMEOUT_MARGIN_MS 1000
 
 K_THREAD_STACK_DEFINE(msg_task_stack, MSG_TASK_STACK_SIZE);
 
@@ -136,6 +137,7 @@ static void free_cmd_msg_data(erpc_wifi_msg_data_t *msg)
 int erpc_wifi_send_cmd(erpc_wifi_cmd_t cmd, void *data, size_t size, int tout)
 {
 	int ret = 0;
+	int effective_tout = tout;
 	k_timeout_t timeout = K_NO_WAIT;
 	erpc_wifi_cmd_ctx_t *ctx = NULL;
 	erpc_wifi_msg_data_t msg = { .cmd = cmd, .ctx = NULL };
@@ -158,12 +160,21 @@ int erpc_wifi_send_cmd(erpc_wifi_cmd_t cmd, void *data, size_t size, int tout)
 		return ret;
 	}
 
-	if (tout != 0) {
-		timeout = (tout == -1) ? K_FOREVER : K_MSEC(tout);
+	if (effective_tout > 0 &&
+	    effective_tout <= CONFIG_ERPC_SPI_READY_TIMEOUT_MS) {
+		effective_tout = CONFIG_ERPC_SPI_READY_TIMEOUT_MS +
+			ERPC_WIFI_CMD_TIMEOUT_MARGIN_MS;
+		LOG_DBG("CMD timeout raised: cmd=%d requested=%d effective=%d transport=%d",
+			cmd, tout, effective_tout, CONFIG_ERPC_SPI_READY_TIMEOUT_MS);
+	}
+
+	if (effective_tout != 0) {
+		timeout = (effective_tout == -1) ? K_FOREVER : K_MSEC(effective_tout);
 
 		ctx = k_malloc(sizeof(erpc_wifi_cmd_ctx_t));
 		if (!ctx) {
-			LOG_ERR("CMD ENOMEM: context allocation failed cmd=%d timeout=%d", cmd, tout);
+			LOG_ERR("CMD ENOMEM: context allocation failed cmd=%d timeout=%d", cmd,
+				effective_tout);
 			free_cmd_msg_data(&msg);
 			return -ENOMEM;
 		}
@@ -180,7 +191,8 @@ int erpc_wifi_send_cmd(erpc_wifi_cmd_t cmd, void *data, size_t size, int tout)
 		if (ctx) {
 			if (k_sem_take(&ctx->sem, timeout) != 0) {
 				atomic_set(&ctx->timed_out, 1);
-				LOG_ERR("CMD timeout: cmd=%d timeout_ms=%d", cmd, tout);
+				LOG_ERR("CMD timeout: cmd=%d requested_ms=%d effective_ms=%d transport_ms=%d",
+					cmd, tout, effective_tout, CONFIG_ERPC_SPI_READY_TIMEOUT_MS);
 				ret = -ETIMEDOUT;
 				/*
 				 * A caller timeout is the dominant symptom of a wedged

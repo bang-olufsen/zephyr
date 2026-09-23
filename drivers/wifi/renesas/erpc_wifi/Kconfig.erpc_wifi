@@ -83,4 +83,11 @@ config WIFI_ERPC_WAKE_TIMEOUT_MS
 	help
 	  Timeout in milliseconds for the host-to-module DPM wake handshake.
 
+config WIFI_ERPC_WAKE_MAX_ATTEMPTS
+	int "RA6W1 DPM wake maximum attempts"
+	default 3
+	range 1 10
+	help
+	  Number of complete GPIO wake-handshake attempts before socket TX fails.
+
 endif # WIFI_ERPC_WIFI
