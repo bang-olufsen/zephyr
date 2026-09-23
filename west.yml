@@ -154,6 +154,11 @@ manifest:
       path: tools/edtt
       groups:
         - tools
+    - name: renesas-erpc-wifi
+      url: https://github.com/Renesas-US-Connectivity/renesas-erpc-wifi.git
+      revision: d688d6679d244cb75a6eabf69a65ff125ef3e863
+      path: modules/erpc_wifi
+      import: true
     - name: fatfs
       revision: f4ead3bf4a6dab3a07d7b5f5315795c073db568d
       path: modules/fs/fatfs
