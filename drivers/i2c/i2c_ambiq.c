@@ -173,14 +173,20 @@ static int i2c_ambiq_read(const struct device *dev, struct i2c_msg *hdr_msg,
 	trans.uPeerInfo.ui32I2CDevAddr = addr;
 	trans.ui32NumBytes = data_msg->len;
 	trans.pui32RxBuffer = (uint32_t *)data_msg->buf;
+	trans.bContinue = !(data_msg->flags & I2C_MSG_STOP);
 	if (hdr_msg) {
 		if (hdr_msg->len > AM_HAL_IOM_MAX_OFFSETSIZE) {
 			return -E2BIG;
 		}
+		uint64_t instruction = 0;
+
+		for (size_t idx = 0; idx < hdr_msg->len; idx++) {
+			instruction = (instruction << 8) | hdr_msg->buf[idx];
+		}
 #if defined(CONFIG_SOC_SERIES_APOLLO3X)
-		memcpy(&trans.ui32Instr, hdr_msg->buf, hdr_msg->len);
+		trans.ui32Instr = (uint32_t)instruction;
 #else
-		memcpy(&trans.ui64Instr, hdr_msg->buf, hdr_msg->len);
+		trans.ui64Instr = instruction;
 #endif
 		trans.ui32InstrLen = hdr_msg->len;
 	}
@@ -233,14 +239,20 @@ static int i2c_ambiq_write(const struct device *dev, struct i2c_msg *hdr_msg,
 	trans.uPeerInfo.ui32I2CDevAddr = addr;
 	trans.ui32NumBytes = data_msg->len;
 	trans.pui32TxBuffer = (uint32_t *)data_msg->buf;
+	trans.bContinue = !(data_msg->flags & I2C_MSG_STOP);
 	if (hdr_msg) {
 		if (hdr_msg->len > AM_HAL_IOM_MAX_OFFSETSIZE) {
 			return -E2BIG;
 		}
+		uint64_t instruction = 0;
+
+		for (size_t idx = 0; idx < hdr_msg->len; idx++) {
+			instruction = (instruction << 8) | hdr_msg->buf[idx];
+		}
 #if defined(CONFIG_SOC_SERIES_APOLLO3X)
-		memcpy(&trans.ui32Instr, hdr_msg->buf, hdr_msg->len);
+		trans.ui32Instr = (uint32_t)instruction;
 #else
-		memcpy(&trans.ui64Instr, hdr_msg->buf, hdr_msg->len);
+		trans.ui64Instr = instruction;
 #endif
 		trans.ui32InstrLen = hdr_msg->len;
 	}
